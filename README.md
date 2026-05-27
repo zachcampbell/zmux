@@ -71,6 +71,8 @@ zmux mcp --session <name>  stdio bridge for MCP clients (Claude Code, Cursor, et
 | `Space` | cycle layout presets |
 | `y` / `]` | yank visible viewport via OSC 52 / paste last yank |
 | `[` | enter scrollback mode |
+| `=` | toggle synchronize-panes — mirror every keystroke to every pane in the active window; `[SYNC]` appears in the status bar while on |
+| `:` | open the command prompt (see below) |
 | **`A`** | **open the supervisor overlay** |
 
 ### Supervisor overlay (`Ctrl-a A`)
@@ -109,7 +111,34 @@ Bindings:
 | `g` / `G` | top / bottom (G follows live output) |
 | `/` | search prompt (Enter commits, Esc cancels) |
 | `n` / `N` | next / previous match |
-| `v` | begin line selection; `y` copies + exits, Esc cancels |
+| `v` | begin selection (character-by-character) |
+| `V` | begin selection (whole-line) |
+| `R` | begin selection (rectangle / block) |
+
+### Selection mode (after `v` / `V` / `R`)
+
+Extend the selection from where it started.
+
+| Key | Action |
+|---|---|
+| `j` / `k` | extend one line down / up |
+| `h` / `l` | extend one char left / right |
+| `g` / `G` | extend to buffer top / bottom |
+| `Space` / `b` | extend full-page down / up |
+| `Ctrl-D` / `Ctrl-U` | extend half-page down / up |
+| `y` | yank the selection via OSC 52 and exit |
+| `v` / `V` / `R` / `Esc` | cancel selection and return to live output |
+
+### Command prompt (`Ctrl-a :`)
+
+A tmux-style command line. Type the command and press Enter; Esc cancels. Registered commands:
+
+| Command | Effect |
+|---|---|
+| `display-message <text>` | flash the text in the status bar |
+| `capture <session> <pane> <path>` | dump raw PTY bytes for a pane to a file (same as the `zmux capture` CLI) |
+
+The prompted-split bindings `Ctrl-a !` (right) and `Ctrl-a ^` (down) accept any shell command line and spawn it in a new pane; `Ctrl-a :` is reserved for the registered zmux commands above.
 
 ## Security
 
@@ -282,6 +311,14 @@ idle_threshold_ms = 750
 shell_prompts = ["$ ", "# ", "> ", "% "]
 agent_prompts  = ["│ > ", "architect> ", ">>> "]
 ```
+
+### Environment variables
+
+| Var | Purpose |
+|---|---|
+| `ZMUX_STATE_DIR` | override the state directory (default: `$XDG_STATE_HOME/zmux` or `~/.local/state/zmux`). Holds Claude hook event streams and pair-mode per-pane locks. |
+| `ZMUX_PAIR_TIMEOUT_SECS` | Ollama HTTP timeout for `zmux pair`, in seconds (default: 60). Bump if your model + scrollback context routinely exceeds it. |
+| `ZMUX_PTY_DUMP` | **Debug only** — when set, every PTY ingest appends its raw bytes to the given path. Massive output; use the per-pane `zmux capture` command instead for normal bug repros. |
 
 ## Why Rust
 
