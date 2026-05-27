@@ -1,0 +1,21 @@
+[package]
+name = "zmux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Zach Campbell <zach@zachcampbell.com>"]
+description = "Terminal multiplexer with pane-local mouse wheel scrolling, an in-daemon MCP server, and agent prompt shims."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zachcampbell/zmux"
+homepage = "https://github.com/zachcampbell/zmux"
+readme = "README.md"
+keywords = ["terminal", "multiplexer", "tmux", "mcp", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `default-features = false` strips rustls / native-tls / gzip / cookies /
+# charset that aren't needed for plain HTTP to localhost.
+ureq = { version = "2.10", default-features = false, features = ["json"] }
+rustyline = "14"

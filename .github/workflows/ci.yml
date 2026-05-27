@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  # `pull_request:` intentionally omitted. With a self-hosted runner on
+  # a public repo, letting fork PRs execute workflows would expose the
+  # runner host to arbitrary code. Only branches inside this repo (i.e.
+  # commits I push) ever trigger CI. To validate a community PR, pull
+  # it locally and push to a branch here.
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: build · fmt · clippy · test
+    # Targets the dedicated zmux runner stood up out-of-band
+    # (see /mnt/FTY/cirunner-zmux/). Generic self-hosted runners on
+    # this host won't claim zmux jobs because they lack the `zmux` label.
+    runs-on: [self-hosted, zmux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build
+        run: cargo build --all-targets
+
+      - name: cargo test
+        # Integration tests spin up real daemons + sockets; --test-threads=1
+        # avoids the cross-test socket/PID contention that flakes
+        # stdio_bridge_recovers_across_daemon_restart under parallel load.
+        run: cargo test --all-targets -- --test-threads=1
+
+      - name: cargo doc
+        run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings

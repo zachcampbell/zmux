@@ -1,0 +1,359 @@
+// Copyright 2026 Zach Campbell
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputAction {
+    Forward(Vec<u8>),
+    Mouse(MouseEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseEvent {
+    pub button: u16,
+    pub col: u16,
+    pub row: u16,
+    pub final_byte: u8,
+}
+
+impl MouseEvent {
+    pub const WHEEL_LINES: usize = 3;
+
+    pub fn is_scroll_up(self) -> bool {
+        self.button & 64 != 0 && (self.button & 0b11) == 0
+    }
+
+    pub fn is_scroll_down(self) -> bool {
+        self.button & 64 != 0 && (self.button & 0b11) == 1
+    }
+
+    pub fn wheel_lines(self) -> Option<usize> {
+        if self.is_scroll_up() || self.is_scroll_down() {
+            Some(Self::WHEEL_LINES)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_left_press(self) -> bool {
+        self.final_byte == b'M'
+            && self.button & 64 == 0
+            && self.button & 32 == 0
+            && (self.button & 0b11) == 0
+    }
+
+    // Motion event while the left button is held. In SGR 1002 (button-
+    // tracking) mode the host terminal emits these as the user drags.
+    // button & 32 marks "motion"; button & 0b11 == 0 says left-button.
+    pub fn is_left_drag_motion(self) -> bool {
+        self.final_byte == b'M'
+            && self.button & 64 == 0
+            && self.button & 32 != 0
+            && (self.button & 0b11) == 0
+    }
+
+    // Button-up on the left button. Terminals signal release with
+    // lowercase 'm' in SGR mode; the button field repeats what was
+    // released. We only care about the left button here.
+    pub fn is_left_release(self) -> bool {
+        self.final_byte == b'm' && self.button & 64 == 0 && (self.button & 0b11) == 0
+    }
+
+    pub fn translate(self, origin_col: u16, origin_row: u16) -> Option<Self> {
+        if self.col < origin_col || self.row < origin_row {
+            return None;
+        }
+
+        Some(Self {
+            col: self.col - origin_col,
+            row: self.row - origin_row,
+            ..self
+        })
+    }
+
+    pub fn encode_sgr(self) -> Vec<u8> {
+        format!(
+            "\x1b[<{};{};{}{}",
+            self.button,
+            self.col.saturating_add(1),
+            self.row.saturating_add(1),
+            self.final_byte as char
+        )
+        .into_bytes()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct InputParser {
+    pending: Vec<u8>,
+}
+
+impl InputParser {
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<InputAction> {
+        self.pending.extend_from_slice(bytes);
+
+        let mut actions = Vec::new();
+        while !self.pending.is_empty() {
+            if self.pending[0] != 0x1b {
+                let length = self
+                    .pending
+                    .iter()
+                    .position(|byte| *byte == 0x1b)
+                    .unwrap_or(self.pending.len());
+                actions.push(InputAction::Forward(self.pending.drain(..length).collect()));
+                continue;
+            }
+
+            if self.pending.len() == 1 {
+                break;
+            }
+
+            if self.pending[1] != b'[' {
+                if self.pending.len() < 2 {
+                    break;
+                }
+
+                actions.push(InputAction::Forward(self.pending.drain(..2).collect()));
+                continue;
+            }
+
+            if self.pending.starts_with(b"\x1b[M") {
+                if self.pending.len() < 6 {
+                    break;
+                }
+                let sequence: Vec<u8> = self.pending.drain(..6).collect();
+                if let Some(mouse) = parse_x10_mouse_sequence(&sequence) {
+                    actions.push(InputAction::Mouse(mouse));
+                } else {
+                    actions.push(InputAction::Forward(sequence));
+                }
+                continue;
+            }
+
+            let Some(final_offset) = self.pending[2..]
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+            else {
+                break;
+            };
+            let final_index = final_offset + 2;
+            let sequence: Vec<u8> = self.pending.drain(..=final_index).collect();
+
+            if let Some(mouse) = parse_mouse_sequence(&sequence) {
+                actions.push(InputAction::Mouse(mouse));
+            } else {
+                actions.push(InputAction::Forward(sequence));
+            }
+        }
+
+        actions
+    }
+}
+
+fn parse_mouse_sequence(sequence: &[u8]) -> Option<MouseEvent> {
+    parse_sgr_mouse_sequence(sequence).or_else(|| parse_rxvt_mouse_sequence(sequence))
+}
+
+fn parse_sgr_mouse_sequence(sequence: &[u8]) -> Option<MouseEvent> {
+    if sequence.len() < 6 || !sequence.starts_with(b"\x1b[<") {
+        return None;
+    }
+
+    parse_semicolon_mouse_payload(&sequence[3..sequence.len() - 1], *sequence.last()?)
+}
+
+fn parse_rxvt_mouse_sequence(sequence: &[u8]) -> Option<MouseEvent> {
+    if sequence.len() < 5 || !sequence.starts_with(b"\x1b[") || sequence.starts_with(b"\x1b[<") {
+        return None;
+    }
+
+    parse_semicolon_mouse_payload(&sequence[2..sequence.len() - 1], *sequence.last()?)
+}
+
+fn parse_semicolon_mouse_payload(payload: &[u8], final_byte: u8) -> Option<MouseEvent> {
+    if final_byte != b'M' && final_byte != b'm' {
+        return None;
+    }
+
+    let payload = std::str::from_utf8(payload).ok()?;
+    let mut fields = payload.split(';');
+    let button = fields.next()?.parse::<u16>().ok()?;
+    let column = fields.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    let row = fields.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    if fields.next().is_some() {
+        return None;
+    }
+
+    Some(MouseEvent {
+        button,
+        col: column,
+        row,
+        final_byte,
+    })
+}
+
+fn parse_x10_mouse_sequence(sequence: &[u8]) -> Option<MouseEvent> {
+    if sequence.len() != 6 || !sequence.starts_with(b"\x1b[M") {
+        return None;
+    }
+
+    Some(MouseEvent {
+        button: sequence[3].saturating_sub(32) as u16,
+        col: sequence[4].saturating_sub(33) as u16,
+        row: sequence[5].saturating_sub(33) as u16,
+        final_byte: b'M',
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InputAction, InputParser, MouseEvent};
+
+    #[test]
+    fn forwards_plain_bytes() {
+        let mut parser = InputParser::default();
+        let actions = parser.push_bytes(b"ls -la\r");
+
+        assert_eq!(actions, vec![InputAction::Forward(b"ls -la\r".to_vec())]);
+    }
+
+    #[test]
+    fn detects_mouse_wheel_sequences() {
+        let mut parser = InputParser::default();
+        let actions = parser.push_bytes(b"\x1b[<64;42;7M\x1b[<65;42;7M");
+
+        assert_eq!(
+            actions,
+            vec![
+                InputAction::Mouse(MouseEvent {
+                    button: 64,
+                    col: 41,
+                    row: 6,
+                    final_byte: b'M'
+                }),
+                InputAction::Mouse(MouseEvent {
+                    button: 65,
+                    col: 41,
+                    row: 6,
+                    final_byte: b'M'
+                })
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_x10_mouse_wheel_sequences() {
+        let mut parser = InputParser::default();
+        let actions = parser.push_bytes(b"\x1b[M`*%");
+
+        assert_eq!(
+            actions,
+            vec![InputAction::Mouse(MouseEvent {
+                button: 64,
+                col: 9,
+                row: 4,
+                final_byte: b'M'
+            })]
+        );
+    }
+
+    #[test]
+    fn keeps_partial_x10_mouse_sequences_buffered_until_complete() {
+        let mut parser = InputParser::default();
+
+        let first = parser.push_bytes(b"\x1b[M`");
+        let second = parser.push_bytes(b"*%");
+
+        assert!(first.is_empty());
+        assert_eq!(
+            second,
+            vec![InputAction::Mouse(MouseEvent {
+                button: 64,
+                col: 9,
+                row: 4,
+                final_byte: b'M'
+            })]
+        );
+    }
+
+    #[test]
+    fn detects_rxvt_mouse_wheel_sequences() {
+        let mut parser = InputParser::default();
+        let actions = parser.push_bytes(b"\x1b[64;42;7M");
+
+        assert_eq!(
+            actions,
+            vec![InputAction::Mouse(MouseEvent {
+                button: 64,
+                col: 41,
+                row: 6,
+                final_byte: b'M'
+            })]
+        );
+    }
+
+    #[test]
+    fn forwards_other_escape_sequences_back_to_the_pty() {
+        let mut parser = InputParser::default();
+        let actions = parser.push_bytes(b"\x1b[A");
+
+        assert_eq!(actions, vec![InputAction::Forward(b"\x1b[A".to_vec())]);
+    }
+
+    #[test]
+    fn keeps_partial_mouse_sequences_buffered_until_complete() {
+        let mut parser = InputParser::default();
+
+        let first = parser.push_bytes(b"\x1b[<64;12");
+        let second = parser.push_bytes(b";9M");
+
+        assert!(first.is_empty());
+        assert_eq!(
+            second,
+            vec![InputAction::Mouse(MouseEvent {
+                button: 64,
+                col: 11,
+                row: 8,
+                final_byte: b'M'
+            })]
+        );
+    }
+
+    #[test]
+    fn parses_left_click_for_focus_routing() {
+        let mut parser = InputParser::default();
+        let actions = parser.push_bytes(b"\x1b[<0;3;2M");
+
+        assert_eq!(
+            actions,
+            vec![InputAction::Mouse(MouseEvent {
+                button: 0,
+                col: 2,
+                row: 1,
+                final_byte: b'M'
+            })]
+        );
+    }
+
+    #[test]
+    fn mouse_events_can_be_translated_and_reencoded() {
+        let mouse = MouseEvent {
+            button: 64,
+            col: 18,
+            row: 9,
+            final_byte: b'M',
+        };
+
+        let translated = mouse.translate(10, 4).expect("translated event");
+
+        assert_eq!(
+            translated,
+            MouseEvent {
+                button: 64,
+                col: 8,
+                row: 5,
+                final_byte: b'M'
+            }
+        );
+        assert_eq!(translated.encode_sgr(), b"\x1b[<64;9;6M");
+    }
+}

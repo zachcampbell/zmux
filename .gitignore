@@ -1,0 +1,24 @@
+# Build artifacts
+/target
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Logs and local captures
+*.log
+/captures
+/*.bin
+
+# Tool-local state
+/.codex
+/.worktrees
+/.claude
+/.dev
+/.mcp.json
+
+# Screenshots dropped at repo root by terminal clients
+Termius_*.png
+Screenshot*.png
