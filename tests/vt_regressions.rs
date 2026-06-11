@@ -142,6 +142,27 @@ fn oversized_osc_payload_does_not_become_the_pane_title() {
     assert!(lines.join("\n").contains("ok"));
 }
 
+// Memory-exhaustion class: terminal dimensions are u16 on the attach
+// wire, and each pane's alternate screen allocates rows x cols cells
+// eagerly — a client lying about its size could demand a 65535x65535
+// grid (~4 billion cells) per pane. PtySize::new now clamps to
+// 512x1024; this must return instantly without gigabyte allocations.
+#[test]
+fn hostile_terminal_dimensions_are_clamped() {
+    let size = PtySize::new(65535, 65535);
+    assert_eq!(size.rows, 512);
+    assert_eq!(size.cols, 1024);
+    // Construct + resize + ingest at the hostile size end-to-end. If
+    // the clamp regresses, this test dies by OOM/timeout rather than
+    // assertion — that's the point.
+    let mut pane = Pane::new("regression", 512, 65535usize);
+    let mut ing = TerminalIngest::new(PtySize::new(65535, 65535));
+    ing.ingest_bytes(&mut pane, b"\x1b[?1049hgrid\x1b[65535;65535H");
+    ing.resize(PtySize::new(65535, 2));
+    ing.resize(PtySize::new(2, 65535));
+    let _ = ing.render_lines(&pane);
+}
+
 // DECSTBM with degenerate and out-of-range margins, then scroll ops —
 // exercises the scroll-region clamps on both screens.
 #[test]

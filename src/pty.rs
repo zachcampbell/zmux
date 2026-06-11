@@ -36,6 +36,17 @@ unsafe extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
 }
 
+// Hard ceilings on terminal dimensions, enforced in `PtySize::new`
+// (which every size on the wire and in the layout funnels through).
+// Each pane's alternate screen allocates rows x cols cells eagerly,
+// so without a cap a client lying about its terminal size on attach
+// (dims are u16 on the wire) can request a 65535x65535 grid — about
+// four billion cells per pane — and OOM the daemon. 512x1024 is ~4x
+// the largest real terminal in each axis while bounding a pane's
+// grid to half a million cells.
+pub const MAX_PTY_ROWS: u16 = 512;
+pub const MAX_PTY_COLS: u16 = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
     pub rows: u16,
@@ -44,7 +55,10 @@ pub struct PtySize {
 
 impl PtySize {
     pub const fn new(rows: u16, cols: u16) -> Self {
-        Self { rows, cols }
+        Self {
+            rows: if rows > MAX_PTY_ROWS { MAX_PTY_ROWS } else { rows },
+            cols: if cols > MAX_PTY_COLS { MAX_PTY_COLS } else { cols },
+        }
     }
 }
 

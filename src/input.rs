@@ -1,6 +1,8 @@
 // Copyright 2026 Zach Campbell
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::mem;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
     Forward(Vec<u8>),
@@ -82,6 +84,13 @@ impl MouseEvent {
     }
 }
 
+// `pending` holds at most one incomplete escape sequence between
+// reads; real sequences are a handful of bytes. If it grows past this
+// the "sequence" is garbage from a misbehaving terminal — forward it
+// raw and reset rather than buffering it forever (the same
+// degrade-don't-die stance as the VT ingester's CSI/OSC caps).
+const MAX_PENDING_BYTES: usize = 8 * 1024;
+
 #[derive(Debug, Default)]
 pub struct InputParser {
     pending: Vec<u8>,
@@ -143,6 +152,13 @@ impl InputParser {
             } else {
                 actions.push(InputAction::Forward(sequence));
             }
+        }
+
+        // The loop only leaves bytes in `pending` while waiting for
+        // the rest of an escape sequence. Nothing legitimate is 8 KiB
+        // of unfinished escape — flush it raw and start over.
+        if self.pending.len() > MAX_PENDING_BYTES {
+            actions.push(InputAction::Forward(mem::take(&mut self.pending)));
         }
 
         actions

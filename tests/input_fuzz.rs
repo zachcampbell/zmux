@@ -36,6 +36,45 @@ fn env_u64(key: &str, default: u64) -> u64 {
     env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+// Regression: a terminal that opens an escape sequence and never
+// finishes it (`ESC [` then digits forever) used to grow `pending`
+// without bound — a slow OOM one layer above the VT ingester's
+// now-capped CSI/OSC buffers. Past 8 KiB the parser must flush the
+// garbage raw and reset instead of buffering it across reads.
+#[test]
+fn never_finalized_escape_does_not_grow_pending_forever() {
+    let mut parser = InputParser::default();
+    let mut forwarded = 0usize;
+    let mut pushed = 0usize;
+    // 1 MiB of unfinished CSI body, fed in 1 KiB slices.
+    let slice = [b'1'; 1024];
+    let actions = parser.push_bytes(b"\x1b[");
+    assert!(actions.is_empty(), "incomplete escape should buffer at first");
+    pushed += 2;
+    for _ in 0..1024 {
+        pushed += slice.len();
+        for action in parser.push_bytes(&slice) {
+            if let InputAction::Forward(bytes) = action {
+                forwarded += bytes.len();
+            }
+        }
+    }
+    // Nearly everything must have been flushed back out; the residue
+    // still buffered is at most one cap's worth, not a megabyte.
+    assert!(
+        pushed - forwarded <= 16 * 1024,
+        "pending grew unbounded: pushed {pushed}, forwarded {forwarded}"
+    );
+    // And the parser still works afterwards.
+    let actions = parser.push_bytes(b"plain");
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, InputAction::Forward(b) if b.ends_with(b"plain"))),
+        "parser must keep functioning after an overflow flush"
+    );
+}
+
 #[test]
 fn input_parser_survives_fuzzed_terminal_bytes() {
     let iters = env_u64("ZMUX_INPUT_FUZZ_ITERS", 2000);
