@@ -56,8 +56,16 @@ pub struct PtySize {
 impl PtySize {
     pub const fn new(rows: u16, cols: u16) -> Self {
         Self {
-            rows: if rows > MAX_PTY_ROWS { MAX_PTY_ROWS } else { rows },
-            cols: if cols > MAX_PTY_COLS { MAX_PTY_COLS } else { cols },
+            rows: if rows > MAX_PTY_ROWS {
+                MAX_PTY_ROWS
+            } else {
+                rows
+            },
+            cols: if cols > MAX_PTY_COLS {
+                MAX_PTY_COLS
+            } else {
+                cols
+            },
         }
     }
 }

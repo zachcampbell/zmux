@@ -48,3 +48,37 @@ jobs:
         run: cargo doc --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
+
+  fuzz-smoke:
+    name: fuzz smoke (rotating seeds)
+    runs-on: [self-hosted, zmux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The harnesses are deterministic: `cargo test` already re-runs
+      # the fixed default seeds in the `check` job. This job walks
+      # FRESH seed space on every CI run by deriving the seed from the
+      # run number, so coverage accumulates instead of re-checking the
+      # same cases forever. A failure prints the exact seed; reproduce
+      # locally with ZMUX_VT_FUZZ_SEED=<seed> ZMUX_VT_FUZZ_ITERS=1.
+      # Dev profile on purpose — overflow checks are where the
+      # arithmetic-panic class actually fires.
+      - name: VT ingester fuzz (5k fresh cases)
+        run: >
+          ZMUX_VT_FUZZ_ITERS=5000
+          ZMUX_VT_FUZZ_SEED=$(( 0x51000000 + GITHUB_RUN_NUMBER * 5000 ))
+          cargo test --test vt_fuzz -- --nocapture
+
+      - name: layout property tests (2k fresh cases)
+        run: >
+          ZMUX_LAYOUT_PROP_SEED=$(( 0x52000000 + GITHUB_RUN_NUMBER * 2000 ))
+          cargo test --test layout_props -- --nocapture
+
+      - name: input parser fuzz (2k fresh cases)
+        run: >
+          ZMUX_INPUT_FUZZ_SEED=$(( 0x53000000 + GITHUB_RUN_NUMBER * 2000 ))
+          cargo test --test input_fuzz -- --nocapture

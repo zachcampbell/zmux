@@ -33,7 +33,10 @@ impl Rng {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 // Regression: a terminal that opens an escape sequence and never
@@ -49,7 +52,10 @@ fn never_finalized_escape_does_not_grow_pending_forever() {
     // 1 MiB of unfinished CSI body, fed in 1 KiB slices.
     let slice = [b'1'; 1024];
     let actions = parser.push_bytes(b"\x1b[");
-    assert!(actions.is_empty(), "incomplete escape should buffer at first");
+    assert!(
+        actions.is_empty(),
+        "incomplete escape should buffer at first"
+    );
     pushed += 2;
     for _ in 0..1024 {
         pushed += slice.len();

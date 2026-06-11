@@ -126,8 +126,24 @@ const DIMS: &[u16] = &[0, 1, 2, 3, 4, 8, 24, 25, 80, 81, 132, 200, 255];
 // Wide chars, combining marks, ZWJ emoji, box drawing — the width
 // table's audited edge cases plus things real agent CLIs emit.
 const UNICODE_POOL: &[&str] = &[
-    "é", "漢", "字", "🎉", "👍🏽", "👨‍👩‍👧‍👦", "│", "█", "╭", "─", "·", "\u{0301}", "\u{200D}",
-    "ﬀ", "𝕫", "ｗ", "🇺🇸", "…",
+    "é",
+    "漢",
+    "字",
+    "🎉",
+    "👍🏽",
+    "👨‍👩‍👧‍👦",
+    "│",
+    "█",
+    "╭",
+    "─",
+    "·",
+    "\u{0301}",
+    "\u{200D}",
+    "ﬀ",
+    "𝕫",
+    "ｗ",
+    "🇺🇸",
+    "…",
 ];
 
 fn gen_csi(rng: &mut Rng, out: &mut Vec<u8>) {
@@ -163,7 +179,9 @@ fn gen_csi(rng: &mut Rng, out: &mut Vec<u8>) {
             }
             // Mode numbers the ingester knows about.
             4 => {
-                let v = *rng.pick(&[1u64, 4, 25, 47, 1000, 1002, 1003, 1004, 1006, 1047, 1048, 1049, 2004, 2026]);
+                let v = *rng.pick(&[
+                    1u64, 4, 25, 47, 1000, 1002, 1003, 1004, 1006, 1047, 1048, 1049, 2004, 2026,
+                ]);
                 let _ = write!(out_as_string(out), "{v}");
             }
             // Empty param (consecutive separators).
@@ -193,10 +211,10 @@ fn gen_osc(rng: &mut Rng, out: &mut Vec<u8>) {
         }
     }
     match rng.below(4) {
-        0 => out.push(0x07),                      // BEL
-        1 => out.extend_from_slice(b"\x1b\\"),    // ST
-        2 => {}                                   // unterminated — next token interrupts
-        _ => out.push(0x9c),                      // 8-bit ST
+        0 => out.push(0x07),                   // BEL
+        1 => out.extend_from_slice(b"\x1b\\"), // ST
+        2 => {}                                // unterminated — next token interrupts
+        _ => out.push(0x9c),                   // 8-bit ST
     }
 }
 
@@ -325,7 +343,12 @@ fn gen_case(seed: u64, byte_budget: usize) -> Case {
             }
         }
     }
-    Case { rows, cols, scrollback, ops }
+    Case {
+        rows,
+        cols,
+        scrollback,
+        ops,
+    }
 }
 
 // ------------------------------------------------------ minimization
@@ -430,7 +453,10 @@ fn describe(case: &Case) -> String {
 // ------------------------------------------------------------- tests
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[test]

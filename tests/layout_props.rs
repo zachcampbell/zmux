@@ -136,7 +136,10 @@ fn assert_layout_sane(layout: &WorkspaceLayout, leaf_ids: &[usize], size: PtySiz
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[test]
@@ -198,7 +201,11 @@ fn layout_tree_survives_random_op_sequences() {
                 // Swap two leaves (occasionally one bogus).
                 6 => {
                     let a = rng.pick(&leaves);
-                    let b = if rng.below(8) == 0 { 8888 } else { rng.pick(&leaves) };
+                    let b = if rng.below(8) == 0 {
+                        8888
+                    } else {
+                        rng.pick(&leaves)
+                    };
                     let swapped = tree.swap_leaves(a, b);
                     let _ = swapped;
                 }

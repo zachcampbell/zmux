@@ -80,11 +80,7 @@ fn primary_cursor_moves_with_huge_counts_do_not_overflow() {
 // clamped at the screen edge, not warped back to the origin side).
 #[test]
 fn alt_screen_cursor_moves_with_huge_counts_clamp_to_edges() {
-    let (ingest, pane) = ingest(
-        4,
-        8,
-        b"\x1b[?1049h\x1b[H\x1b[9223372036854775808Bok",
-    );
+    let (ingest, pane) = ingest(4, 8, b"\x1b[?1049h\x1b[H\x1b[9223372036854775808Bok");
     // Cursor must have moved DOWN to the last row (clamped), so "ok"
     // renders on row 3 — not row 0, which is where a negative
     // sign-wrapped move would have left it.
@@ -124,8 +120,14 @@ fn oversized_csi_body_is_discarded_not_executed() {
     let _ = pane;
     let lines = ingest.render_lines(&pane);
     let joined = lines.join("\n");
-    assert!(joined.contains("after"), "text after the sequence must render: {joined:?}");
-    assert!(!joined.contains("111"), "CSI body bytes leaked into the grid: {joined:?}");
+    assert!(
+        joined.contains("after"),
+        "text after the sequence must render: {joined:?}"
+    );
+    assert!(
+        !joined.contains("111"),
+        "CSI body bytes leaked into the grid: {joined:?}"
+    );
 }
 
 #[test]

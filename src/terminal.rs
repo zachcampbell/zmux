@@ -2173,7 +2173,9 @@ fn parse_params(body: &str) -> Vec<Option<usize>> {
             if part.is_empty() {
                 None
             } else {
-                part.parse::<usize>().ok().map(|value| value.min(CSI_PARAM_MAX))
+                part.parse::<usize>()
+                    .ok()
+                    .map(|value| value.min(CSI_PARAM_MAX))
             }
         })
         .collect()
