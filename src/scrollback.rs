@@ -17,19 +17,15 @@ pub struct ScrollbackBuffer {
 }
 
 impl ScrollbackBuffer {
+    // Zero capacity / height are clamped to 1 rather than rejected:
+    // both can reach here from the outside world (a layout split on a
+    // tiny terminal can hand a pane 0 rows), and a degenerate-but-alive
+    // buffer beats a daemon panic.
     pub fn new(capacity: usize, viewport_height: usize) -> Self {
-        assert!(
-            capacity > 0,
-            "scrollback capacity must be greater than zero"
-        );
-        assert!(
-            viewport_height > 0,
-            "viewport height must be greater than zero"
-        );
-
+        let capacity = capacity.max(1);
         Self {
             capacity,
-            viewport_height,
+            viewport_height: viewport_height.max(1),
             lines: VecDeque::with_capacity(capacity),
             viewport_top: 0,
             follow_output: true,
@@ -107,12 +103,9 @@ impl ScrollbackBuffer {
     }
 
     pub fn set_viewport_height(&mut self, viewport_height: usize) {
-        assert!(
-            viewport_height > 0,
-            "viewport height must be greater than zero"
-        );
-
-        self.viewport_height = viewport_height;
+        // Clamped for the same reason as `new`: resize paths can
+        // legitimately compute a 0-row pane on a tiny terminal.
+        self.viewport_height = viewport_height.max(1);
         self.viewport_top = self.viewport_top.min(self.max_viewport_top());
         if self.follow_output {
             self.scroll_to_bottom();

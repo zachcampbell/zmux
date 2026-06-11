@@ -1192,6 +1192,14 @@ impl TerminalIngest {
         }
         self.primary_wrap_pending = false;
         let row = self.primary_cursor_row;
+        // The grid grows lazily, so the cursor can sit beyond its
+        // current tail (CUP/CNL clamp against the viewport, not grid
+        // length). Rows past the tail are implicitly blank — inserting
+        // blanks among them shifts nothing, so IL is a no-op there
+        // (and Vec::insert past len would panic).
+        if row >= self.primary_grid.len() {
+            return;
+        }
         let viewport = self.alternate.rows.max(1);
         let count = count.min(viewport.saturating_sub(row));
         for _ in 0..count {
@@ -1776,7 +1784,12 @@ impl AlternateScreen {
     }
 
     fn next_line(&mut self, count: usize) {
-        let count = count.max(1);
+        // Cap at 2×rows: once the cursor has reached the scroll bottom
+        // and the region has scrolled through its full height, every
+        // further linefeed leaves the screen in the same state, so a
+        // larger count is wasted work (parse_params already bounds the
+        // value; this keeps the loop O(rows) regardless).
+        let count = count.max(1).min(self.rows.saturating_mul(2).max(2));
         for _ in 0..count {
             self.linefeed();
         }
@@ -1785,10 +1798,7 @@ impl AlternateScreen {
 
     fn previous_line(&mut self, count: usize) {
         self.wrap_pending = false;
-        let count = count.max(1);
-        for _ in 0..count {
-            self.cursor_row = self.cursor_row.saturating_sub(1);
-        }
+        self.cursor_row = self.cursor_row.saturating_sub(count.max(1));
         self.carriage_return();
     }
 
@@ -2100,6 +2110,15 @@ fn parse_osc_palette_query(payload: &str, terminator: OscTerminator) -> Option<V
     Some(out)
 }
 
+// CSI parameters are clamped to 65 535, matching xterm. Screen
+// coordinates fit in u16, so no legitimate parameter exceeds this —
+// but an unclamped count is a CPU-exhaustion vector (`CSI
+// 18446744073709551615 b` would spin the REP loop for centuries) and
+// an overflow vector (`cursor + count` arithmetic in the movement
+// handlers). Values that don't parse at all (non-numeric, colon
+// sub-params) stay `None` and pick up each control's default.
+const CSI_PARAM_MAX: usize = 65_535;
+
 fn parse_params(body: &str) -> Vec<Option<usize>> {
     if body.is_empty() {
         return Vec::new();
@@ -2110,7 +2129,7 @@ fn parse_params(body: &str) -> Vec<Option<usize>> {
             if part.is_empty() {
                 None
             } else {
-                part.parse::<usize>().ok()
+                part.parse::<usize>().ok().map(|value| value.min(CSI_PARAM_MAX))
             }
         })
         .collect()
