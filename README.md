@@ -58,6 +58,8 @@ zmux mcp --session <name>  stdio bridge for MCP clients (Claude Code, Cursor, et
 | `o` / `p` | cycle focus next / previous |
 | `c` | open a new window |
 | `n` / `P` | next / previous window |
+| `Ctrl-a` (again) | toggle to the previously active window (screen-style `other`) |
+| `a` | send one literal `Ctrl-a` to the pane (readline beginning-of-line etc.) |
 | `1-9` | jump to window by index |
 | `&` | close active window (only when more than one exists) |
 | `{` / `}` | swap active pane with the previous / next pane |
@@ -77,7 +79,7 @@ zmux mcp --session <name>  stdio bridge for MCP clients (Claude Code, Cursor, et
 
 ### Supervisor overlay (`Ctrl-a A`)
 
-A live dashboard of every pane in the session.
+A live dashboard of every pane in the session — including panes in other windows, which carry a `w2:` tag and stay live in the list as session events stream in. `Enter` on a tagged row switches to that window and focuses the pane; kill, label, and broadcast reach panes in any window.
 
 ```
 ┌─ zmux supervisor [working] ─ 3 of 7 panes ─┐
@@ -184,7 +186,7 @@ Now Claude Code can call:
 | Tool | Purpose |
 |---|---|
 | `list_panes` | list every pane in the session with window index, state, label, last command, last exit, size |
-| `spawn_pane` | spawn a new pane running a command (`split`: `"h"`, `"v"`, or `"window"`) |
+| `spawn_pane` | spawn a new pane running a command (`split`: `"h"`, `"v"`, or `"window"`; window spawns land in the background and do not steal the attached client's view) |
 | `send_keys` | type into a pane (`enter: true` presses Enter; `clear_input` sends Ctrl-U first; `expect_text` waits for a sentinel in settled output) |
 | `wait_pane` | wait for a pane to settle or for `expect_text` without sending input |
 | `read_pane` | read pane text (`mode`: `"visible"` \| `"scrollback"`, optional `strip_ansi`) |
@@ -345,7 +347,7 @@ The daemon stays sync. The MCP listener thread accepts connections, per-conn thr
 ## Current limits
 
 - newly-created windows use distinct pane-id ranges so MCP tools can address panes across windows without colliding with the original window.
-- the supervisor overlay remains window-local, while the MCP `list_panes` tool, `watch_events`, and `zmux://panes` resource are session-wide.
+- the supervisor overlay is session-wide like the MCP surface: it lists every window's panes (foreign rows tagged `w2:`), stays live via the session event bus, and attach/kill/label/broadcast reach any window.
 - only one client at a time may be attached; the daemon rejects a second concurrent attach with `Busy`.
 - no per-client viewport state yet; the attached client owns the whole workspace.
 - the VT subset is targeted at agent CLIs (`claude`, `codex`, `aider`); full xterm/htop/btop parity is not a goal.

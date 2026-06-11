@@ -26,6 +26,15 @@ pub struct WindowPaneSummaryView {
 pub struct WindowSet {
     windows: Vec<Workspace>,
     active: usize,
+    // Window that was active before the most recent switch, for the
+    // Ctrl-a Ctrl-a "last window" toggle (GNU screen's `other`).
+    // Kept in-bounds by the close-window index fixup below.
+    last_active: usize,
+    // Live while the supervisor overlay is open: a session-bus
+    // subscription that `pump_supervisor_events` drains each frame so
+    // panes in OTHER windows stay live in the overlay (the owning
+    // workspace only mirrors its own events). Dropped on close.
+    supervisor_events: Option<mpsc::Receiver<Event>>,
     session_event_bus: Arc<Mutex<EventBus>>,
     next_window_pane_base: PaneId,
     // Cached so every new window inherits the same config-derived
@@ -52,6 +61,8 @@ impl WindowSet {
         let mut set = Self {
             windows: vec![first],
             active: 0,
+            last_active: 0,
+            supervisor_events: None,
             session_event_bus,
             next_window_pane_base: WINDOW_PANE_ID_STRIDE,
             shell,
@@ -222,6 +233,138 @@ impl WindowSet {
         ))
     }
 
+    /// Open the supervisor overlay on the ACTIVE window, seeded with
+    /// every pane in the session. Panes from other windows carry a
+    /// 1-based window tag (`w2:` in the dashboard) so the user knows
+    /// Enter will switch windows. Also arms the session-bus pump that
+    /// keeps foreign rows live while the overlay is open.
+    pub fn open_supervisor(&mut self) {
+        let active_index = self.active;
+        let rows: Vec<crate::supervisor::SupervisorRow> = self
+            .pane_summaries_all()
+            .into_iter()
+            .map(|view| crate::supervisor::SupervisorRow {
+                pane_id: view.pane.pane_id,
+                label: view.pane.label,
+                state: view.pane.state.as_wire(),
+                last_command: view.pane.last_command,
+                age_secs: 0,
+                window: if view.window_index == active_index {
+                    None
+                } else {
+                    Some(view.window_index + 1)
+                },
+            })
+            .collect();
+        self.supervisor_events = Some(self.subscribe_events());
+        self.active_mut().open_supervisor_with_rows(rows);
+    }
+
+    pub fn supervisor_open(&self) -> bool {
+        self.active().supervisor_open()
+    }
+
+    /// Session-wide key router for the open overlay. The active
+    /// workspace runs the UI state machine; actions it reports back
+    /// (attach / kill / label / broadcast) execute here so they reach
+    /// panes in ANY window, not just the overlay's own.
+    pub fn supervisor_handle_key(&mut self, byte: u8) -> io::Result<bool> {
+        let (dirty, action) = self.active_mut().supervisor_key(byte);
+        if let Some(action) = action {
+            use crate::workspace::SupervisorAction;
+            match action {
+                SupervisorAction::Attach(pane_id) => {
+                    self.focus_pane_anywhere(pane_id);
+                }
+                SupervisorAction::Kill(pane_id) => {
+                    // NotFound (stale row) is not an error worth
+                    // tearing the overlay down over; ignore it.
+                    if let Err(err) = self.kill_pane_by_id(pane_id)
+                        && err.kind() != io::ErrorKind::NotFound
+                    {
+                        return Err(err);
+                    }
+                }
+                SupervisorAction::SetLabel(pane_id, label) => {
+                    self.set_pane_label(pane_id, label);
+                }
+                SupervisorAction::Broadcast(payload, recipients) => {
+                    for pane_id in recipients {
+                        let _ = self.send_pty_input(pane_id, payload.as_bytes());
+                    }
+                }
+            }
+            self.maybe_drop_supervisor_pump();
+            return Ok(true);
+        }
+        self.maybe_drop_supervisor_pump();
+        Ok(dirty)
+    }
+
+    /// Per-frame drain of the session bus into the open overlay.
+    /// Events about the active window's own panes are skipped — the
+    /// workspace's `publish_event` already mirrored those — so this
+    /// only carries news from OTHER windows. Returns true when the
+    /// overlay changed and the frame should be re-rendered.
+    pub fn pump_supervisor_events(&mut self) -> bool {
+        if !self.supervisor_open() {
+            self.supervisor_events = None;
+            return false;
+        }
+        let Some(rx) = self.supervisor_events.as_ref() else {
+            return false;
+        };
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        if events.is_empty() {
+            return false;
+        }
+        let active_index = self.active;
+        let mut dirty = false;
+        for event in events {
+            let pane_id = match &event {
+                Event::PaneSpawned { pane_id, .. }
+                | Event::PaneClosed { pane_id }
+                | Event::PaneStateChanged { pane_id, .. }
+                | Event::PaneOutput { pane_id, .. }
+                | Event::PaneExited { pane_id, .. }
+                | Event::LabelChanged { pane_id, .. } => *pane_id,
+            };
+            if self.windows[active_index].has_pane(pane_id) {
+                continue;
+            }
+            let window_tag = self
+                .windows
+                .iter()
+                .position(|w| w.has_pane(pane_id))
+                .map(|idx| idx + 1);
+            dirty |= self.windows[active_index].supervisor_apply_foreign_event(&event, window_tag);
+        }
+        dirty
+    }
+
+    fn maybe_drop_supervisor_pump(&mut self) {
+        if !self.active().supervisor_open() {
+            self.supervisor_events = None;
+        }
+    }
+
+    /// Make `pane_id` the focused pane, switching the active window
+    /// first when it lives elsewhere. Used by the supervisor's
+    /// Enter→attach across windows.
+    pub fn focus_pane_anywhere(&mut self, pane_id: u32) -> bool {
+        let Some(window_index) = self.windows.iter().position(|w| w.has_pane(pane_id)) else {
+            return false;
+        };
+        if window_index != self.active {
+            self.switch_active(window_index);
+        }
+        self.windows[window_index].change_active(pane_id as crate::layout::PaneId);
+        true
+    }
+
     pub fn window_count(&self) -> usize {
         self.windows.len()
     }
@@ -250,8 +393,7 @@ impl WindowSet {
         // left label stays consistent across windows.
         workspace.set_status_label_override(self.status_label_override.clone());
         self.windows.push(workspace);
-        self.active = self.windows.len() - 1;
-        self.sync_window_indicator();
+        self.switch_active(self.windows.len() - 1);
         self.publish_session_event(Event::PaneSpawned {
             pane_id: pane_id as u32,
             label: None,
@@ -278,7 +420,12 @@ impl WindowSet {
         workspace.set_session_event_bus(self.session_event_bus.clone());
         workspace.set_status_label_override(self.status_label_override.clone());
         self.windows.push(workspace);
-        self.active = self.windows.len() - 1;
+        // Deliberately NOT switching the active window: this is the
+        // programmatic spawn path (MCP split="window"), and yanking
+        // the attached human's view to a worker window every time an
+        // agent spawns one is hostile. tmux's `new-window -d` is the
+        // same call. The human path (`new_window`, Ctrl-a c) still
+        // focuses the newcomer.
         self.sync_window_indicator();
         self.publish_session_event(Event::PaneSpawned {
             pane_id: pane_id as u32,
@@ -324,8 +471,7 @@ impl WindowSet {
         if index >= self.windows.len() || index == self.active {
             return false;
         }
-        self.active = index;
-        self.sync_window_indicator();
+        self.switch_active(index);
         true
     }
 
@@ -333,8 +479,7 @@ impl WindowSet {
         if self.windows.len() <= 1 {
             return false;
         }
-        self.active = (self.active + 1) % self.windows.len();
-        self.sync_window_indicator();
+        self.switch_active((self.active + 1) % self.windows.len());
         true
     }
 
@@ -342,9 +487,32 @@ impl WindowSet {
         if self.windows.len() <= 1 {
             return false;
         }
-        self.active = (self.active + self.windows.len() - 1) % self.windows.len();
-        self.sync_window_indicator();
+        self.switch_active((self.active + self.windows.len() - 1) % self.windows.len());
         true
+    }
+
+    /// Ctrl-a Ctrl-a: jump to the window that was active before the
+    /// most recent switch (GNU screen's `other`). With exactly two
+    /// windows this cycles between them. Returns false when there is
+    /// nowhere to go (single window, or the remembered window was the
+    /// current one — e.g. right after session start).
+    pub fn toggle_last_window(&mut self) -> bool {
+        let target = self.last_active.min(self.windows.len().saturating_sub(1));
+        if target == self.active {
+            return false;
+        }
+        self.switch_active(target);
+        true
+    }
+
+    // All window switches funnel through here so `last_active` always
+    // remembers where Ctrl-a Ctrl-a should jump back to.
+    fn switch_active(&mut self, index: usize) {
+        if index != self.active {
+            self.last_active = self.active;
+        }
+        self.active = index;
+        self.sync_window_indicator();
     }
 
     // Close the active window. Returns Ok(true) if a window was
@@ -366,6 +534,16 @@ impl WindowSet {
         } else if self.active >= self.windows.len() {
             self.active = self.windows.len() - 1;
         }
+        // Keep the Ctrl-a Ctrl-a target meaningful across removals:
+        // shift it down past the removed slot, and if the removed
+        // window WAS the remembered one, fall back to the current
+        // active (making the toggle a no-op rather than a surprise).
+        if self.last_active > index {
+            self.last_active -= 1;
+        } else if self.last_active == index {
+            self.last_active = self.active;
+        }
+        self.last_active = self.last_active.min(self.windows.len() - 1);
         self.sync_window_indicator();
         Ok(true)
     }
@@ -643,5 +821,156 @@ mod tests {
             multi.iter().any(|line| line.contains("[w:2/2]")),
             "status bar should show active/total window indicator: {multi:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod session_supervisor_tests {
+    use super::*;
+    use crate::config::{DEFAULT_SCROLLBACK_LINES, DEFAULT_STATUS_BAR_HINTS};
+
+    fn build() -> WindowSet {
+        let workspace = Workspace::spawn_single_named_with_options(
+            "/bin/sh",
+            PtySize::new(24, 80),
+            "test",
+            DEFAULT_SCROLLBACK_LINES,
+            DEFAULT_STATUS_BAR_HINTS,
+        )
+        .expect("spawn initial workspace");
+        WindowSet::new(
+            workspace,
+            "/bin/sh".to_string(),
+            "test".to_string(),
+            DEFAULT_SCROLLBACK_LINES,
+            DEFAULT_STATUS_BAR_HINTS,
+            None,
+        )
+    }
+
+    #[test]
+    fn supervisor_seeds_rows_from_every_window_with_tags() {
+        let mut set = build();
+        let w2_pane = set.new_window_with_command("sleep 5").expect("window 2");
+        // Programmatic window spawns stay in the background, so the
+        // overlay opens on window 1; the worker pane is foreign.
+        assert_eq!(
+            set.active_index(),
+            0,
+            "MCP window spawn must not steal focus"
+        );
+        set.open_supervisor();
+        let state = set.active().supervisor_state().expect("overlay open");
+        assert_eq!(state.rows.len(), 2, "both windows' panes are listed");
+        let local = state.rows.iter().find(|r| r.pane_id == 1).expect("w1 row");
+        assert_eq!(local.window, None, "local pane renders untagged");
+        let foreign = state
+            .rows
+            .iter()
+            .find(|r| r.pane_id == w2_pane)
+            .expect("w2 row");
+        assert_eq!(foreign.window, Some(2), "foreign pane carries window tag");
+    }
+
+    #[test]
+    fn supervisor_enter_attaches_across_windows() {
+        let mut set = build();
+        set.new_window().expect("window 2");
+        assert_eq!(set.active_index(), 1);
+        set.open_supervisor();
+        // Row order follows window order, so row 0 is window 1's
+        // genesis pane (id 1). j/k start at index 0 → Enter attaches.
+        let dirty = set.supervisor_handle_key(b'\r').expect("enter");
+        assert!(dirty);
+        assert_eq!(
+            set.active_index(),
+            0,
+            "Enter on a foreign pane switches the active window"
+        );
+        assert!(!set.supervisor_open(), "overlay closes after attach");
+    }
+
+    #[test]
+    fn supervisor_kill_reaches_foreign_windows() {
+        let mut set = build();
+        let victim = set.new_window_with_command("sleep 30").expect("window 2");
+        // Background spawn leaves window 1 active; overlay opens here.
+        assert_eq!(set.active_index(), 0);
+        set.open_supervisor();
+        // Move selection onto the foreign pane's row, then K + y.
+        set.supervisor_handle_key(b'j').unwrap();
+        set.supervisor_handle_key(b'K').unwrap();
+        set.supervisor_handle_key(b'y').unwrap();
+        assert_eq!(
+            set.window_count(),
+            1,
+            "killing window 2's only pane closes that window"
+        );
+        assert!(
+            set.find_pane_mut(victim as usize).is_none(),
+            "foreign pane is gone"
+        );
+    }
+
+    #[test]
+    fn foreign_window_events_reach_the_open_overlay() {
+        let mut set = build();
+        set.new_window().expect("window 2");
+        assert!(set.select_window(0));
+        set.open_supervisor();
+        let before = set.active().supervisor_state().unwrap().rows.len();
+        // Spawning in window 2 publishes PaneSpawned on the session
+        // bus; the pump must add a tagged row to window 1's overlay.
+        let spawned = set.new_window_with_command("sleep 5").expect("window 3");
+        // The background spawn leaves window 1 active, overlay still
+        // up — exactly the daemon's per-frame pump situation.
+        assert_eq!(set.active_index(), 0);
+        let dirty = set.pump_supervisor_events();
+        assert!(dirty, "pump applies the foreign spawn");
+        let state = set.active().supervisor_state().unwrap();
+        assert_eq!(state.rows.len(), before + 1);
+        let row = state
+            .rows
+            .iter()
+            .find(|r| r.pane_id == spawned)
+            .expect("spawned row present");
+        assert_eq!(row.window, Some(3), "pumped row carries its window tag");
+    }
+
+    #[test]
+    fn last_window_toggle_jumps_between_recent_windows() {
+        let mut set = build();
+        set.new_window().expect("window 2");
+        set.new_window().expect("window 3");
+        assert_eq!(set.active_index(), 2);
+        // Last switch was 1 → 2, so toggle returns to 1, and again
+        // bounces back to 2.
+        assert!(set.toggle_last_window());
+        assert_eq!(set.active_index(), 1);
+        assert!(set.toggle_last_window());
+        assert_eq!(set.active_index(), 2);
+        // Single-window set: nothing to toggle to.
+        let mut solo = build();
+        assert!(!solo.toggle_last_window());
+    }
+
+    #[test]
+    fn last_window_survives_window_removal() {
+        let mut set = build();
+        set.new_window().expect("window 2");
+        set.new_window().expect("window 3");
+        // active=2, last=1. Closing window 1 shifts indices down:
+        // the remembered window (old index 1) becomes index 0... but
+        // window removal targets the ACTIVE window here, so go to
+        // window 0 first (active=0, last=2) then close it.
+        assert!(set.select_window(0));
+        set.close_active_window().expect("close window 1");
+        // Old window 3 (index 2) is now index 1; remembered index 2
+        // must have been shifted/clamped, and toggling stays in
+        // bounds whatever it now points at.
+        let active_before = set.active_index();
+        let _ = set.toggle_last_window();
+        assert!(set.active_index() < set.window_count());
+        let _ = active_before;
     }
 }

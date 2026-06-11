@@ -62,6 +62,7 @@ const CLIENT_CAPTURE: u8 = 53;
 const CLIENT_LIST_PANES: u8 = 54;
 const CLIENT_OPEN_SUPERVISOR: u8 = 55;
 const CLIENT_SET_LABEL: u8 = 56;
+const CLIENT_LAST_WINDOW: u8 = 57;
 
 const SERVER_FRAME: u8 = 1;
 const SERVER_EXITED: u8 = 2;
@@ -124,6 +125,7 @@ pub enum ClientMessage {
     CloseWindow,
     NextWindow,
     PreviousWindow,
+    LastWindow,
     ToggleSyncPanes,
     CyclePreset,
     SelectWindow(u8),
@@ -342,6 +344,7 @@ pub fn encode_client_message(message: &ClientMessage) -> io::Result<Vec<u8>> {
         ClientMessage::CloseWindow => body.push(CLIENT_CLOSE_WINDOW),
         ClientMessage::NextWindow => body.push(CLIENT_NEXT_WINDOW),
         ClientMessage::PreviousWindow => body.push(CLIENT_PREVIOUS_WINDOW),
+        ClientMessage::LastWindow => body.push(CLIENT_LAST_WINDOW),
         ClientMessage::ToggleSyncPanes => body.push(CLIENT_TOGGLE_SYNC_PANES),
         ClientMessage::CyclePreset => body.push(CLIENT_CYCLE_PRESET),
         ClientMessage::SelectWindow(index) => {
@@ -594,6 +597,7 @@ fn parse_client_message(frame: &[u8]) -> io::Result<ClientMessage> {
         CLIENT_CLOSE_WINDOW if rest.is_empty() => Ok(ClientMessage::CloseWindow),
         CLIENT_NEXT_WINDOW if rest.is_empty() => Ok(ClientMessage::NextWindow),
         CLIENT_PREVIOUS_WINDOW if rest.is_empty() => Ok(ClientMessage::PreviousWindow),
+        CLIENT_LAST_WINDOW if rest.is_empty() => Ok(ClientMessage::LastWindow),
         CLIENT_TOGGLE_SYNC_PANES if rest.is_empty() => Ok(ClientMessage::ToggleSyncPanes),
         CLIENT_CYCLE_PRESET if rest.is_empty() => Ok(ClientMessage::CyclePreset),
         CLIENT_SELECT_WINDOW => {
@@ -928,6 +932,7 @@ mod tests {
             ClientMessage::CloseWindow,
             ClientMessage::NextWindow,
             ClientMessage::PreviousWindow,
+            ClientMessage::LastWindow,
             ClientMessage::ToggleSyncPanes,
             ClientMessage::CyclePreset,
             ClientMessage::SelectWindow(0),

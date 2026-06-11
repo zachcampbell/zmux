@@ -85,6 +85,11 @@ pub struct SupervisorRow {
     pub state: String,
     pub last_command: Option<String>,
     pub age_secs: u64,
+    // 1-based window number, set only for panes living in a window
+    // other than the one the overlay opened from. `None` rows render
+    // plain; `Some(n)` rows get a `wN:` tag so the user knows Enter
+    // will switch windows.
+    pub window: Option<usize>,
 }
 
 impl SupervisorState {
@@ -101,6 +106,9 @@ impl SupervisorState {
                     state: "Idle".into(),
                     last_command: None,
                     age_secs: 0,
+                    // Events carry no window id; WindowSet's pump
+                    // annotates foreign rows right after applying.
+                    window: None,
                 });
             }
             Event::PaneClosed { pane_id } => {
@@ -554,10 +562,13 @@ fn format_body_line(inner_width: usize, content: &str) -> String {
 
 fn format_row(inner_width: usize, row: &SupervisorRow) -> String {
     let glyph = state_glyph(&row.state);
-    let label = row
+    let mut label = row
         .label
         .clone()
         .unwrap_or_else(|| format!("pane #{}", row.pane_id));
+    if let Some(window) = row.window {
+        label = format!("w{window}:{label}");
+    }
     let state = state_display(&row.state);
     let cmd = row.last_command.clone().unwrap_or_else(|| "—".to_string());
     let age = humanize_age(row.age_secs);

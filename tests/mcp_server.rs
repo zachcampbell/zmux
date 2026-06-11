@@ -1062,9 +1062,9 @@ fn spawn_pane_window_split_creates_new_window_and_returns_pane_id() {
         "fresh window's genesis pane id should not collide with the original pane"
     );
 
-    // The new window is now active. list_panes returns the whole
-    // session, so we should see both the original pane and the new
-    // window's unique pane id.
+    // Programmatic window spawns must NOT steal focus (tmux
+    // `new-window -d` semantics): the worker lands at window_index 1
+    // in the background and the original window stays active.
     thread::sleep(Duration::from_millis(150));
     let list = round_trip(
         &name,
@@ -1080,9 +1080,15 @@ fn spawn_pane_window_split_creates_new_window_and_returns_pane_id() {
     assert!(
         arr.iter()
             .any(|pane| pane["pane_id"] == spawn_payload["pane_id"]
-                && pane["active_window"] == true
+                && pane["active_window"] == false
                 && pane["window_index"] == 1),
-        "new window pane missing from list_panes: {}",
+        "worker window should exist in the background: {}",
+        list["result"]["structuredContent"],
+    );
+    assert!(
+        arr.iter()
+            .any(|pane| pane["pane_id"] == 1 && pane["active_window"] == true),
+        "original window must keep focus after an MCP window spawn: {}",
         list["result"]["structuredContent"],
     );
     cleanup(&name, child);

@@ -449,6 +449,9 @@ pub fn attach_session(name: &str) -> io::Result<AttachOutcome> {
                 AttachInput::NextWindow => {
                     send_client_message(&mut stream, &ClientMessage::NextWindow)?;
                 }
+                AttachInput::LastWindow => {
+                    send_client_message(&mut stream, &ClientMessage::LastWindow)?;
+                }
                 AttachInput::PreviousWindow => {
                     send_client_message(&mut stream, &ClientMessage::PreviousWindow)?;
                 }
@@ -820,9 +823,9 @@ fn run_server_loop(
                         // bytes to the focused pane's PTY while the
                         // overlay is open — they are dashboard
                         // controls, not shell input.
-                        if windows.active().supervisor_open() {
+                        if windows.supervisor_open() {
                             for &b in bytes.iter() {
-                                dirty |= windows.active_mut().supervisor_handle_key(b)?;
+                                dirty |= windows.supervisor_handle_key(b)?;
                             }
                             continue;
                         }
@@ -1137,6 +1140,9 @@ fn run_server_loop(
                     ClientMessage::PreviousWindow => {
                         dirty |= windows.previous_window();
                     }
+                    ClientMessage::LastWindow => {
+                        dirty |= windows.toggle_last_window();
+                    }
                     ClientMessage::ToggleSyncPanes => {
                         dirty |= windows.active_mut().toggle_sync_panes();
                     }
@@ -1188,7 +1194,7 @@ fn run_server_loop(
                         pane_list_replies.push((index, summaries));
                     }
                     ClientMessage::OpenSupervisor => {
-                        windows.active_mut().open_supervisor();
+                        windows.open_supervisor();
                         dirty = true;
                     }
                     ClientMessage::SetLabel { pane_id, label } => {
@@ -1294,6 +1300,14 @@ fn run_server_loop(
         // met or whose deadline has fired. Runs every iteration so
         // the wait granularity is bounded by SERVER_POLL_MS (20ms).
         if mcp::tick_pending(windows, &mut pending_mcp) {
+            dirty = true;
+        }
+
+        // While the supervisor overlay is open, drain session-bus
+        // events from OTHER windows into it so background panes stay
+        // live in the dashboard (the active workspace mirrors only
+        // its own events).
+        if windows.pump_supervisor_events() {
             dirty = true;
         }
 
@@ -1792,6 +1806,7 @@ impl Default for PrefixKeyParser {
 enum AttachInput {
     Forward(Vec<u8>),
     Detach,
+    LastWindow,
     SplitPaneColumns,
     SplitPaneRows,
     ClosePane,
@@ -1838,6 +1853,24 @@ impl PrefixKeyParser {
         for &byte in bytes {
             if self.pending_prefix {
                 self.pending_prefix = false;
+                // Double prefix (Ctrl-a Ctrl-a) toggles back to the
+                // previously active window, GNU-screen style. The
+                // literal prefix byte is still reachable for the
+                // shell via `Ctrl-a a` below.
+                if byte == self.prefix_byte {
+                    if !forward.is_empty() {
+                        actions.push(AttachInput::Forward(std::mem::take(&mut forward)));
+                    }
+                    actions.push(AttachInput::LastWindow);
+                    continue;
+                }
+                // Ctrl-a a: forward one literal prefix byte (screen's
+                // convention) so readline's beginning-of-line etc.
+                // remain reachable inside panes.
+                if byte == b'a' {
+                    forward.push(self.prefix_byte);
+                    continue;
+                }
                 let bound = match byte {
                     b'd' => Some(AttachInput::Detach),
                     b'|' => Some(AttachInput::SplitPaneColumns),

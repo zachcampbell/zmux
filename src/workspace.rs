@@ -73,6 +73,18 @@ enum PromptState {
     },
 }
 
+// What the supervisor UI state machine asked the caller to do after a
+// key press. Returned by `Workspace::supervisor_key`; executed either
+// window-locally (`Workspace::supervisor_handle_key`) or session-wide
+// (`WindowSet::supervisor_handle_key`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SupervisorAction {
+    Attach(u32),
+    Kill(u32),
+    SetLabel(u32, Option<String>),
+    Broadcast(String, Vec<u32>),
+}
+
 /// Public mirror of `PromptState` variants — returned by
 /// [`Workspace::active_prompt_kind`] so callers can branch on the kind without
 /// access to the private `PromptState` enum.
@@ -1359,9 +1371,53 @@ impl Workspace {
                 state: s.state.as_wire(),
                 last_command: s.last_command,
                 age_secs: 0,
+                window: None,
             });
         }
         self.supervisor = Some(state);
+    }
+
+    /// Open the supervisor with a caller-built row set. `WindowSet`
+    /// uses this to seed the overlay with every pane in the SESSION
+    /// (foreign rows carrying their `window` tag), not just this
+    /// window's panes.
+    pub(crate) fn open_supervisor_with_rows(&mut self, rows: Vec<SupervisorRow>) {
+        let mut state = SupervisorState::new();
+        state.rows = rows;
+        self.supervisor = Some(state);
+    }
+
+    /// Apply a session-bus event to the open overlay (no-op when
+    /// closed). `WindowSet::pump_supervisor_events` feeds events from
+    /// OTHER windows through here; this workspace's own events arrive
+    /// via the `publish_event` mirror. Returns true when the overlay
+    /// was open (so the caller can mark the frame dirty), and gives
+    /// back the row set for post-apply annotation.
+    pub(crate) fn supervisor_apply_foreign_event(
+        &mut self,
+        event: &crate::events::Event,
+        window_tag: Option<usize>,
+    ) -> bool {
+        let Some(state) = self.supervisor.as_mut() else {
+            return false;
+        };
+        state.apply_event(event);
+        // PaneSpawned rows are created without a window; tag the new
+        // row so the user can see Enter will switch windows.
+        if let (Some(tag), crate::events::Event::PaneSpawned { pane_id, .. }) = (window_tag, event)
+            && let Some(row) = state.rows.iter_mut().find(|r| r.pane_id == *pane_id)
+        {
+            row.window = Some(tag);
+        }
+        true
+    }
+
+    /// Whether `pane_id` belongs to this workspace. The supervisor
+    /// pump uses this to tell local events (already mirrored by
+    /// `publish_event`) from foreign-window events.
+    pub(crate) fn has_pane(&self, pane_id: u32) -> bool {
+        let target: PaneId = pane_id as PaneId;
+        self.sessions.iter().any(|s| s.id == target)
     }
 
     /// Close the supervisor overlay (whether opened by Ctrl-a A or
@@ -1380,9 +1436,41 @@ impl Workspace {
     /// push a fresh frame to clients). When the overlay is closed
     /// (e.g. on `q`/`Esc` or after Enter→attach), the next call will
     /// no-op until `open_supervisor` is called again.
+    ///
+    /// Actions that touch panes execute against THIS workspace only.
+    /// The daemon routes through `WindowSet::supervisor_handle_key`
+    /// instead, which uses `Workspace::supervisor_key` to execute
+    /// the same actions session-wide. This wrapper remains for
+    /// single-window callers and tests.
     pub fn supervisor_handle_key(&mut self, byte: u8) -> io::Result<bool> {
+        let (dirty, action) = self.supervisor_key(byte);
+        if let Some(action) = action {
+            match action {
+                SupervisorAction::Attach(pane_id) => self.change_active(pane_id as PaneId),
+                SupervisorAction::Kill(pane_id) => {
+                    self.kill_pane_by_id(pane_id)?;
+                }
+                SupervisorAction::SetLabel(pane_id, label) => {
+                    self.set_pane_label(pane_id, label);
+                }
+                SupervisorAction::Broadcast(payload, recipients) => {
+                    let _ = self.broadcast_to_panes(payload.as_bytes(), &recipients);
+                }
+            }
+            return Ok(true);
+        }
+        Ok(dirty)
+    }
+
+    /// Advance the supervisor UI state machine by one key byte and
+    /// return what (if anything) the caller must now execute. The
+    /// overlay's pane rows can span every window in the session, so
+    /// the state machine itself never touches panes — it reports a
+    /// [`SupervisorAction`] and the caller picks the execution scope
+    /// (this workspace, or the whole `WindowSet`).
+    pub(crate) fn supervisor_key(&mut self, byte: u8) -> (bool, Option<SupervisorAction>) {
         if self.supervisor.is_none() {
-            return Ok(false);
+            return (false, None);
         }
 
         // Prioritise modal sub-states (kill confirm / label input /
@@ -1397,10 +1485,7 @@ impl Workspace {
                 .supervisor
                 .as_mut()
                 .and_then(|s| s.resolve_kill_confirm(byte));
-            if let Some(pane_id) = to_kill {
-                self.kill_pane_by_id(pane_id)?;
-            }
-            return Ok(true);
+            return (true, to_kill.map(SupervisorAction::Kill));
         }
 
         let in_label = self
@@ -1413,7 +1498,7 @@ impl Workspace {
                 if let Some(state) = self.supervisor.as_mut() {
                     state.cancel_label_input();
                 }
-                return Ok(true);
+                return (true, None);
             }
             let committed = self
                 .supervisor
@@ -1428,9 +1513,9 @@ impl Workspace {
                 } else {
                     Some(trimmed)
                 };
-                self.set_pane_label(pane_id, new_label);
+                return (true, Some(SupervisorAction::SetLabel(pane_id, new_label)));
             }
-            return Ok(true);
+            return (true, None);
         }
 
         // Broadcast modal: `b`-confirm or typing buffer takes
@@ -1438,7 +1523,7 @@ impl Workspace {
         // typed payload don't escape the modal.
         let broadcast_state = self.supervisor.as_ref().and_then(|s| s.broadcast.clone());
         if let Some(broadcast) = broadcast_state {
-            return self.handle_broadcast_key(broadcast, byte);
+            return self.broadcast_key(broadcast, byte);
         }
 
         // Main supervisor keymap.
@@ -1447,61 +1532,62 @@ impl Workspace {
                 if let Some(state) = self.supervisor.as_mut() {
                     state.move_down();
                 }
-                Ok(true)
+                (true, None)
             }
             b'k' => {
                 if let Some(state) = self.supervisor.as_mut() {
                     state.move_up();
                 }
-                Ok(true)
+                (true, None)
             }
             b'\r' | b'\n' => {
                 let target = self.supervisor.as_ref().and_then(|s| s.selected_pane());
                 self.close_supervisor();
-                if let Some(pane_id) = target {
-                    self.change_active(pane_id as PaneId);
-                }
-                Ok(true)
+                (true, target.map(SupervisorAction::Attach))
             }
             b'l' => {
                 if let Some(state) = self.supervisor.as_mut() {
                     state.begin_label_input();
                 }
-                Ok(true)
+                (true, None)
             }
             b'K' => {
                 if let Some(state) = self.supervisor.as_mut() {
                     state.begin_kill_confirm();
                 }
-                Ok(true)
+                (true, None)
             }
             b'f' => {
                 if let Some(state) = self.supervisor.as_mut() {
                     state.cycle_filter();
                 }
-                Ok(true)
+                (true, None)
             }
             b'b' => {
                 if let Some(state) = self.supervisor.as_mut() {
                     state.begin_broadcast_confirm();
                 }
-                Ok(true)
+                (true, None)
             }
             b'q' | 0x1b => {
                 self.close_supervisor();
-                Ok(true)
+                (true, None)
             }
-            _ => Ok(false),
+            _ => (false, None),
         }
     }
 
-    fn handle_broadcast_key(&mut self, broadcast: BroadcastState, byte: u8) -> io::Result<bool> {
+    fn broadcast_key(
+        &mut self,
+        broadcast: BroadcastState,
+        byte: u8,
+    ) -> (bool, Option<SupervisorAction>) {
         match broadcast {
             BroadcastState::Confirm => {
                 if let Some(state) = self.supervisor.as_mut() {
                     state.resolve_broadcast_confirm(byte);
                 }
-                Ok(true)
+                (true, None)
             }
             BroadcastState::Typing(_) => {
                 let payload = self
@@ -1514,9 +1600,12 @@ impl Workspace {
                         .as_ref()
                         .map(|s| s.broadcast_recipient_ids())
                         .unwrap_or_default();
-                    let _ = self.broadcast_to_panes(committed.as_bytes(), &recipients);
+                    return (
+                        true,
+                        Some(SupervisorAction::Broadcast(committed, recipients)),
+                    );
                 }
-                Ok(true)
+                (true, None)
             }
         }
     }
@@ -2801,7 +2890,7 @@ impl Workspace {
     // pane, `ESC[I` on the newly-active one). Per-PTY write failures
     // are swallowed so a dead/closing shell on one side can't block a
     // focus change from completing on the other.
-    fn change_active(&mut self, new_id: PaneId) {
+    pub(crate) fn change_active(&mut self, new_id: PaneId) {
         let old_id = self.active;
         self.active = new_id;
         if old_id == new_id {
