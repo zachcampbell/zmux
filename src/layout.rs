@@ -37,13 +37,17 @@ pub struct PaneLayout {
 
 impl PaneLayout {
     pub fn from_frame(frame: Rect) -> Self {
-        // Row 0 of each frame is the header; the rest is content.
+        // Row 0 of each frame is the header; the rest is content. A
+        // frame squeezed to 0 or 1 rows gets zero-height content —
+        // NOT a 1-row minimum, which would escape the frame and draw
+        // over whatever pane sits below. `pty_size()` still clamps
+        // the PTY itself to 1x1 so the child process stays alive.
         let header_height = 1u16;
         let content = Rect {
             x: frame.x,
             y: frame.y.saturating_add(header_height),
             width: frame.width,
-            height: frame.height.saturating_sub(header_height).max(1),
+            height: frame.height.saturating_sub(header_height),
         };
         Self { frame, content }
     }
@@ -515,18 +519,27 @@ impl LayoutNode {
                     SplitOrientation::Columns => {
                         let available = rect.width.saturating_sub(divider_count);
                         let widths = allocate(available, weights);
+                        // Children are clipped to the parent rect: the
+                        // allocator's 1-cell floor can hand out more
+                        // total width than `available` on an over-
+                        // constrained split, and an unclipped child
+                        // would spill into the parent's siblings (panes
+                        // drawing over each other). Trailing children
+                        // degrade to zero-width instead.
+                        let parent_right = rect.x.saturating_add(rect.width);
                         let mut cursor_x = rect.x;
                         for (index, (child, width)) in
                             children.iter().zip(widths.iter()).enumerate()
                         {
+                            let width = (*width).min(parent_right.saturating_sub(cursor_x));
                             let child_rect = Rect {
                                 x: cursor_x,
                                 y: rect.y,
-                                width: *width,
+                                width,
                                 height: rect.height,
                             };
                             child.lay_out(child_rect, panes, separators);
-                            cursor_x = cursor_x.saturating_add(*width);
+                            cursor_x = cursor_x.saturating_add(width).min(parent_right);
                             if index + 1 < children.len() {
                                 separators.push(Separator {
                                     orientation: SplitOrientation::Columns,
@@ -534,25 +547,28 @@ impl LayoutNode {
                                     y: rect.y,
                                     length: rect.height,
                                 });
-                                cursor_x = cursor_x.saturating_add(1);
+                                cursor_x = cursor_x.saturating_add(1).min(parent_right);
                             }
                         }
                     }
                     SplitOrientation::Rows => {
                         let available = rect.height.saturating_sub(divider_count);
                         let heights = allocate(available, weights);
+                        // Same clipping as the Columns branch above.
+                        let parent_bottom = rect.y.saturating_add(rect.height);
                         let mut cursor_y = rect.y;
                         for (index, (child, height)) in
                             children.iter().zip(heights.iter()).enumerate()
                         {
+                            let height = (*height).min(parent_bottom.saturating_sub(cursor_y));
                             let child_rect = Rect {
                                 x: rect.x,
                                 y: cursor_y,
                                 width: rect.width,
-                                height: *height,
+                                height,
                             };
                             child.lay_out(child_rect, panes, separators);
-                            cursor_y = cursor_y.saturating_add(*height);
+                            cursor_y = cursor_y.saturating_add(height).min(parent_bottom);
                             if index + 1 < children.len() {
                                 separators.push(Separator {
                                     orientation: SplitOrientation::Rows,
@@ -560,7 +576,7 @@ impl LayoutNode {
                                     y: cursor_y,
                                     length: rect.width,
                                 });
-                                cursor_y = cursor_y.saturating_add(1);
+                                cursor_y = cursor_y.saturating_add(1).min(parent_bottom);
                             }
                         }
                     }
