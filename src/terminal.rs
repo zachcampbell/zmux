@@ -30,6 +30,14 @@ pub struct TerminalIngest {
     state: ParseState,
     csi_buffer: Vec<u8>,
     osc_buffer: Vec<u8>,
+    // Set when csi_buffer / osc_buffer hit their caps. The parser
+    // keeps consuming the sequence's bytes (so they don't spray into
+    // the grid as text) but stops storing them, and the finished
+    // sequence is discarded as malformed. Without the caps, a stream
+    // that opens a CSI/OSC and never sends the terminator grows the
+    // buffer without bound — a slow OOM of the daemon.
+    csi_overflow: bool,
+    osc_overflow: bool,
     // Primary-screen 2D editable grid. Each entry is a row of cells; the
     // last row is the row the cursor currently sits in. Rows above are
     // older live rows that haven't yet been scrolled into pane scrollback.
@@ -139,6 +147,8 @@ impl TerminalIngest {
             state: ParseState::Ground,
             csi_buffer: Vec::new(),
             osc_buffer: Vec::new(),
+            csi_overflow: false,
+            osc_overflow: false,
             primary_grid: Vec::new(),
             primary_cursor_row: 0,
             primary_cursor_col: 0,
@@ -528,10 +538,12 @@ impl TerminalIngest {
         self.state = match byte {
             b'[' => {
                 self.csi_buffer.clear();
+                self.csi_overflow = false;
                 ParseState::Csi
             }
             b']' => {
                 self.osc_buffer.clear();
+                self.osc_overflow = false;
                 ParseState::Osc
             }
             b'P' => ParseState::Dcs,
@@ -585,11 +597,20 @@ impl TerminalIngest {
     fn handle_csi(&mut self, pane: &mut Pane, byte: u8) -> Option<Vec<u8>> {
         if (0x40..=0x7e).contains(&byte) {
             let buffer = mem::take(&mut self.csi_buffer);
-            let reply = self.process_csi(pane, buffer, byte);
+            let overflowed = mem::take(&mut self.csi_overflow);
             self.state = ParseState::Ground;
-            reply
+            if overflowed {
+                // The body blew past CSI_BUFFER_MAX — no real control
+                // sequence is that long. Discard it as malformed.
+                return None;
+            }
+            self.process_csi(pane, buffer, byte)
         } else {
-            self.csi_buffer.push(byte);
+            if self.csi_buffer.len() >= CSI_BUFFER_MAX {
+                self.csi_overflow = true;
+            } else {
+                self.csi_buffer.push(byte);
+            }
             None
         }
     }
@@ -1335,7 +1356,7 @@ impl TerminalIngest {
                 None
             }
             _ => {
-                self.osc_buffer.push(byte);
+                self.push_osc_byte(byte);
                 self.state = ParseState::Osc;
                 None
             }
@@ -1349,15 +1370,29 @@ impl TerminalIngest {
                 self.finish_osc(pane, OscTerminator::St)
             }
             _ => {
-                self.osc_buffer.push(b'\x1b');
-                self.osc_buffer.push(byte);
+                self.push_osc_byte(b'\x1b');
+                self.push_osc_byte(byte);
                 self.state = ParseState::Osc;
                 None
             }
         }
     }
 
+    fn push_osc_byte(&mut self, byte: u8) {
+        if self.osc_buffer.len() >= OSC_BUFFER_MAX {
+            self.osc_overflow = true;
+        } else {
+            self.osc_buffer.push(byte);
+        }
+    }
+
     fn finish_osc(&mut self, pane: &mut Pane, terminator: OscTerminator) -> Option<Vec<u8>> {
+        if mem::take(&mut self.osc_overflow) {
+            // Payload blew past OSC_BUFFER_MAX — discard as malformed
+            // rather than set a megabyte pane title.
+            self.osc_buffer.clear();
+            return None;
+        }
         let payload = String::from_utf8_lossy(&self.osc_buffer).into_owned();
         let reply = match payload.as_str() {
             // OSC 10/11 are foreground/background color queries. Agent
@@ -1995,6 +2030,15 @@ impl AlternateScreen {
         }
     }
 }
+
+// Caps on the CSI / OSC accumulation buffers. No real CSI body comes
+// close to 1 KiB; OSC gets 1 MiB (the same allowance as the
+// synchronized-output buffer) since titles and hyperlinks are small
+// but future pass-through payloads (OSC 52 clipboard) can be large.
+// Overflowing sequences are consumed and discarded as malformed —
+// the alternative is a slow OOM on a stream that never terminates.
+const CSI_BUFFER_MAX: usize = 1 << 10;
+const OSC_BUFFER_MAX: usize = 1 << 20;
 
 // The literal byte sequence that closes a Synchronized Output region
 // (DECRST 2026). Detected by `ingest_bytes` while the sync buffer is

@@ -107,6 +107,41 @@ fn insert_line_with_cursor_beyond_grid_tail_does_not_panic() {
     let (_, _) = ingest(24, 80, b"\x1b[20;1Hx\x1b[5;1H\x1b[24d\x1b[3L\x1b[3M");
 }
 
+// Memory-exhaustion class, found by inspection during the fuzz sweep:
+// the CSI and OSC accumulation buffers grew without bound while
+// waiting for a terminator that a malformed stream never sends. Both
+// are now capped (1 KiB / 1 MiB); overflowing sequences are consumed
+// and discarded as malformed instead of processed.
+#[test]
+fn oversized_csi_body_is_discarded_not_executed() {
+    // CSI + 8 KiB of parameter bytes + 'H' (CUP). Past the cap the
+    // sequence must be swallowed whole: not executed, and its bytes
+    // must not spray into the grid as text.
+    let mut bytes = b"start\r\n\x1b[".to_vec();
+    bytes.extend(std::iter::repeat_n(b'1', 8 * 1024));
+    bytes.extend_from_slice(b"Hafter");
+    let (ingest, pane) = ingest(4, 40, &bytes);
+    let _ = pane;
+    let lines = ingest.render_lines(&pane);
+    let joined = lines.join("\n");
+    assert!(joined.contains("after"), "text after the sequence must render: {joined:?}");
+    assert!(!joined.contains("111"), "CSI body bytes leaked into the grid: {joined:?}");
+}
+
+#[test]
+fn oversized_osc_payload_does_not_become_the_pane_title() {
+    // OSC 0;<2 MiB of A>;BEL — must not set a 2 MiB title, and the
+    // parser must resume cleanly after the BEL.
+    let mut bytes = b"\x1b]0;".to_vec();
+    bytes.extend(std::iter::repeat_n(b'A', 2 * 1024 * 1024));
+    bytes.push(0x07);
+    bytes.extend_from_slice(b"ok");
+    let (ingest, pane) = ingest(4, 40, &bytes);
+    assert!(pane.title().len() < 4096, "oversized OSC title was applied");
+    let lines = ingest.render_lines(&pane);
+    assert!(lines.join("\n").contains("ok"));
+}
+
 // DECSTBM with degenerate and out-of-range margins, then scroll ops —
 // exercises the scroll-region clamps on both screens.
 #[test]
