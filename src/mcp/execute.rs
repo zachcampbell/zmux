@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use serde_json::{Map, Value, json};
 
+use super::audit::AuditLog;
 use super::dispatch::{McpCall, ReadMode, SpawnSplit};
 use crate::agent::AgentState;
 use crate::events::Event;
@@ -25,6 +26,9 @@ pub enum McpRequest {
     ToolCall {
         call: McpCall,
         reply: Sender<McpResponse>,
+        // Daemon-lifetime id of the MCP connection that sent this
+        // call; 0 when there is none (tests). Audit-log context only.
+        conn_id: u64,
     },
     Subscribe {
         reply: Sender<Receiver<Event>>,
@@ -113,21 +117,29 @@ pub fn drain_requests(
     rx: &Receiver<McpRequest>,
     windows: &mut WindowSet,
     pending: &mut Vec<Pending>,
+    audit: &mut AuditLog,
 ) -> bool {
     let mut dirty = false;
     while let Ok(request) = rx.try_recv() {
         match request {
-            McpRequest::ToolCall { call, reply } => match execute_call(call, windows) {
-                Outcome::Done(response, mutated) => {
-                    let _ = reply.send(response);
-                    dirty |= mutated;
+            McpRequest::ToolCall {
+                call,
+                reply,
+                conn_id,
+            } => {
+                audit.record(conn_id, &call);
+                match execute_call(call, windows) {
+                    Outcome::Done(response, mutated) => {
+                        let _ = reply.send(response);
+                        dirty |= mutated;
+                    }
+                    Outcome::Defer(mut p, immediate_dirty) => {
+                        p.reply = reply;
+                        pending.push(p);
+                        dirty |= immediate_dirty;
+                    }
                 }
-                Outcome::Defer(mut p, immediate_dirty) => {
-                    p.reply = reply;
-                    pending.push(p);
-                    dirty |= immediate_dirty;
-                }
-            },
+            }
             McpRequest::Subscribe { reply } => {
                 let sub = windows.subscribe_events();
                 let _ = reply.send(sub);

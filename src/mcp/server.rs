@@ -78,16 +78,37 @@ pub fn spawn_listener(socket_path: PathBuf) -> io::Result<Receiver<McpRequest>> 
 }
 
 fn run_listener(listener: UnixListener, tx: Sender<McpRequest>) {
+    let mut next_conn_id: u64 = 1;
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
             Err(_) => continue,
         };
         let tx = tx.clone();
+        let conn_id = next_conn_id;
+        next_conn_id += 1;
         let _ = thread::Builder::new()
             .name("zmux-mcp-conn".into())
-            .spawn(move || handle_connection(stream, tx));
+            .spawn(move || {
+                CURRENT_CONN_ID.set(conn_id);
+                handle_connection(stream, tx)
+            });
     }
+}
+
+// Identity of the MCP connection served by this thread, recorded into
+// the audit log alongside each mutating tool call. Connections map
+// 1:1 to reader threads, so a thread-local carries the id into
+// `ship_to_main` without threading a parameter through every dispatch
+// signature. 0 means "not an MCP connection thread" (tests, future
+// in-process callers). Ids are daemon-lifetime sequence numbers — they
+// distinguish concurrent controllers, not users.
+thread_local! {
+    static CURRENT_CONN_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn current_conn_id() -> u64 {
+    CURRENT_CONN_ID.get()
 }
 
 /// Per-connection reader. Spawns a writer thread that owns the

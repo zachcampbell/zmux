@@ -1677,3 +1677,97 @@ fn stdio_bridge_synthesizes_errors_for_inflight_requests_on_daemon_death() {
     let _ = std::fs::remove_file(client_socket_path(&name));
     let _ = std::fs::remove_file(mcp_socket_path(&name));
 }
+
+// ---------------------------------------------------------------- audit
+
+/// Mutating tool calls (send_keys here) must land in the per-session
+/// audit log with a connection id; read-only calls (list_panes) must
+/// not. The daemon writes to $ZMUX_STATE_DIR/audit/<session>.jsonl,
+/// so point the state dir at a test-scoped temp directory.
+#[test]
+fn mutating_tool_calls_land_in_the_audit_log() {
+    let name = unique_name("mcp-audit");
+    let state_dir = std::env::temp_dir().join(format!("zmux-test-state-{name}"));
+    let exe = env!("CARGO_BIN_EXE_zmux");
+    let mut command = Command::new(exe);
+    command
+        .arg("serve")
+        .arg(&name)
+        .env("ZMUX_STATE_DIR", &state_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().expect("spawn zmux serve");
+
+    // A read-only call first — must NOT be audited.
+    let list = round_trip(
+        &name,
+        json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"list_panes","arguments":{}}
+        }),
+    );
+    assert_eq!(list["result"]["isError"], false);
+
+    // A mutating call — must be audited. Genesis pane id is 1.
+    let send = round_trip(
+        &name,
+        json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{
+                "name":"send_keys",
+                "arguments":{"pane_id":1,"keys":"echo audit-probe","enter":false}
+            }
+        }),
+    );
+    assert_eq!(send["result"]["isError"], false, "send_keys failed: {send}");
+
+    // The audit line is written before the tool executes, so it is on
+    // disk by the time the reply arrives; poll briefly anyway in case
+    // the filesystem is slow.
+    let audit_path = state_dir.join("audit").join(format!("{name}.jsonl"));
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let contents = loop {
+        match std::fs::read_to_string(&audit_path) {
+            Ok(s) if !s.is_empty() => break s,
+            _ if Instant::now() > deadline => {
+                panic!("audit log never appeared at {}", audit_path.display())
+            }
+            _ => thread::sleep(Duration::from_millis(20)),
+        }
+    };
+
+    let lines: Vec<Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("audit lines are JSON"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly the send_keys call is audited (list_panes is read-only): {contents}"
+    );
+    let entry = &lines[0];
+    assert_eq!(entry["tool"], "send_keys");
+    assert_eq!(entry["pane_id"], 1);
+    assert_eq!(entry["keys"], "echo audit-probe");
+    assert_eq!(entry["enter"], false);
+    assert!(
+        entry["conn"].as_u64().unwrap_or(0) >= 1,
+        "audit entries carry the MCP connection id: {entry}"
+    );
+    assert!(
+        entry["ts_ms"].as_u64().unwrap_or(0) > 0,
+        "audit entries carry a timestamp: {entry}"
+    );
+
+    cleanup(&name, child);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

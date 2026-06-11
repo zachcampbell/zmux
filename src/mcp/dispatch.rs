@@ -590,6 +590,7 @@ fn ship_to_main(call: McpCall, tx: &Sender<McpRequest>) -> Result<McpResponse, M
     tx.send(McpRequest::ToolCall {
         call,
         reply: reply_tx,
+        conn_id: super::server::current_conn_id(),
     })
     .map_err(|_| MethodError::internal("daemon main loop is gone"))?;
     reply_rx
@@ -609,7 +610,7 @@ mod tests {
 
     fn expect_tool_call(rx: &mpsc::Receiver<McpRequest>) -> (McpCall, Sender<McpResponse>) {
         match rx.recv().expect("expected a queued request") {
-            McpRequest::ToolCall { call, reply } => (call, reply),
+            McpRequest::ToolCall { call, reply, .. } => (call, reply),
             McpRequest::Subscribe { .. } => {
                 panic!("dispatch tests should not produce Subscribe requests");
             }

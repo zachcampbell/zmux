@@ -16,6 +16,7 @@
 //! - `stdio` — stdio↔socket bridge for MCP clients that launch zmux
 //!   as a subprocess.
 
+mod audit;
 mod bridge_state;
 mod dispatch;
 mod execute;
@@ -23,6 +24,7 @@ mod protocol;
 mod server;
 mod stdio;
 
+pub use audit::AuditLog;
 pub use execute::{McpRequest, Pending, drain_requests, tick_pending};
 pub use protocol::{JsonRpcRequest, event_notification, process_request_line_for_test};
 pub use server::{session_mcp_socket_path, spawn_listener};

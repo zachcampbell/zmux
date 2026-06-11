@@ -712,6 +712,15 @@ fn run_server_after_bind(
         }
     };
 
+    // Mutating MCP tool calls (send_keys, spawn_pane, kill_pane,
+    // set_label) are recorded per session; see mcp::audit. Only built
+    // when the MCP listener actually came up.
+    let mut mcp_audit = if mcp_rx.is_some() {
+        mcp::AuditLog::open(name)
+    } else {
+        mcp::AuditLog::disabled()
+    };
+
     let result = run_server_loop(
         listener,
         &mut windows,
@@ -719,6 +728,7 @@ fn run_server_after_bind(
         socket_path,
         &registry,
         mcp_rx.as_ref(),
+        &mut mcp_audit,
     );
     // Mirror the client-socket cleanup from `run_server`: the MCP
     // socket is daemon-scoped, so removing it on shutdown keeps the
@@ -734,6 +744,7 @@ fn run_server_loop(
     socket_path: &Path,
     registry: &CommandRegistry,
     mcp_rx: Option<&std::sync::mpsc::Receiver<mcp::McpRequest>>,
+    mcp_audit: &mut mcp::AuditLog,
 ) -> io::Result<i32> {
     // Tracks the last wall-clock second we rendered for a client so the
     // status bar clock ticks once per second even when nothing else
@@ -1275,7 +1286,7 @@ fn run_server_loop(
         // handlers (e.g. spawn_pane wait_for_idle) push into
         // `pending_mcp`; their replies fire from `tick_pending` below.
         if let Some(rx) = mcp_rx
-            && mcp::drain_requests(rx, windows, &mut pending_mcp)
+            && mcp::drain_requests(rx, windows, &mut pending_mcp, mcp_audit)
         {
             dirty = true;
         }
