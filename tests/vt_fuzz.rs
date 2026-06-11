@@ -372,8 +372,7 @@ fn minimize(mut case: Case) -> Case {
         let mut chunk = bytes.len().max(1);
         while chunk >= 1 {
             let mut i = 0;
-            loop {
-                let Op::Feed(bytes) = &case.ops[idx] else { break };
+            while let Op::Feed(bytes) = &case.ops[idx] {
                 if i >= bytes.len() {
                     break;
                 }

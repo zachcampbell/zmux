@@ -151,8 +151,9 @@ The prompted-split bindings `Ctrl-a !` (right) and `Ctrl-a ^` (down) accept any 
 
 **What does NOT protect the socket:**
 - There is no per-connection auth handshake, capability check, or rate limit beyond a 1 MiB JSON-RPC line cap and a 1024-payload outbound queue.
-- There is no audit log; the daemon does not record which client called `send_keys`.
 - The supervisor overlay's confirm-then-kill UX is for humans at the terminal — MCP clients bypass it entirely.
+
+**Audit log:** every mutating MCP call (`send_keys`, `spawn_pane`, `kill_pane`, `set_label`) is appended as a JSON line to `$ZMUX_STATE_DIR/audit/<session>.jsonl` (mode `0600`) with a timestamp and a per-connection id, so concurrent controllers can be told apart after the fact. This is forensics, not access control: it records what happened, it does not prevent anything, and connection ids identify sockets, not users. Keystroke payloads are truncated at 2 KiB.
 
 **Operational consequences:**
 - Treat any MCP client you wire up the same way you'd treat a logged-in shell on the same machine. The Claude Code config snippet below puts Claude Code in exactly that trust position.
@@ -316,7 +317,7 @@ agent_prompts  = ["│ > ", "architect> ", ">>> "]
 
 | Var | Purpose |
 |---|---|
-| `ZMUX_STATE_DIR` | override the state directory (default: `$XDG_STATE_HOME/zmux` or `~/.local/state/zmux`). Holds Claude hook event streams and pair-mode per-pane locks. |
+| `ZMUX_STATE_DIR` | override the state directory (default: `$XDG_STATE_HOME/zmux` or `~/.local/state/zmux`). Holds Claude hook event streams, pair-mode per-pane locks, and the per-session MCP audit logs (`audit/<session>.jsonl`). |
 | `ZMUX_PAIR_TIMEOUT_SECS` | Ollama HTTP timeout for `zmux pair`, in seconds (default: 60). Bump if your model + scrollback context routinely exceeds it. |
 | `ZMUX_PTY_DUMP` | **Debug only** — when set, every PTY ingest appends its raw bytes to the given path. Massive output; use the per-pane `zmux capture` command instead for normal bug repros. |
 
@@ -348,7 +349,7 @@ The daemon stays sync. The MCP listener thread accepts connections, per-conn thr
 - only one client at a time may be attached; the daemon rejects a second concurrent attach with `Busy`.
 - no per-client viewport state yet; the attached client owns the whole workspace.
 - the VT subset is targeted at agent CLIs (`claude`, `codex`, `aider`); full xterm/htop/btop parity is not a goal.
-- the VT and layout layers are still "crash on surprising input" in places — pathological agent output may panic the daemon rather than degrade gracefully. The fuzz surface is the byte stream the agent CLI emits. If you hit one, capture the failing bytes with `zmux capture <session> <pane> /tmp/repro.bin` and inspect with `cargo run --example replay -- /tmp/repro.bin` so the case can be added to the test fixtures.
+- the VT and layout layers are fuzzed for robustness, not correctness: a deterministic fuzz harness (`tests/vt_fuzz.rs`, with `tests/layout_props.rs` and `tests/input_fuzz.rs` covering layout trees and client input) drives hostile byte streams, resizes, and render calls — hundreds of thousands of cases run panic- and hang-free, hostile CSI/OSC payloads are clamped or discarded, and over-constrained layouts clip instead of overlapping. Malformed input degrades the way real terminals degrade (dropped sequences, clipped panes), but unusual-yet-valid sequences may still *render* wrong — if you see misrendering, capture the bytes with `zmux capture <session> <pane> /tmp/repro.bin` and inspect with `cargo run --example replay -- /tmp/repro.bin` so the case can be added to the fixtures. Long soak: `ZMUX_VT_FUZZ_ITERS=200000 cargo test --test vt_fuzz`.
 - one MCP `watch_events` subscription per connection (a second call returns a tool-level error).
 
 ## Why this exists

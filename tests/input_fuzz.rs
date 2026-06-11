@@ -84,9 +84,8 @@ fn input_parser_survives_fuzzed_terminal_bytes() {
                     }
                     // Bare ESC runs (alt-keys, split sequences).
                     3 => {
-                        for _ in 0..1 + rng.below(4) {
-                            buf.push(0x1b);
-                        }
+                        let count = 1 + rng.below(4) as usize;
+                        buf.extend(std::iter::repeat_n(0x1b, count));
                     }
                     // Plain text.
                     4..=5 => {
