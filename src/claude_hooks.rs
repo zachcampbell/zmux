@@ -14,6 +14,12 @@ use serde_json::{Map, Value, json};
 use crate::agent_shim::extract_last_marked_result;
 use crate::state_paths::{safe_component, shell_quote, state_dir};
 
+// Upper bound on a single un-terminated hook-events line held in the
+// poller's `partial_line` buffer. Real records (a prompt, an
+// assistant message) are a few KB; 4 MiB is generous headroom while
+// still bounding memory if a writer never emits a newline.
+const MAX_HOOK_LINE_BYTES: usize = 4 * 1024 * 1024;
+
 const HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
@@ -247,6 +253,16 @@ impl ClaudeHookPoller {
         }
         self.cursor += read as u64;
         self.partial_line.push_str(&chunk);
+
+        // A well-formed events file is newline-delimited JSON; a single
+        // record is at most a few KB. If the buffer grows past the cap
+        // without a newline the file is corrupt or being written by
+        // something other than the hook appender — drop the runaway
+        // partial so a missing terminator can't grow the buffer to OOM.
+        if self.partial_line.len() > MAX_HOOK_LINE_BYTES && !self.partial_line.contains('\n') {
+            self.partial_line.clear();
+            return Ok(None);
+        }
 
         while let Some(newline) = self.partial_line.find('\n') {
             let line = self.partial_line[..newline].trim().to_string();

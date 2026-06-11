@@ -123,10 +123,20 @@ fn handle_connection(stream: UnixStream, tx: Sender<McpRequest>) {
     let mut reader = BufReader::new(read_stream);
     let write_stream = stream;
     let (outbound_tx, outbound_rx) = mpsc::sync_channel::<Vec<u8>>(OUTBOUND_QUEUE_BOUND);
-    let writer_handle = thread::Builder::new()
+    // Spawning the writer can fail under thread/FD exhaustion. Drop
+    // just this connection instead of `expect`-panicking the whole
+    // listener thread (which would take down MCP for every client).
+    // Matches the listener's own best-effort spawn handling.
+    let writer_handle = match thread::Builder::new()
         .name("zmux-mcp-writer".into())
         .spawn(move || run_writer(write_stream, outbound_rx))
-        .expect("spawn mcp writer thread");
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            eprintln!("zmux mcp: cannot spawn writer thread: {err}; dropping connection");
+            return;
+        }
+    };
     let queue_full_logged = Arc::new(AtomicBool::new(false));
     // Latches on the first successful `watch_events`; subsequent
     // calls on the same connection are refused so the client doesn't

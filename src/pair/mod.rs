@@ -261,6 +261,35 @@ pub enum MediatorOutput {
     Done,
 }
 
+/// Make a model-supplied string safe to print in the confirmation
+/// prompt. Control characters (including ESC, CR, and the C1 range)
+/// are rendered as visible `\xNN` / `\u{NNNN}` escapes so they cannot
+/// drive the terminal — a malicious tool-call argument can't repaint
+/// the screen, hide text behind a carriage return, or recolour the
+/// prompt to disguise what's being approved. Printable text (including
+/// normal Unicode) passes through unchanged.
+fn sanitize_for_display(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch == '\t' {
+            out.push_str("\\t");
+        } else if (ch.is_control()) || ('\u{80}'..='\u{9f}').contains(&ch) {
+            // ASCII controls (incl. ESC 0x1b, CR, LF, BEL) and the C1
+            // control block. \n included on purpose: the prompt is a
+            // single line and an injected newline could scroll the
+            // real command out of view.
+            if (ch as u32) <= 0xff {
+                out.push_str(&format!("\\x{:02x}", ch as u32));
+            } else {
+                out.push_str(&format!("\\u{{{:04x}}}", ch as u32));
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn inject_pane_id(target: u32, args_json: &str) -> serde_json::Value {
     let mut v: serde_json::Value =
         serde_json::from_str(args_json).unwrap_or_else(|_| serde_json::json!({}));
@@ -400,9 +429,18 @@ fn drive_model_loop(
                 convo.push_assistant_tool_calls(calls.clone());
                 for call in calls {
                     if requires_confirmation(&call) {
+                        // Sanitize the model-supplied arguments before
+                        // they hit the terminal: a hostile or buggy
+                        // Ollama response could embed ANSI/VT escapes to
+                        // visually hide what it's asking to run, which
+                        // would defeat the entire point of this y/N
+                        // gate. Render control bytes inert/visible so
+                        // what the user sees is what `dispatch_tool`
+                        // will actually send.
                         let summary = format!(
                             "Co-pilot wants: {}({}). Approve?",
-                            call.function.name, call.function.arguments
+                            sanitize_for_display(&call.function.name),
+                            sanitize_for_display(&call.function.arguments),
                         );
                         let _ = outbox.send(MediatorOutput::ConfirmRequest { summary });
                         convo.pending_confirm = Some(call.clone());
@@ -513,6 +551,24 @@ mod tests {
         let mut v: Vec<String> = vec!["zmux".into(), "pair".into()];
         v.extend(extra.iter().map(|s| s.to_string()));
         v
+    }
+
+    #[test]
+    fn sanitize_for_display_neutralizes_terminal_escapes() {
+        // A hostile tool-call argument trying to hide the real command
+        // behind colour codes and a carriage return.
+        let hostile = "\u{1b}[2K\rrm -rf ~\u{1b}[1G echo safe";
+        let safe = sanitize_for_display(hostile);
+        assert!(!safe.contains('\u{1b}'), "ESC must not survive: {safe:?}");
+        assert!(!safe.contains('\r'), "CR must not survive: {safe:?}");
+        assert!(!safe.contains('\n'), "LF must not survive");
+        assert!(safe.contains("\\x1b"), "ESC rendered visibly: {safe:?}");
+        assert!(safe.contains("rm -rf ~"), "real payload stays readable");
+        // C1 control block (8-bit CSI) is escaped too.
+        assert!(!sanitize_for_display("\u{9b}31m").contains('\u{9b}'));
+        // Ordinary text and Unicode pass through untouched.
+        assert_eq!(sanitize_for_display("read_pane"), "read_pane");
+        assert_eq!(sanitize_for_display("café 漢字 🎉"), "café 漢字 🎉");
     }
 
     #[test]

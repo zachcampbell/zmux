@@ -681,7 +681,14 @@ fn parse_server_message(frame: &[u8]) -> io::Result<ServerMessage> {
                 .ok_or_else(|| invalid_data("invalid mouse mode"))?;
             let (line_count, next) = take_u16(rest)?;
             rest = next;
-            let mut lines = Vec::with_capacity(line_count as usize);
+            // Cap the preallocation at the bytes actually remaining:
+            // every line carries a 4-byte length prefix, so the real
+            // count can't exceed `rest.len()`. Trusting the wire's
+            // count verbatim would let a peer request a gigantic
+            // allocation (Vec::with_capacity aborts the process on
+            // failure — not a catchable panic). The loop is already
+            // self-limiting because take_u32 errors when bytes run out.
+            let mut lines = Vec::with_capacity((line_count as usize).min(rest.len()));
             for _ in 0..line_count {
                 let (length, next) = take_u32(rest)?;
                 rest = next;
@@ -733,7 +740,11 @@ fn parse_server_message(frame: &[u8]) -> io::Result<ServerMessage> {
         }
         SERVER_PANE_LIST => {
             let (count, mut rest) = take_u32(rest)?;
-            let mut rows = Vec::with_capacity(count as usize);
+            // Cap as in SERVER_FRAME above: a pane row is several bytes
+            // minimum, so `rest.len()` is a safe upper bound and blocks
+            // the `count = u32::MAX` allocation bomb. The loop's
+            // take_u32 calls fail-fast when the bytes run out.
+            let mut rows = Vec::with_capacity((count as usize).min(rest.len()));
             for _ in 0..count {
                 let (pane_id, next) = take_u32(rest)?;
                 rest = next;
@@ -866,6 +877,45 @@ mod tests {
         ServerDecoder, ServerMessage, encode_client_message, encode_server_message,
     };
     use crate::pty::PtySize;
+
+    #[test]
+    fn pane_list_with_huge_count_errors_instead_of_allocating() {
+        // Body: SERVER_PANE_LIST tag + count=u32::MAX, then NO row
+        // bytes. Pre-fix this requested a ~u32::MAX-element Vec (abort
+        // on alloc failure); now the capacity is clamped to the
+        // remaining byte count and the row loop errors cleanly when it
+        // runs out of bytes.
+        let mut body = vec![6u8]; // SERVER_PANE_LIST
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&body);
+
+        let mut decoder = ServerDecoder::default();
+        let result = decoder.push_bytes(&frame);
+        assert!(
+            result.is_err(),
+            "huge pane-list count must be rejected, not allocated"
+        );
+    }
+
+    #[test]
+    fn frame_with_huge_line_count_errors_instead_of_allocating() {
+        // SERVER_FRAME tag + size(4) + mouse_mode(1) + line_count=u16::MAX,
+        // then no line data.
+        let mut body = vec![1u8]; // SERVER_FRAME
+        body.extend_from_slice(&24u16.to_le_bytes()); // rows
+        body.extend_from_slice(&80u16.to_le_bytes()); // cols
+        body.push(0u8); // mouse mode (Off)
+        body.extend_from_slice(&u16::MAX.to_le_bytes()); // line_count
+        let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&body);
+
+        let mut decoder = ServerDecoder::default();
+        assert!(
+            decoder.push_bytes(&frame).is_err(),
+            "huge line count must be rejected, not allocated"
+        );
+    }
 
     #[test]
     fn client_messages_round_trip() {
