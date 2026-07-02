@@ -25,6 +25,18 @@ pub enum CursorShape {
     SteadyBar,
 }
 
+// Cursor state captured by DECSC (ESC 7) / CSI s and restored by DECRC
+// (ESC 8) / CSI u. Per xterm, the save covers the SGR pen as well as
+// the position — TUIs bracket styled fragments with save/restore and
+// rely on the pen coming back, so restoring position alone leaks the
+// styled pen into everything printed afterwards.
+#[derive(Debug, Clone)]
+struct SavedCursor {
+    row: usize,
+    col: usize,
+    pen: Style,
+}
+
 #[derive(Debug)]
 pub struct TerminalIngest {
     state: ParseState,
@@ -54,13 +66,19 @@ pub struct TerminalIngest {
     primary_grid: Vec<Vec<Cell>>,
     primary_cursor_row: usize,
     primary_cursor_col: usize,
-    primary_saved_cursor: Option<(usize, usize)>,
+    primary_saved_cursor: Option<SavedCursor>,
     primary_scroll_top: usize,
     primary_scroll_bottom: usize,
     primary_flushed_to_scrollback: bool,
     primary_wrap_pending: bool,
     primary_auto_wrap: bool,
     alternate: AlternateScreen,
+    // Pen saved by DECSC while the alternate screen is active. The
+    // position half lives inside AlternateScreen; the pen lives here
+    // because `current_style` does. Defaults to Style::DEFAULT, which
+    // gives alt-screen DECRC-without-DECSC xterm's reset-to-normal
+    // behavior for free.
+    alt_saved_pen: Style,
     // Active SGR state. Updated as `CSI m` sequences come in and copied
     // into each Cell written to either screen. The primary-screen
     // scrollback and the alternate-screen grid both carry these styles
@@ -159,6 +177,7 @@ impl TerminalIngest {
             primary_wrap_pending: false,
             primary_auto_wrap: true,
             alternate: AlternateScreen::new(size.rows as usize, size.cols as usize),
+            alt_saved_pen: Style::DEFAULT,
             current_style: Style::DEFAULT,
             utf8_buffer: Vec::new(),
             utf8_remaining: 0,
@@ -212,8 +231,9 @@ impl TerminalIngest {
         self.primary_cursor_row = self.primary_cursor_row.min(max_row);
         self.primary_cursor_col = self.primary_cursor_col.min(col_cap.saturating_sub(1));
         self.primary_wrap_pending = false;
-        if let Some((r, c)) = self.primary_saved_cursor {
-            self.primary_saved_cursor = Some((r.min(max_row), c.min(col_cap.saturating_sub(1))));
+        if let Some(saved) = self.primary_saved_cursor.as_mut() {
+            saved.row = saved.row.min(max_row);
+            saved.col = saved.col.min(col_cap.saturating_sub(1));
         }
         if old_region_was_full {
             self.primary_scroll_top = 0;
@@ -549,28 +569,15 @@ impl TerminalIngest {
             b'P' => ParseState::Dcs,
             b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => ParseState::Charset,
             b'7' => {
-                match pane.screen_mode() {
-                    ScreenMode::Primary => {
-                        // DECSC on primary: stash (row, col) so the next
-                        // `ESC 8` can put the cursor right back. claude
-                        // and friends use this to mark the bottom of the
-                        // input box, draw the spinner, then restore.
-                        self.primary_saved_cursor =
-                            Some((self.primary_cursor_row, self.primary_cursor_col));
-                    }
-                    ScreenMode::Alternate => self.alternate.save_cursor(),
-                }
+                // DECSC: stash (row, col) + pen so the next `ESC 8` can
+                // put both right back. claude and friends use this to
+                // mark the bottom of the input box, draw the spinner,
+                // then restore.
+                self.save_cursor_state(pane);
                 ParseState::Ground
             }
             b'8' => {
-                match pane.screen_mode() {
-                    ScreenMode::Primary => {
-                        if let Some((row, col)) = self.primary_saved_cursor {
-                            self.primary_set_cursor(row, col);
-                        }
-                    }
-                    ScreenMode::Alternate => self.alternate.restore_cursor(),
-                }
+                self.restore_cursor_state(pane);
                 ParseState::Ground
             }
             b'D' => {
@@ -670,21 +677,8 @@ impl TerminalIngest {
                 // cells with the current background.
                 self.alternate.set_fill_style(self.current_style.clone());
             }
-            b's' => match pane.screen_mode() {
-                ScreenMode::Primary => {
-                    self.primary_saved_cursor =
-                        Some((self.primary_cursor_row, self.primary_cursor_col));
-                }
-                ScreenMode::Alternate => self.alternate.save_cursor(),
-            },
-            b'u' => match pane.screen_mode() {
-                ScreenMode::Primary => {
-                    if let Some((row, col)) = self.primary_saved_cursor {
-                        self.primary_set_cursor(row, col);
-                    }
-                }
-                ScreenMode::Alternate => self.alternate.restore_cursor(),
-            },
+            b's' => self.save_cursor_state(pane),
+            b'u' => self.restore_cursor_state(pane),
             b'H' | b'f' => {
                 let row = params.first().and_then(|value| *value).unwrap_or(1);
                 let col = params.get(1).and_then(|value| *value).unwrap_or(1);
@@ -937,8 +931,18 @@ impl TerminalIngest {
                 for param in params.into_iter().flatten() {
                     match param {
                         47 | 1047 | 1049 => {
+                            // 1049 does an implicit DECSC before switching
+                            // (xterm semantics) so the matching 1049l can
+                            // hand back the pre-alt cursor and pen. Only
+                            // save on a real primary→alt transition; a
+                            // redundant re-enter must not clobber the
+                            // saved primary state with alt-screen state.
+                            if param == 1049 && pane.screen_mode() == ScreenMode::Primary {
+                                self.save_cursor_state(pane);
+                            }
                             pane.set_screen_mode(ScreenMode::Alternate);
                             self.alternate.reset();
+                            self.alt_saved_pen = Style::DEFAULT;
                         }
                         7 => {
                             self.set_primary_auto_wrap(true);
@@ -973,7 +977,17 @@ impl TerminalIngest {
                 let mut disable_mouse = false;
                 for param in params.into_iter().flatten() {
                     match param {
-                        47 | 1047 | 1049 => pane.set_screen_mode(ScreenMode::Primary),
+                        47 | 1047 | 1049 => {
+                            // 1049 restores as in DECRC on the way out —
+                            // pen included — but only on a real alt→primary
+                            // transition so a stray 1049l can't teleport
+                            // the primary cursor.
+                            let was_alternate = pane.screen_mode() == ScreenMode::Alternate;
+                            pane.set_screen_mode(ScreenMode::Primary);
+                            if param == 1049 && was_alternate {
+                                self.restore_cursor_state(pane);
+                            }
+                        }
                         7 => {
                             self.set_primary_auto_wrap(false);
                             self.alternate.set_auto_wrap(false);
@@ -1050,6 +1064,7 @@ impl TerminalIngest {
         self.current_style = Style::DEFAULT;
         self.alternate.set_fill_style(Style::DEFAULT);
         self.alternate.reset();
+        self.alt_saved_pen = Style::DEFAULT;
         self.alternate.set_auto_wrap(true);
         self.reset_primary_modes(true);
         self.cursor_shape = CursorShape::Default;
@@ -1087,6 +1102,45 @@ impl TerminalIngest {
         self.primary_scroll_bottom = self.alternate.rows.saturating_sub(1);
         self.primary_wrap_pending = false;
         self.primary_auto_wrap = true;
+    }
+
+    // DECSC / CSI s. Saves position + pen for whichever screen is active.
+    fn save_cursor_state(&mut self, pane: &Pane) {
+        match pane.screen_mode() {
+            ScreenMode::Primary => {
+                self.primary_saved_cursor = Some(SavedCursor {
+                    row: self.primary_cursor_row,
+                    col: self.primary_cursor_col,
+                    pen: self.current_style.clone(),
+                });
+            }
+            ScreenMode::Alternate => {
+                self.alternate.save_cursor();
+                self.alt_saved_pen = self.current_style.clone();
+            }
+        }
+    }
+
+    // DECRC / CSI u. Restores position + pen. Primary keeps its
+    // historical no-op when nothing was saved; the alternate screen
+    // restores its (home, default-pen) baseline, matching xterm's
+    // reset-attributes behavior for DECRC without a prior DECSC.
+    fn restore_cursor_state(&mut self, pane: &Pane) {
+        match pane.screen_mode() {
+            ScreenMode::Primary => {
+                if let Some(saved) = self.primary_saved_cursor.clone() {
+                    self.primary_set_cursor(saved.row, saved.col);
+                    self.current_style = saved.pen;
+                }
+            }
+            ScreenMode::Alternate => {
+                self.alternate.restore_cursor();
+                self.current_style = self.alt_saved_pen.clone();
+            }
+        }
+        // Erase/scroll fills must blank with the restored pen, same as
+        // after an explicit SGR.
+        self.alternate.set_fill_style(self.current_style.clone());
     }
 
     // Set the primary cursor, clamped to the addressable region. Used by
@@ -2184,6 +2238,7 @@ fn parse_params(body: &str) -> Vec<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use crate::mouse::{MouseTrackingMode, ScreenMode};
+    use crate::style::Color;
     use crate::{Pane, PtySize};
 
     use super::{CursorShape, TerminalIngest};
@@ -3557,5 +3612,78 @@ mod tests {
         ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b(B\x1bPzz\x1b\\ok");
 
         assert_eq!(ingest.render_lines(&pane)[0], "ok");
+    }
+
+    #[test]
+    fn decrc_restores_sgr_pen_on_primary_screen() {
+        // DECSC saves the SGR pen along with the cursor; DECRC brings
+        // both back. claude's redraw loop leans on this: save, style a
+        // spinner/status fragment, restore, keep printing plain text.
+        // Restoring only the position leaves the styled pen active and
+        // every subsequent character in the pane inherits it.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b7\x1b[4mspin\x1b8after");
+
+        let cells = ingest.render_cells(&pane);
+        let text: String = cells[0].iter().map(|cell| cell.ch).collect();
+        assert_eq!(text, "after");
+        for cell in cells[0].iter().take(5) {
+            assert!(
+                !cell.style.attrs.underline,
+                "DECRC must restore the saved pen; {:?} kept underline",
+                cell.ch,
+            );
+        }
+    }
+
+    #[test]
+    fn decrc_restores_sgr_pen_on_alt_screen() {
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b7\x1b[4mspin\x1b8after");
+
+        let cells = ingest.render_cells(&pane);
+        for cell in cells[0].iter().take(5) {
+            assert!(
+                !cell.style.attrs.underline,
+                "alt-screen DECRC must restore the saved pen; {:?} kept underline",
+                cell.ch,
+            );
+        }
+    }
+
+    #[test]
+    fn alt_screen_roundtrip_restores_primary_pen() {
+        // DECSET/DECRST 1049 does an implicit DECSC on enter and DECRC
+        // on exit (xterm semantics), pen included. Without the restore,
+        // styles set while an alt-screen view is up (agent TUI pages)
+        // leak into everything printed on the primary screen after exit.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(
+            &mut pane,
+            b"\x1b[31mred\x1b[?1049h\x1b[4;32munderlined\x1b[?1049lback",
+        );
+
+        let cells = ingest.render_cells(&pane);
+        let text: String = cells[0].iter().map(|cell| cell.ch).collect();
+        assert_eq!(text, "redback");
+        for cell in cells[0].iter().skip(3).take(4) {
+            assert!(
+                !cell.style.attrs.underline,
+                "1049l must restore the pre-alt pen; {:?} kept underline",
+                cell.ch,
+            );
+            assert_eq!(
+                cell.style.fg,
+                Color::Indexed(1),
+                "1049l must restore the pre-alt foreground on {:?}",
+                cell.ch,
+            );
+        }
     }
 }
