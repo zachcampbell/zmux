@@ -41,6 +41,17 @@ const DEFAULT_SESSION_NAME: &str = "default";
 // conventionally use for this same ambiguity.
 const SERVER_POLL_MS: u64 = 20;
 const STARTUP_WAIT_MS: u64 = 1_000;
+// The daemon's event loop is single-threaded: every client socket is
+// serviced from the same tick, and `broadcast_frame` writes to each
+// attached client in turn. Accepted client streams are blocking (only
+// the listener itself is nonblocking), so a client that stops reading
+// (suspended terminal, dead network peer, malicious hang) would
+// otherwise wedge `write_all` forever and freeze every other session
+// and client sharing this daemon. A write timeout bounds the damage to
+// one slow client: a timed-out write is treated the same as a broken
+// pipe (see `broadcast_frame`), dropping that client while the rest of
+// the daemon keeps ticking.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
@@ -1426,12 +1437,7 @@ fn broadcast_frame(
     let mut dead: Vec<usize> = Vec::new();
     for (index, client) in clients.iter_mut().enumerate() {
         if let Err(error) = send_server_message(client.stream_mut(), &frame) {
-            if matches!(
-                error.kind(),
-                io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::UnexpectedEof
-            ) {
+            if is_dead_client_write_error(error.kind()) {
                 dead.push(index);
             } else {
                 return Err(error);
@@ -1442,6 +1448,29 @@ fn broadcast_frame(
         clients.swap_remove(index);
     }
     Ok(())
+}
+
+// Errors from writing to a client socket that mean "this peer is gone (or
+// might as well be)" rather than "the daemon itself is broken". Any of
+// these should drop just the offending client, not tear down the whole
+// broadcast (and with it, every other attached client and session).
+//
+// BrokenPipe/ConnectionReset/UnexpectedEof are the classic "peer hung
+// up" trio. WouldBlock and TimedOut are included because of
+// `CLIENT_WRITE_TIMEOUT`: a client that stops reading (suspended
+// terminal, dead network peer) makes `write_all` block until the
+// timeout fires, and depending on platform that surfaces as either
+// WouldBlock or TimedOut. Without including them here, a single stuck
+// client would take down the entire single-threaded server loop.
+fn is_dead_client_write_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1806,6 +1835,12 @@ struct AttachedClient {
 
 impl AttachedClient {
     fn new(stream: UnixStream) -> Self {
+        // Bound every write to this client so a stuck peer can't wedge the
+        // single-threaded server loop (see `CLIENT_WRITE_TIMEOUT`). Ignore
+        // failures here: on the platforms zmux targets this only fails for
+        // a zero duration, which we never pass, so treat it as effectively
+        // infallible rather than tearing down a brand-new connection.
+        let _ = stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
         Self {
             stream,
             decoder: ClientDecoder::default(),
@@ -2082,9 +2117,15 @@ pub fn print_session_list_verbose(
 
 #[cfg(test)]
 mod tests {
-    use super::{AttachInput, PrefixKeyParser, print_session_list};
-    use crate::protocol::ClientMessage;
+    use super::{
+        AttachInput, PrefixKeyParser, is_dead_client_write_error, print_session_list,
+        send_server_message,
+    };
+    use crate::protocol::{ClientMessage, ServerMessage};
+    use std::io;
+    use std::os::unix::net::UnixStream;
     use std::path::Path;
+    use std::time::Duration;
 
     #[test]
     fn ctrl_a_d_detaches() {
@@ -2283,5 +2324,65 @@ mod tests {
             String::from_utf8(output).expect("utf-8"),
             "alpha\t/tmp/zmux-user/alpha.sock\n"
         );
+    }
+
+    #[test]
+    fn dead_client_write_error_classification_covers_stalled_writes() {
+        // The classic "peer hung up" trio.
+        assert!(is_dead_client_write_error(io::ErrorKind::BrokenPipe));
+        assert!(is_dead_client_write_error(io::ErrorKind::ConnectionReset));
+        assert!(is_dead_client_write_error(io::ErrorKind::UnexpectedEof));
+        // WouldBlock/TimedOut are what CLIENT_WRITE_TIMEOUT surfaces as
+        // when a client stops reading; these must be treated the same
+        // way or one stuck client wedges the whole broadcast loop.
+        assert!(is_dead_client_write_error(io::ErrorKind::WouldBlock));
+        assert!(is_dead_client_write_error(io::ErrorKind::TimedOut));
+        // Anything else (e.g. an unrelated I/O failure) should still
+        // propagate rather than being silently swallowed.
+        assert!(!is_dead_client_write_error(io::ErrorKind::InvalidInput));
+        assert!(!is_dead_client_write_error(io::ErrorKind::Other));
+    }
+
+    #[test]
+    fn write_to_a_stalled_peer_times_out_instead_of_blocking_forever() {
+        // Regression test for the "wedged client freezes the whole
+        // daemon" bug: a client that never reads must make writes fail
+        // (via CLIENT_WRITE_TIMEOUT-style timeout) rather than hang the
+        // calling thread indefinitely.
+        let (mut server_side, client_side) = UnixStream::pair().expect("create socket pair");
+        // A short timeout keeps this test fast; production uses
+        // CLIENT_WRITE_TIMEOUT (2s) but the mechanism under test here is
+        // "does a bounded write timeout actually fire", not the exact
+        // duration.
+        server_side
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .expect("set write timeout");
+
+        // Never read from client_side, and never let it close: the
+        // kernel socket buffer is finite, so repeatedly writing into it
+        // without draining will eventually block, and then time out.
+        let mut last_error_kind = None;
+        for _ in 0..256 {
+            let big_payload = ServerMessage::Clipboard("x".repeat(64 * 1024));
+            match send_server_message(&mut server_side, &big_payload) {
+                Ok(()) => continue,
+                Err(error) => {
+                    last_error_kind = Some(error.kind());
+                    break;
+                }
+            }
+        }
+
+        let kind = last_error_kind
+            .expect("writing into a full, undrained socket buffer should eventually error");
+        assert!(
+            is_dead_client_write_error(kind),
+            "expected a dead-client-classified error kind, got {kind:?}",
+        );
+
+        // Keep client_side alive until here so the pair isn't torn down
+        // (which would turn this into a BrokenPipe test instead of a
+        // WouldBlock/TimedOut test).
+        drop(client_side);
     }
 }
