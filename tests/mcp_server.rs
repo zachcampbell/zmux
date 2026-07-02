@@ -13,82 +13,26 @@
 //! runs don't clobber each other on the shared `$TMPDIR/zmux-$USER`
 //! directory.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-unsafe extern "C" {
-    fn setsid() -> i32;
-}
+mod support;
+use support::{
+    TestSession, client_socket_path, mcp_socket_path, spawn_serve, unique_name, wait_for_socket,
+};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn session_root() -> PathBuf {
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-    std::env::temp_dir().join(format!("zmux-{user}"))
-}
-
-fn client_socket_path(name: &str) -> PathBuf {
-    session_root().join(format!("{name}.sock"))
-}
-
-fn mcp_socket_path(name: &str) -> PathBuf {
-    session_root().join(format!("{name}.mcp.sock"))
-}
-
-/// Generate a unique session name per test so parallel runs don't
-/// step on each other. Combines PID + a process-local atomic so even
-/// repeated invocations of the same test in one binary stay unique.
-fn unique_name(prefix: &str) -> String {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{pid}-{n}")
-}
-
-fn spawn_serve(name: &str) -> Child {
-    let exe = env!("CARGO_BIN_EXE_zmux");
-    let mut command = Command::new(exe);
-    command
-        .arg("serve")
-        .arg(name)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            if setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    command.spawn().expect("spawn zmux serve")
-}
-
-fn wait_for_socket(path: &Path) {
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    while !path.exists() {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for socket at {}", path.display());
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
 
 /// Connect to the MCP socket and set sensible read/write timeouts so
 /// a hung server can't block the test runner forever.
 fn connect_mcp(name: &str) -> UnixStream {
     let path = mcp_socket_path(name);
-    wait_for_socket(&path);
+    support::wait_for_socket(&path);
     let stream = UnixStream::connect(&path).expect("connect to MCP socket");
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
@@ -114,22 +58,10 @@ fn round_trip(name: &str, request: Value) -> Value {
     serde_json::from_str(&line).expect("parse JSON-RPC response")
 }
 
-/// Shut the daemon down cleanly. We rely on the existing client
-/// admin path: connect to the *non-MCP* socket and send a Detach
-/// (closing the last attached client triggers... actually nothing,
-/// the daemon idles until exit_code_if_complete fires). Simplest
-/// reliable shutdown is to kill the process.
-fn cleanup(name: &str, mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_file(client_socket_path(name));
-    let _ = std::fs::remove_file(mcp_socket_path(name));
-}
-
 #[test]
 fn initialize_returns_protocol_handshake() {
     let name = unique_name("mcp-init");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(&name, json!({"jsonrpc":"2.0","id":1,"method":"initialize"}));
     let result = &response["result"];
     assert_eq!(
@@ -149,7 +81,6 @@ fn initialize_returns_protocol_handshake() {
         result["capabilities"]["resources"].is_object(),
         "must advertise resources capability"
     );
-    cleanup(&name, child);
 }
 
 /// `resources/list` enumerates `zmux://panes`. The resource mirrors
@@ -158,7 +89,7 @@ fn initialize_returns_protocol_handshake() {
 #[test]
 fn resources_list_advertises_zmux_panes() {
     let name = unique_name("mcp-rl");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(
         &name,
         json!({"jsonrpc":"2.0","id":1,"method":"resources/list"}),
@@ -171,7 +102,6 @@ fn resources_list_advertises_zmux_panes() {
         uris.contains(&"zmux://panes"),
         "zmux://panes must be advertised; got {uris:?}"
     );
-    cleanup(&name, child);
 }
 
 /// `resources/read` with `zmux://panes` returns the same JSON the
@@ -180,7 +110,7 @@ fn resources_list_advertises_zmux_panes() {
 #[test]
 fn resources_read_panes_returns_list_panes_json() {
     let name = unique_name("mcp-rr");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(
         &name,
         json!({
@@ -200,7 +130,6 @@ fn resources_read_panes_returns_list_panes_json() {
     let arr = parsed["panes"].as_array().expect("`panes` array");
     assert_eq!(arr.len(), 1, "fresh session has the one genesis pane");
     assert_eq!(arr[0]["pane_id"], 1);
-    cleanup(&name, child);
 }
 
 /// Unknown URIs are rejected with a JSON-RPC `invalid_params` error so
@@ -209,7 +138,7 @@ fn resources_read_panes_returns_list_panes_json() {
 #[test]
 fn resources_read_unknown_uri_returns_invalid_params() {
     let name = unique_name("mcp-rr-bad");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(
         &name,
         json!({
@@ -218,13 +147,12 @@ fn resources_read_unknown_uri_returns_invalid_params() {
         }),
     );
     assert_eq!(response["error"]["code"], -32602);
-    cleanup(&name, child);
 }
 
 #[test]
 fn tools_list_advertises_list_panes() {
     let name = unique_name("mcp-tools");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(&name, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
     let tools = response["result"]["tools"].as_array().expect("tools array");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -232,13 +160,12 @@ fn tools_list_advertises_list_panes() {
         names.contains(&"list_panes"),
         "list_panes must be advertised; got {names:?}"
     );
-    cleanup(&name, child);
 }
 
 #[test]
 fn list_panes_returns_genesis_pane_summary() {
     let name = unique_name("mcp-list");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(
         &name,
         json!({
@@ -272,13 +199,12 @@ fn list_panes_returns_genesis_pane_summary() {
         pane["size_rows"].as_u64().unwrap_or(0) > 0,
         "size_rows must be reported"
     );
-    cleanup(&name, child);
 }
 
 #[test]
 fn spawn_pane_creates_a_new_pane_visible_in_list_panes() {
     let name = unique_name("mcp-spawn");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     // Spawn a long-running shell so list_panes definitely sees it
     // before the daemon reaps the exit. We rely on the daemon's
     // 20ms poll to drain MCP requests; give the spawn a beat to
@@ -328,7 +254,6 @@ fn spawn_pane_creates_a_new_pane_visible_in_list_panes() {
             )
         });
     assert_eq!(new_pane["label"].as_str(), Some("sleeper"));
-    cleanup(&name, child);
 }
 
 #[test]
@@ -338,7 +263,7 @@ fn spawn_pane_with_wait_for_idle_returns_text_in_response() {
     // errored/exited. The reply must include the rendered text so the
     // caller skips the follow-up read_pane round trip.
     let name = unique_name("mcp-spawn-wait");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
 
     // printf produces a known marker, then sleep keeps the pane alive
     // past the idle threshold (DEFAULT_IDLE_THRESHOLD = 750ms). The
@@ -381,13 +306,12 @@ fn spawn_pane_with_wait_for_idle_returns_text_in_response() {
         result["timed_out"], false,
         "should have settled before deadline"
     );
-    cleanup(&name, child);
 }
 
 #[test]
 fn kill_pane_removes_pane_from_list_panes() {
     let name = unique_name("mcp-kill");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     // Spawn a long-lived pane we can kill cleanly.
     let spawn = round_trip(
         &name,
@@ -431,13 +355,12 @@ fn kill_pane_removes_pane_from_list_panes() {
         "pane {pane_id} should be gone after kill_pane; got {}",
         list["result"]["structuredContent"],
     );
-    cleanup(&name, child);
 }
 
 #[test]
 fn kill_pane_closes_single_pane_worker_window() {
     let name = unique_name("mcp-kill-worker-window");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let spawn = round_trip(
         &name,
         json!({
@@ -483,13 +406,12 @@ fn kill_pane_closes_single_pane_worker_window() {
         panes[0]["active_window"], true,
         "remaining window should be active: {list}"
     );
-    cleanup(&name, child);
 }
 
 #[test]
 fn kill_pane_refuses_last_pane_in_window() {
     let name = unique_name("mcp-kill-last");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     // Genesis pane id 1 is the only pane in the only window.
     let response = round_trip(
         &name,
@@ -501,13 +423,12 @@ fn kill_pane_refuses_last_pane_in_window() {
     assert_eq!(response["result"]["isError"], true);
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("last remaining pane"), "text: {text}");
-    cleanup(&name, child);
 }
 
 #[test]
 fn set_label_updates_list_panes_label() {
     let name = unique_name("mcp-label");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let spawn = round_trip(
         &name,
         json!({
@@ -546,13 +467,12 @@ fn set_label_updates_list_panes_label() {
         .find(|p| p["pane_id"].as_u64() == Some(u64::from(pane_id)))
         .unwrap();
     assert_eq!(pane["label"].as_str(), Some("frontend"));
-    cleanup(&name, child);
 }
 
 #[test]
 fn set_label_unknown_pane_returns_tool_error() {
     let name = unique_name("mcp-label-bad");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(
         &name,
         json!({
@@ -563,13 +483,12 @@ fn set_label_unknown_pane_returns_tool_error() {
         }),
     );
     assert_eq!(response["result"]["isError"], true);
-    cleanup(&name, child);
 }
 
 #[test]
 fn read_pane_visible_returns_recent_output_with_strip_ansi() {
     let name = unique_name("mcp-read");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     // Print a colored line then sleep so the output settles in the
     // pane's viewport before we read it.
     let spawn = round_trip(
@@ -615,13 +534,12 @@ fn read_pane_visible_returns_recent_output_with_strip_ansi() {
         payload["cursor_at_bottom"], true,
         "fresh pane viewport must follow output"
     );
-    cleanup(&name, child);
 }
 
 #[test]
 fn read_pane_strip_ansi_false_returns_styled_sgr_text() {
     let name = unique_name("mcp-read-styled");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let spawn = round_trip(
         &name,
         json!({
@@ -687,8 +605,6 @@ fn read_pane_strip_ansi_false_returns_styled_sgr_text() {
         plain_text.contains("red") && plain_text.contains("line"),
         "expected visible chars to survive stripping, got: {plain_text:?}"
     );
-
-    cleanup(&name, child);
 }
 
 #[test]
@@ -700,7 +616,7 @@ fn read_pane_scrollback_strip_ansi_false_returns_styled_sgr_text() {
     // so the composition path pulls the full grid (plus whatever
     // scrollback history exists) rather than just a tail slice.
     let name = unique_name("mcp-read-scroll-styled");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let spawn = round_trip(
         &name,
         json!({
@@ -756,14 +672,12 @@ fn read_pane_scrollback_strip_ansi_false_returns_styled_sgr_text() {
         !plain_text.contains('\u{1b}'),
         "expected no escape bytes in stripped scrollback text, got: {plain_text:?}"
     );
-
-    cleanup(&name, child);
 }
 
 #[test]
 fn read_pane_output_returns_cursor_based_raw_transcript() {
     let name = unique_name("mcp-read-output");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let spawn = round_trip(
         &name,
         json!({
@@ -835,13 +749,12 @@ fn read_pane_output_returns_cursor_based_raw_transcript() {
         text.contains("ZMUX_RAW_OUTPUT_OK"),
         "raw output transcript should include command output, got {text:?}",
     );
-    cleanup(&name, child);
 }
 
 #[test]
 fn read_pane_output_unknown_pane_returns_tool_error() {
     let name = unique_name("mcp-read-output-bad");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(
         &name,
         json!({
@@ -850,13 +763,12 @@ fn read_pane_output_unknown_pane_returns_tool_error() {
         }),
     );
     assert_eq!(response["result"]["isError"], true);
-    cleanup(&name, child);
 }
 
 #[test]
 fn read_pane_unknown_pane_returns_tool_error() {
     let name = unique_name("mcp-read-bad");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(
         &name,
         json!({
@@ -865,13 +777,12 @@ fn read_pane_unknown_pane_returns_tool_error() {
         }),
     );
     assert_eq!(response["result"]["isError"], true);
-    cleanup(&name, child);
 }
 
 #[test]
 fn send_keys_writes_bytes_to_target_pane_pty() {
     let name = unique_name("mcp-keys");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     // Use a unique tempfile per run so parallel `cargo test`
     // invocations don't collide.
     let outfile = std::env::temp_dir().join(format!("zmux-mcp-out-{}", unique_name("k")));
@@ -944,7 +855,6 @@ fn send_keys_writes_bytes_to_target_pane_pty() {
     }
 
     let _ = std::fs::remove_file(&outfile);
-    cleanup(&name, child);
 
     assert!(
         contents.contains("hello"),
@@ -956,7 +866,7 @@ fn send_keys_writes_bytes_to_target_pane_pty() {
 #[test]
 fn send_keys_wait_for_idle_returns_settled_output_for_window_pane() {
     let name = unique_name("mcp-keys-wait");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let spawn = round_trip(
         &name,
         json!({
@@ -1014,13 +924,12 @@ fn send_keys_wait_for_idle_returns_settled_output_for_window_pane() {
         text.contains("ZMUX_WAIT_OK"),
         "wait response should include command output, got {text:?}",
     );
-    cleanup(&name, child);
 }
 
 #[test]
 fn wait_pane_observes_output_without_sending_input() {
     let name = unique_name("mcp-wait-pane");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let spawn = round_trip(
         &name,
         json!({
@@ -1075,7 +984,6 @@ fn wait_pane_observes_output_without_sending_input() {
         text.contains("ZMUX_WAIT_PANE_OK"),
         "wait response should include command output, got {text:?}",
     );
-    cleanup(&name, child);
 }
 
 #[test]
@@ -1087,7 +995,7 @@ fn send_keys_wraps_in_bracketed_paste_when_shell_enables_2004() {
     // gap the unbracketed path needs. This test verifies the wire bytes
     // by having the shell echo them into a file via cat.
     let name = unique_name("mcp-keys-bp");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let outfile = std::env::temp_dir().join(format!("zmux-mcp-out-{}", unique_name("kbp")));
     let _ = std::fs::remove_file(&outfile);
     let outfile_str = outfile.display().to_string();
@@ -1154,7 +1062,6 @@ fn send_keys_wraps_in_bracketed_paste_when_shell_enables_2004() {
     }
 
     let _ = std::fs::remove_file(&outfile);
-    cleanup(&name, child);
 
     assert!(
         contents.windows(expected.len()).any(|w| w == expected),
@@ -1165,7 +1072,7 @@ fn send_keys_wraps_in_bracketed_paste_when_shell_enables_2004() {
 #[test]
 fn send_keys_unknown_pane_returns_tool_error() {
     let name = unique_name("mcp-keys-bad");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(
         &name,
         json!({
@@ -1178,13 +1085,12 @@ fn send_keys_unknown_pane_returns_tool_error() {
     assert_eq!(response["result"]["isError"], true);
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("send_keys failed"), "text was: {text}");
-    cleanup(&name, child);
 }
 
 #[test]
 fn spawn_pane_window_split_creates_new_window_and_returns_pane_id() {
     let name = unique_name("mcp-spawn-win");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     // split="window" creates a brand-new window whose genesis pane
     // runs the command. WindowSet hands back a session-unique pane id
     // so MCP clients can address it without colliding with window 0.
@@ -1233,7 +1139,6 @@ fn spawn_pane_window_split_creates_new_window_and_returns_pane_id() {
         "original window must keep focus after an MCP window spawn: {}",
         list["result"]["structuredContent"],
     );
-    cleanup(&name, child);
 }
 
 /// `target_pane` is meaningless when split=window (the new pane is
@@ -1242,7 +1147,7 @@ fn spawn_pane_window_split_creates_new_window_and_returns_pane_id() {
 #[test]
 fn spawn_pane_window_with_target_pane_returns_tool_error() {
     let name = unique_name("mcp-spawn-win-bad");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(
         &name,
         json!({
@@ -1253,13 +1158,12 @@ fn spawn_pane_window_with_target_pane_returns_tool_error() {
         }),
     );
     assert_eq!(response["result"]["isError"], true);
-    cleanup(&name, child);
 }
 
 #[test]
 fn spawn_pane_rejects_unknown_split_value() {
     let name = unique_name("mcp-bad-split");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let response = round_trip(
         &name,
         json!({
@@ -1271,13 +1175,12 @@ fn spawn_pane_rejects_unknown_split_value() {
         }),
     );
     assert_eq!(response["error"]["code"], -32602);
-    cleanup(&name, child);
 }
 
 #[test]
 fn parse_error_returns_minus_32700_with_null_id() {
     let name = unique_name("mcp-parse");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let stream = connect_mcp(&name);
     let mut writer = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
@@ -1288,7 +1191,6 @@ fn parse_error_returns_minus_32700_with_null_id() {
     let response: Value = serde_json::from_str(&line).expect("parse");
     assert_eq!(response["error"]["code"], -32700);
     assert!(response["id"].is_null());
-    cleanup(&name, child);
 }
 
 /// `watch_events` opens a notification subscription on the per-conn
@@ -1300,7 +1202,7 @@ fn parse_error_returns_minus_32700_with_null_id() {
 #[test]
 fn watch_events_streams_pane_lifecycle_notifications() {
     let name = unique_name("mcp-watch");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let stream = connect_mcp(&name);
     let mut writer = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
@@ -1402,8 +1304,6 @@ fn watch_events_streams_pane_lifecycle_notifications() {
         }
     }
     assert!(saw_closed, "expected a PaneClosed notification within 2s");
-
-    cleanup(&name, child);
 }
 
 /// Sending more than the per-line cap (1 MiB) without a newline must
@@ -1415,7 +1315,7 @@ fn watch_events_streams_pane_lifecycle_notifications() {
 #[test]
 fn oversize_line_closes_connection() {
     let name = unique_name("mcp-oversize");
-    let child = spawn_serve(&name);
+    let _session = spawn_serve(&name);
     let stream = connect_mcp(&name);
     let mut writer = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
@@ -1439,7 +1339,6 @@ fn oversize_line_closes_connection() {
         ),
         Err(_) => { /* connection reset is also acceptable */ }
     }
-    cleanup(&name, child);
 }
 
 /// `zmux mcp --session <name>` is the stdio bridge for external MCP
@@ -1450,7 +1349,7 @@ fn oversize_line_closes_connection() {
 #[test]
 fn stdio_bridge_round_trips_initialize_and_tools_list() {
     let name = unique_name("mcp-stdio");
-    let serve = spawn_serve(&name);
+    let mut session = spawn_serve(&name);
     // Wait for the daemon's MCP socket to come up before launching
     // the bridge — otherwise the bridge dies fast with ENOENT.
     wait_for_socket(&mcp_socket_path(&name));
@@ -1468,6 +1367,10 @@ fn stdio_bridge_round_trips_initialize_and_tools_list() {
     let mut stdin = bridge.stdin.take().expect("bridge stdin");
     let stdout = bridge.stdout.take().expect("bridge stdout");
     let mut reader = BufReader::new(stdout);
+    // Adopt the bridge into the session guard now, before any
+    // assertions run, so a panic below still reaps both the bridge
+    // and the daemon instead of leaking them.
+    session.adopt(bridge);
 
     // Send both requests up front, then close stdin so the bridge's
     // stdin→socket pump sees EOF and the daemon closes the socket
@@ -1504,25 +1407,8 @@ fn stdio_bridge_round_trips_initialize_and_tools_list() {
         "tools/list via stdio bridge must include list_panes + watch_events; got {names:?}"
     );
 
-    // The bridge should exit on its own once stdin closes and the
-    // daemon hangs up. Bound the wait so a hung bridge fails the test
-    // rather than the harness.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut bridge_done = false;
-    while Instant::now() < deadline {
-        match bridge.try_wait().expect("wait bridge") {
-            Some(_) => {
-                bridge_done = true;
-                break;
-            }
-            None => thread::sleep(Duration::from_millis(50)),
-        }
-    }
-    if !bridge_done {
-        let _ = bridge.kill();
-    }
-    let _ = bridge.wait();
-    cleanup(&name, serve);
+    // Teardown (both the bridge and the daemon) happens via
+    // `session`'s Drop — success or panic.
 }
 
 /// MCP clients (Claude Code, Cursor) configure the stdio bridge with
@@ -1541,6 +1427,10 @@ fn stdio_bridge_auto_starts_daemon_when_socket_is_missing() {
         !mcp_socket_path(&name).exists(),
         "precondition: MCP socket must not exist before the bridge runs",
     );
+    // We never hold a `Child` for the daemon (the bridge auto-starts
+    // it), so the guard tracks it by name only; Drop still tears it
+    // down via `zmux::kill_session`.
+    let mut session = TestSession::for_name(&name);
 
     let exe = env!("CARGO_BIN_EXE_zmux");
     let mut bridge = Command::new(exe)
@@ -1555,6 +1445,10 @@ fn stdio_bridge_auto_starts_daemon_when_socket_is_missing() {
     let mut stdin = bridge.stdin.take().expect("bridge stdin");
     let stdout = bridge.stdout.take().expect("bridge stdout");
     let mut reader = BufReader::new(stdout);
+    // Adopt the bridge before any assertions so a panic below still
+    // reaps it (and, via the guard's name-based Drop, the daemon it
+    // auto-started).
+    session.adopt(bridge);
 
     let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize"});
     let mut bytes = serde_json::to_vec(&init).expect("serialize init");
@@ -1589,28 +1483,9 @@ fn stdio_bridge_auto_starts_daemon_when_socket_is_missing() {
         "auto-started daemon must advertise list_panes"
     );
 
-    // The auto-started daemon outlives the bridge. Tear it down so the
-    // test doesn't leak a process or stale socket.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        match bridge.try_wait().expect("wait bridge") {
-            Some(_) => break,
-            None => thread::sleep(Duration::from_millis(50)),
-        }
-    }
-    let _ = bridge.kill();
-    let _ = bridge.wait();
-
-    // Kill the auto-started daemon explicitly. We don't have a Child
-    // handle (it's now PPID=1) so use the public CLI surface.
-    let _ = Command::new(exe)
-        .arg("kill")
-        .arg(&name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = std::fs::remove_file(client_socket_path(&name));
-    let _ = std::fs::remove_file(mcp_socket_path(&name));
+    // The auto-started daemon outlives the bridge; both are torn down
+    // by `session`'s Drop (which kills the daemon by name since we
+    // never held a `Child` for it, and reaps the adopted bridge).
 }
 
 /// The dogfood scenario: a long-lived MCP client (Claude Code) is
@@ -1623,7 +1498,7 @@ fn stdio_bridge_auto_starts_daemon_when_socket_is_missing() {
 #[test]
 fn stdio_bridge_recovers_across_daemon_restart() {
     let name = unique_name("mcp-reconnect");
-    let serve_a = spawn_serve(&name);
+    let mut session = spawn_serve(&name);
     wait_for_socket(&mcp_socket_path(&name));
 
     let exe = env!("CARGO_BIN_EXE_zmux");
@@ -1639,6 +1514,10 @@ fn stdio_bridge_recovers_across_daemon_restart() {
     let mut stdin = bridge.stdin.take().expect("bridge stdin");
     let stdout = bridge.stdout.take().expect("bridge stdout");
     let mut reader = BufReader::new(stdout);
+    // Adopt the bridge now so a panic anywhere below still reaps it
+    // alongside whichever daemon (A or B) the guard is currently
+    // tracking.
+    session.adopt(bridge);
 
     // Phase 1: complete the MCP handshake against daemon A so the
     // bridge has an `initialize` cached for replay.
@@ -1679,17 +1558,17 @@ fn stdio_bridge_recovers_across_daemon_restart() {
     // and trigger reconnect handling; absent any pending request, no
     // error frames will be synthesized — but the bridge will still
     // attempt to reconnect immediately.
-    cleanup(&name, serve_a);
+    session.kill_now();
     // Give the bridge's reconnect loop a beat to notice the close
     // before we put a fresh daemon in front of it. Without this the
     // bridge might race ahead and connect to A's stale socket file
-    // (which the cleanup just removed).
+    // (which kill_now just removed).
     thread::sleep(Duration::from_millis(150));
 
     // Phase 4: bring up daemon B at the same session name. The
     // bridge's reconnect-with-backoff loop will catch this on its
     // next attempt.
-    let serve_b = spawn_serve(&name);
+    session.respawn();
     wait_for_socket(&mcp_socket_path(&name));
 
     // Phase 5: send a tools/list THROUGH the bridge. With reconnect
@@ -1722,18 +1601,10 @@ fn stdio_bridge_recovers_across_daemon_restart() {
         "tools/list across reconnect must reach the new daemon and return its tools"
     );
 
-    // Clean exit: close stdin, wait for bridge to finish.
+    // Close stdin; `session`'s Drop reaps both the adopted bridge and
+    // daemon B (whichever is currently in `child`) unconditionally,
+    // so no manual wait/kill dance is needed here.
     drop(stdin);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        match bridge.try_wait().expect("wait bridge") {
-            Some(_) => break,
-            None => thread::sleep(Duration::from_millis(50)),
-        }
-    }
-    let _ = bridge.kill();
-    let _ = bridge.wait();
-    cleanup(&name, serve_b);
 }
 
 /// In-flight requests at the moment of disconnect should be answered
@@ -1744,7 +1615,7 @@ fn stdio_bridge_recovers_across_daemon_restart() {
 #[test]
 fn stdio_bridge_synthesizes_errors_for_inflight_requests_on_daemon_death() {
     let name = unique_name("mcp-inflight");
-    let serve_a = spawn_serve(&name);
+    let mut session = spawn_serve(&name);
     wait_for_socket(&mcp_socket_path(&name));
 
     let exe = env!("CARGO_BIN_EXE_zmux");
@@ -1760,6 +1631,11 @@ fn stdio_bridge_synthesizes_errors_for_inflight_requests_on_daemon_death() {
     let mut stdin = bridge.stdin.take().expect("bridge stdin");
     let stdout = bridge.stdout.take().expect("bridge stdout");
     let mut reader = BufReader::new(stdout);
+    // Adopt the bridge so a panic anywhere below still reaps it; the
+    // daemon (and any reconnect-spawned replacement under the same
+    // name) is torn down by name in Drop regardless of whether we
+    // hold a live `Child` handle for it.
+    session.adopt(bridge);
 
     // Handshake first so cached_init is set; the disconnect path then
     // also exercises the replay branch (even though we don't send a
@@ -1782,7 +1658,7 @@ fn stdio_bridge_synthesizes_errors_for_inflight_requests_on_daemon_death() {
     stdin.write_all(&bytes).expect("write list");
     stdin.flush().expect("flush list");
 
-    cleanup(&name, serve_a);
+    session.kill_now();
 
     // Read the next frame the bridge emits. It will be EITHER:
     //   (a) the real tools/list response (daemon answered before we
@@ -1809,21 +1685,12 @@ fn stdio_bridge_synthesizes_errors_for_inflight_requests_on_daemon_death() {
         "frame must be either a real response or a -32603 disconnect error: {v}",
     );
 
-    drop(stdin);
-    let _ = bridge.kill();
-    let _ = bridge.wait();
     // The bridge's reconnect path may have auto-spawned a fresh daemon
-    // for `name` between disconnect and our shutdown. We don't have a
-    // Child handle for it, so use the public CLI to tear it down and
-    // unlink the socket files cleanly.
-    let _ = Command::new(exe)
-        .arg("kill")
-        .arg(&name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = std::fs::remove_file(client_socket_path(&name));
-    let _ = std::fs::remove_file(mcp_socket_path(&name));
+    // for `name` between disconnect and our shutdown. We don't hold a
+    // `Child` handle for it, but `session`'s Drop tears sessions down
+    // by name (`zmux::kill_session`), which covers it, plus reaps the
+    // adopted bridge and sweeps both socket files.
+    drop(stdin);
 }
 
 // ---------------------------------------------------------------- audit
@@ -1836,24 +1703,8 @@ fn stdio_bridge_synthesizes_errors_for_inflight_requests_on_daemon_death() {
 fn mutating_tool_calls_land_in_the_audit_log() {
     let name = unique_name("mcp-audit");
     let state_dir = std::env::temp_dir().join(format!("zmux-test-state-{name}"));
-    let exe = env!("CARGO_BIN_EXE_zmux");
-    let mut command = Command::new(exe);
-    command
-        .arg("serve")
-        .arg(&name)
-        .env("ZMUX_STATE_DIR", &state_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            if setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = command.spawn().expect("spawn zmux serve");
+    let _session =
+        support::spawn_serve_with_envs(&name, [("ZMUX_STATE_DIR", state_dir.as_os_str())]);
 
     // A read-only call first — must NOT be audited.
     let list = round_trip(
@@ -1916,6 +1767,48 @@ fn mutating_tool_calls_land_in_the_audit_log() {
         "audit entries carry a timestamp: {entry}"
     );
 
-    cleanup(&name, child);
     let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+// ------------------------------------------------------------ guard proof
+
+/// Proves the whole point of `TestSession`: a test body that panics
+/// before reaching any explicit teardown must still leave no daemon
+/// process and no socket files behind. We can't panic *this* test
+/// without failing it, so we run the panicking body inside
+/// `catch_unwind` and assert on the aftermath.
+#[test]
+fn drop_tears_down_session_on_panic() {
+    let name = unique_name("guard-panic");
+    let mut pid: Option<u32> = None;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let session = spawn_serve(&name);
+        wait_for_socket(&mcp_socket_path(&name));
+        pid = session.pid();
+        panic!("intentional panic to exercise TestSession::drop on unwind");
+    }));
+
+    assert!(
+        result.is_err(),
+        "inner closure was expected to panic (proves this isn't a no-op)"
+    );
+    let pid = pid.expect("daemon pid must have been captured before the panic fired");
+
+    assert!(
+        !client_socket_path(&name).exists(),
+        "client socket must be removed by Drop after a panic"
+    );
+    assert!(
+        !mcp_socket_path(&name).exists(),
+        "mcp socket must be removed by Drop after a panic"
+    );
+    assert!(
+        !process_alive(pid),
+        "daemon process {pid} must be gone after Drop ran during unwind"
+    );
+}
+
+fn process_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
 }

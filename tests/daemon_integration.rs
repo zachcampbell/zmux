@@ -3,59 +3,17 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use zmux::PtySize;
 use zmux::protocol::{ClientMessage, ServerDecoder, ServerMessage, encode_client_message};
 
-unsafe extern "C" {
-    fn setsid() -> i32;
-}
+mod support;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
-
-fn socket_path(name: &str) -> PathBuf {
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-    std::env::temp_dir()
-        .join(format!("zmux-{user}"))
-        .join(format!("{name}.sock"))
-}
-
-fn spawn_server_with_setsid(name: &str) -> Child {
-    let exe = env!("CARGO_BIN_EXE_zmux");
-    let mut command = Command::new(exe);
-    command
-        .arg("serve")
-        .arg(name)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            if setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    command.spawn().expect("spawn zmux serve")
-}
-
-fn wait_for_socket(path: &Path) {
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    while !path.exists() {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for daemon socket at {}", path.display());
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
 
 fn wait_for_removal(path: &Path) {
     let deadline = Instant::now() + CONNECT_TIMEOUT;
@@ -112,15 +70,15 @@ fn send(stream: &mut UnixStream, message: &ClientMessage) {
 #[test]
 fn daemon_attach_detach_reattach_shutdown() {
     let name = format!("it-lifecycle-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
     // Spawning under setsid exercises the O_NOCTTY regression path: the
     // daemon becomes a session leader with no controlling terminal, so the
     // PTY slave open in spawn_two_pane must not claim the slave as the
     // daemon's ctty or the forked shell's TIOCSCTTY will fail with EPERM.
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let mut session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
 
@@ -168,22 +126,8 @@ fn daemon_attach_detach_reattach_shutdown() {
 
     wait_for_removal(&path);
 
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    loop {
-        match child.try_wait().expect("poll child") {
-            Some(status) => {
-                assert!(status.success(), "daemon exited with {status}");
-                break;
-            }
-            None => {
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!("daemon did not exit after shutdown");
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
+    let status = session.wait_for_exit(CONNECT_TIMEOUT);
+    assert!(status.success(), "daemon exited with {status}");
 }
 
 fn drain_frame(stream: &mut UnixStream) -> Option<ServerMessage> {
@@ -269,11 +213,11 @@ fn parse_active_pane(frame: &ServerMessage) -> (usize, usize) {
 #[test]
 fn split_active_increases_pane_count_in_frames() {
     let name = format!("it-split-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let mut session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut stream = connect(&path);
@@ -307,22 +251,8 @@ fn split_active_increases_pane_count_in_frames() {
     drop(stream);
     wait_for_removal(&path);
 
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    loop {
-        match child.try_wait().expect("poll child") {
-            Some(status) => {
-                assert!(status.success(), "daemon exited with {status}");
-                break;
-            }
-            None => {
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!("daemon did not exit after shutdown");
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
+    let status = session.wait_for_exit(CONNECT_TIMEOUT);
+    assert!(status.success(), "daemon exited with {status}");
 }
 
 #[test]
@@ -331,11 +261,11 @@ fn horizontal_and_vertical_splits_produce_dividers_on_both_axes() {
     // right column horizontally. The rendered frame should contain both
     // a '|' (vertical divider) and a '-' (horizontal divider).
     let name = format!("it-cross-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let mut session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut stream = connect(&path);
@@ -378,22 +308,8 @@ fn horizontal_and_vertical_splits_produce_dividers_on_both_axes() {
     drop(stream);
     wait_for_removal(&path);
 
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    loop {
-        match child.try_wait().expect("poll child") {
-            Some(status) => {
-                assert!(status.success(), "daemon exited with {status}");
-                break;
-            }
-            None => {
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!("daemon did not exit after shutdown");
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
+    let status = session.wait_for_exit(CONNECT_TIMEOUT);
+    assert!(status.success(), "daemon exited with {status}");
 }
 
 #[test]
@@ -402,11 +318,11 @@ fn split_cycle_close_leaves_focus_on_a_sane_pane() {
     // times, cycle focus around, close the active pane, and confirm the
     // new active index is in range and the workspace still renders.
     let name = format!("it-focus-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let mut session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut stream = connect(&path);
@@ -454,22 +370,8 @@ fn split_cycle_close_leaves_focus_on_a_sane_pane() {
     drop(stream);
     wait_for_removal(&path);
 
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    loop {
-        match child.try_wait().expect("poll child") {
-            Some(status) => {
-                assert!(status.success(), "daemon exited with {status}");
-                break;
-            }
-            None => {
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!("daemon did not exit after shutdown");
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
+    let status = session.wait_for_exit(CONNECT_TIMEOUT);
+    assert!(status.success(), "daemon exited with {status}");
 }
 
 #[test]
@@ -478,11 +380,11 @@ fn two_clients_both_receive_frames_when_state_changes() {
     // get an initial frame, and a pane split from one of them produces
     // fresh frames on both.
     let name = format!("it-multi-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let mut session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut a = connect(&path);
@@ -513,54 +415,26 @@ fn two_clients_both_receive_frames_when_state_changes() {
     drop(b);
     wait_for_removal(&path);
 
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    loop {
-        match child.try_wait().expect("poll child") {
-            Some(status) => {
-                assert!(status.success(), "daemon exited with {status}");
-                break;
-            }
-            None => {
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!("daemon did not exit after shutdown");
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
+    let status = session.wait_for_exit(CONNECT_TIMEOUT);
+    assert!(status.success(), "daemon exited with {status}");
 }
 
 #[test]
 fn daemon_exits_when_socket_is_removed_externally() {
     let name = format!("it-orphan-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let mut session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     // Removing the socket file out-of-band used to leave the daemon spinning
     // forever with no way to kill it via the CLI. The server should notice
     // and shut down on its own.
     std::fs::remove_file(&path).expect("remove socket");
 
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    loop {
-        match child.try_wait().expect("poll child") {
-            Some(status) => {
-                assert!(status.success(), "orphaned daemon exited with {status}");
-                break;
-            }
-            None => {
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!("daemon did not exit after socket was removed");
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
+    let status = session.wait_for_exit(CONNECT_TIMEOUT);
+    assert!(status.success(), "orphaned daemon exited with {status}");
 }
 
 fn read_frame_with(stream: &mut UnixStream, needle: &str) -> Vec<String> {
@@ -585,11 +459,11 @@ fn read_frame_with(stream: &mut UnixStream, needle: &str) -> Vec<String> {
 #[test]
 fn toggle_zoom_round_trips_over_the_socket() {
     let name = format!("it-zoom-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let _session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut client = connect(&path);
@@ -614,17 +488,17 @@ fn toggle_zoom_round_trips_over_the_socket() {
     send(&mut client, &ClientMessage::Shutdown);
     drop(client);
     wait_for_removal(&path);
-    let _ = child.wait();
+    // `session`'s Drop reaps the daemon process below.
 }
 
 #[test]
 fn toggle_zoom_after_split_shows_only_one_pane_header() {
     let name = format!("it-zoom-split-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let _session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut client = connect(&path);
@@ -701,17 +575,17 @@ fn toggle_zoom_after_split_shows_only_one_pane_header() {
     send(&mut client, &ClientMessage::Shutdown);
     drop(client);
     wait_for_removal(&path);
-    let _ = child.wait();
+    // `session`'s Drop reaps the daemon process below.
 }
 
 #[test]
 fn new_window_and_cycle_over_the_socket() {
     let name = format!("it-windows-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let _session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut client = connect(&path);
@@ -765,17 +639,17 @@ fn new_window_and_cycle_over_the_socket() {
     send(&mut client, &ClientMessage::Shutdown);
     drop(client);
     wait_for_removal(&path);
-    let _ = child.wait();
+    // `session`'s Drop reaps the daemon process below.
 }
 
 #[test]
 fn rename_wire_path_updates_pane_header() {
     let name = format!("it-rename-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let _session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut client = connect(&path);
@@ -800,17 +674,17 @@ fn rename_wire_path_updates_pane_header() {
     send(&mut client, &ClientMessage::Shutdown);
     drop(client);
     wait_for_removal(&path);
-    let _ = child.wait();
+    // `session`'s Drop reaps the daemon process below.
 }
 
 #[test]
 fn swap_pane_next_reorders_pane_headers() {
     let name = format!("it-swap-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let _session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut client = connect(&path);
@@ -871,17 +745,17 @@ fn swap_pane_next_reorders_pane_headers() {
     send(&mut client, &ClientMessage::Shutdown);
     drop(client);
     wait_for_removal(&path);
-    let _ = child.wait();
+    // `session`'s Drop reaps the daemon process below.
 }
 
 #[test]
 fn begin_selection_surfaces_sel_tag_and_yank_returns_clipboard() {
     let name = format!("it-select-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let _session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut client = connect(&path);
@@ -927,17 +801,17 @@ fn begin_selection_surfaces_sel_tag_and_yank_returns_clipboard() {
     send(&mut client, &ClientMessage::Shutdown);
     drop(client);
     wait_for_removal(&path);
-    let _ = child.wait();
+    // `session`'s Drop reaps the daemon process below.
 }
 
 #[test]
 fn search_begin_shows_prompt_in_status_bar() {
     let name = format!("it-search-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let _session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut client = connect(&path);
@@ -961,7 +835,7 @@ fn search_begin_shows_prompt_in_status_bar() {
     send(&mut client, &ClientMessage::Shutdown);
     drop(client);
     wait_for_removal(&path);
-    let _ = child.wait();
+    // `session`'s Drop reaps the daemon process below.
 }
 
 /// End-to-end: the Ctrl-a : flow sends `CommandPromptBegin(General)` then
@@ -973,11 +847,11 @@ fn runtime_prompt_display_message_round_trip() {
     use zmux::protocol::CommandPromptKind;
 
     let name = format!("it-cmd-prompt-{}", std::process::id());
-    let path = socket_path(&name);
+    let path = support::client_socket_path(&name);
     let _ = std::fs::remove_file(&path);
 
-    let mut child = spawn_server_with_setsid(&name);
-    wait_for_socket(&path);
+    let _session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
 
     let size = PtySize::new(24, 80);
     let mut client = connect(&path);
@@ -1020,5 +894,5 @@ fn runtime_prompt_display_message_round_trip() {
     send(&mut client, &ClientMessage::Shutdown);
     drop(client);
     wait_for_removal(&path);
-    let _ = child.wait();
+    // `session`'s Drop reaps the daemon process below.
 }
