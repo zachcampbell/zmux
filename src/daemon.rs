@@ -848,7 +848,7 @@ fn run_server_loop(
                 Err(error) => return Err(error),
             };
 
-            let messages = clients[index].decoder.push_bytes(&bytes)?;
+            let messages = coalesce_resizes(clients[index].decoder.push_bytes(&bytes)?);
             let mut detached_now = false;
             for message in messages {
                 match message {
@@ -1383,6 +1383,38 @@ fn run_server_loop(
 
         thread::sleep(Duration::from_millis(SERVER_POLL_MS));
     }
+}
+
+// A user dragging a terminal window resize can fire many SIGWINCH
+// events in quick succession; the client sends a Resize per event, and
+// a single socket read on the daemon side can end up with several of
+// them buffered in one batch. Each Resize drives a full workspace
+// relayout plus a TIOCSWINSZ ioctl fan-out to every pane's PTY (see the
+// Attach/Resize handling in run_server_loop) — only the size from the
+// *last* Resize in a run actually matters, since every earlier one in
+// that run is immediately superseded before this batch is even done
+// being processed. Fold consecutive Resize messages down to just the
+// final one in each run so the daemon does one relayout per batch
+// instead of one per buffered message.
+//
+// Attach also carries a size, and today drives the identical relayout
+// path (see the shared match arm below), but is deliberately left
+// alone here: it's a different message kind from Resize, and normal
+// client behavior only ever sends it once, as the first message right
+// after connecting. There's no resize storm to coalesce it out of, and
+// folding it into a neighboring Resize run would blur two semantically
+// distinct message kinds together for no benefit.
+fn coalesce_resizes(messages: Vec<ClientMessage>) -> Vec<ClientMessage> {
+    let mut coalesced: Vec<ClientMessage> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if matches!(message, ClientMessage::Resize { .. })
+            && matches!(coalesced.last(), Some(ClientMessage::Resize { .. }))
+        {
+            coalesced.pop();
+        }
+        coalesced.push(message);
+    }
+    coalesced
 }
 
 fn accept_pending_connections(listener: &UnixListener, clients: &mut Vec<AttachedClient>) {
@@ -2118,10 +2150,11 @@ pub fn print_session_list_verbose(
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachInput, PrefixKeyParser, is_dead_client_write_error, print_session_list,
-        send_server_message,
+        AttachInput, PrefixKeyParser, coalesce_resizes, is_dead_client_write_error,
+        print_session_list, send_server_message,
     };
     use crate::protocol::{ClientMessage, ServerMessage};
+    use crate::pty::PtySize;
     use std::io;
     use std::os::unix::net::UnixStream;
     use std::path::Path;
@@ -2384,5 +2417,84 @@ mod tests {
         // (which would turn this into a BrokenPipe test instead of a
         // WouldBlock/TimedOut test).
         drop(client_side);
+    }
+
+    #[test]
+    fn coalesce_resizes_folds_a_consecutive_run_down_to_the_final_size() {
+        let messages = vec![
+            ClientMessage::Resize {
+                size: PtySize::new(24, 80),
+            },
+            ClientMessage::Resize {
+                size: PtySize::new(30, 90),
+            },
+            ClientMessage::Resize {
+                size: PtySize::new(40, 100),
+            },
+        ];
+
+        let coalesced = coalesce_resizes(messages);
+
+        assert_eq!(
+            coalesced,
+            vec![ClientMessage::Resize {
+                size: PtySize::new(40, 100),
+            }],
+            "only the final resize in a consecutive run should survive"
+        );
+    }
+
+    #[test]
+    fn coalesce_resizes_leaves_non_resize_messages_untouched_and_in_order() {
+        let messages = vec![
+            ClientMessage::Attach {
+                size: PtySize::new(24, 80),
+            },
+            ClientMessage::Resize {
+                size: PtySize::new(30, 90),
+            },
+            ClientMessage::Resize {
+                size: PtySize::new(40, 100),
+            },
+            ClientMessage::Input(vec![b'a']),
+            ClientMessage::Resize {
+                size: PtySize::new(50, 110),
+            },
+        ];
+
+        let coalesced = coalesce_resizes(messages);
+
+        // Attach is untouched (not folded into the following Resize
+        // run), the first Resize run collapses to its final size,
+        // Input passes through unchanged, and the lone trailing Resize
+        // (with nothing after it to fold with) survives as-is. Order
+        // is preserved throughout.
+        assert_eq!(
+            coalesced,
+            vec![
+                ClientMessage::Attach {
+                    size: PtySize::new(24, 80),
+                },
+                ClientMessage::Resize {
+                    size: PtySize::new(40, 100),
+                },
+                ClientMessage::Input(vec![b'a']),
+                ClientMessage::Resize {
+                    size: PtySize::new(50, 110),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_resizes_is_a_noop_on_a_batch_with_no_resizes() {
+        let messages = vec![ClientMessage::Detach, ClientMessage::ToggleZoom];
+        let coalesced = coalesce_resizes(messages.clone());
+        assert_eq!(coalesced, messages);
+    }
+
+    #[test]
+    fn coalesce_resizes_handles_an_empty_batch() {
+        assert_eq!(coalesce_resizes(Vec::new()), Vec::new());
     }
 }
