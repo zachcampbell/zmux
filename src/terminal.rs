@@ -599,14 +599,30 @@ impl TerminalIngest {
                 ParseState::Ground
             }
             b'D' => {
-                if pane.screen_mode() == ScreenMode::Alternate {
-                    self.alternate.index();
+                match pane.screen_mode() {
+                    ScreenMode::Primary => self.primary_index(pane),
+                    ScreenMode::Alternate => self.alternate.index(),
                 }
                 ParseState::Ground
             }
             b'M' => {
-                if pane.screen_mode() == ScreenMode::Alternate {
-                    self.alternate.reverse_index();
+                match pane.screen_mode() {
+                    ScreenMode::Primary => self.primary_reverse_index(),
+                    ScreenMode::Alternate => self.alternate.reverse_index(),
+                }
+                ParseState::Ground
+            }
+            b'E' => {
+                // NEL: carriage return + IND. `primary_linefeed` already
+                // *is* CR-plus-index (see its comment), so this is a
+                // direct reuse; the alt screen keeps the two split apart
+                // like a real terminal, so it calls both explicitly.
+                match pane.screen_mode() {
+                    ScreenMode::Primary => self.primary_linefeed(pane),
+                    ScreenMode::Alternate => {
+                        self.alternate.carriage_return();
+                        self.alternate.index();
+                    }
                 }
                 ParseState::Ground
             }
@@ -1595,7 +1611,17 @@ impl TerminalIngest {
     // (Most terminals separate linefeed from carriage return, but every
     // existing caller of this code treats `\n` as both — shells emit
     // `\r\n` so `\r` is a no-op there, and bare `\n` from poorly-behaved
-    // sources still wants to land on a fresh column-0 line.)
+    // sources still wants to land on a fresh column-0 line.) That makes
+    // this identical to NEL (CR + IND), so NEL reuses it directly rather
+    // than re-deriving the same two steps.
+    fn primary_linefeed(&mut self, pane: &mut Pane) {
+        self.primary_cursor_col = 0;
+        self.primary_index(pane);
+    }
+
+    // IND (`ESC D`): cursor down one row, column untouched — the part of
+    // `primary_linefeed` that isn't the carriage return, split out so
+    // IND can share it without inheriting LF's column reset.
     //
     // Push behavior:
     //   - if the cursor is at the bottom of the grid AND the grid hasn't
@@ -1605,15 +1631,14 @@ impl TerminalIngest {
     //     shift everything up one row, push a blank row at the bottom,
     //     leave the cursor at the (now-bottom) row.
     //   - otherwise: just advance the cursor.
-    fn primary_linefeed(&mut self, pane: &mut Pane) {
+    fn primary_index(&mut self, pane: &mut Pane) {
         self.primary_wrap_pending = false;
-        self.primary_cursor_col = 0;
         let max_rows = self.alternate.rows.max(1);
 
-        // Make sparse absolute-positioned rows real before applying LF.
-        // Without this, CUP/CUD to the bottom followed by LF collapses the
-        // cursor back to the current grid tail instead of scrolling the
-        // viewport/scroll-region like a terminal would.
+        // Make sparse absolute-positioned rows real before applying IND.
+        // Without this, CUP/CUD to the bottom followed by IND collapses
+        // the cursor back to the current grid tail instead of scrolling
+        // the viewport/scroll-region like a terminal would.
         while self.primary_grid.len() <= self.primary_cursor_row {
             self.primary_grid.push(Vec::new());
         }
@@ -1639,6 +1664,28 @@ impl TerminalIngest {
         pane.append_output_line(evicted);
         self.primary_grid.push(Vec::new());
         self.primary_cursor_row = max_rows - 1;
+    }
+
+    // RI (`ESC M`): cursor up one row, column untouched. Mirrors
+    // `AlternateScreen::reverse_index` — at the scroll region's top
+    // margin the region scrolls down (blank line at the top, the
+    // region's bottom line discarded) instead of moving the cursor past
+    // it. Reverse scrolling never feeds scrollback; that only happens on
+    // the forward (IND) direction.
+    //
+    // Unlike `AlternateScreen::reverse_index`'s bare `cursor_row -= 1`,
+    // this uses `saturating_sub`: DECSTBM parks the cursor at (0, 0)
+    // after setting a region, so a region whose top isn't row 0 can
+    // leave the cursor above `primary_scroll_top`. An RI from there must
+    // clamp at row 0 like every other primary-screen vertical move, not
+    // underflow.
+    fn primary_reverse_index(&mut self) {
+        self.primary_wrap_pending = false;
+        if self.primary_cursor_row == self.primary_scroll_top {
+            self.primary_scroll_down_within_region(1);
+        } else {
+            self.primary_cursor_row = self.primary_cursor_row.saturating_sub(1);
+        }
     }
 
     // Print one character at the cursor's current cell on the primary
@@ -1725,6 +1772,30 @@ impl TerminalIngest {
         region.rotate_left(count);
         let len = region.len();
         for row in region.iter_mut().skip(len.saturating_sub(count)) {
+            *row = blank.clone();
+        }
+    }
+
+    // RI's counterpart to `primary_scroll_up_within_region`: rotate the
+    // region the other way and blank the rows that rotated in at the
+    // top instead of the bottom.
+    fn primary_scroll_down_within_region(&mut self, count: usize) {
+        let max_row = self.alternate.rows.saturating_sub(1);
+        let top = self.primary_scroll_top.min(max_row);
+        let bottom = self.primary_scroll_bottom.min(max_row);
+        if top >= bottom {
+            return;
+        }
+
+        while self.primary_grid.len() <= bottom {
+            self.primary_grid.push(Vec::new());
+        }
+
+        let count = count.min(bottom.saturating_sub(top) + 1);
+        let blank = self.primary_blank_row();
+        let region = &mut self.primary_grid[top..=bottom];
+        region.rotate_right(count);
+        for row in region.iter_mut().take(count) {
             *row = blank.clone();
         }
     }
@@ -3865,6 +3936,141 @@ mod tests {
         assert_eq!(
             semi_cells[0][1].style, colon_cells[0][1].style,
             "38:2:R:G:B should match 38;2;R;G;B",
+        );
+    }
+
+    // ESC D (IND) and ESC M (RI) used to be alt-screen-only — silent
+    // no-ops on the primary grid — and ESC E (NEL) wasn't wired up at
+    // all. The tests below pin the primary-screen behavior to match
+    // xterm, reusing the same scroll machinery DECSTBM/linefeed already
+    // exercise rather than a parallel implementation.
+
+    #[test]
+    fn ind_and_ri_move_the_cursor_without_scrolling_mid_screen() {
+        // Neither escape should touch content or column when the cursor
+        // isn't sitting on a scroll-region margin — this is the case a
+        // naive "always scroll" implementation gets wrong.
+        let mut pane = Pane::new("shell", 32, 5);
+        let mut ingest = TerminalIngest::new(PtySize::new(5, 32));
+
+        ingest.ingest_bytes(&mut pane, b"r0\nr1\nr2\nr3\nr4");
+        // Park at row 3 (1-based), col 3 — nowhere near either margin of
+        // the default full-screen region (rows 0..4).
+        let reply = ingest.ingest_bytes(&mut pane, b"\x1b[3;3H\x1bD\x1b[6n");
+        assert_eq!(
+            reply, b"\x1b[4;3R",
+            "IND should move down one row, column held"
+        );
+
+        let reply = ingest.ingest_bytes(&mut pane, b"\x1bM\x1b[6n");
+        assert_eq!(reply, b"\x1b[3;3R", "RI should undo the IND exactly");
+
+        assert_eq!(
+            ingest.render_lines(&pane),
+            vec!["r0", "r1", "r2", "r3", "r4"],
+            "mid-screen IND/RI must not scroll or mutate content",
+        );
+    }
+
+    #[test]
+    fn ri_at_viewport_top_pushes_content_down_with_no_scroll_region_set() {
+        // No DECSTBM in play, so the "region" is the whole viewport.
+        // RI at row 0 must scroll the whole screen down: a blank line
+        // appears at the top and the bottom line is discarded (RI never
+        // feeds a scrollback line — that only happens on forward scroll).
+        let mut pane = Pane::new("shell", 32, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 32));
+
+        ingest.ingest_bytes(&mut pane, b"a\nb\nc\nd");
+        ingest.ingest_bytes(&mut pane, b"\x1b[1;1H\x1bM");
+
+        assert_eq!(
+            ingest.render_lines(&pane),
+            vec!["", "a", "b", "c"],
+            "RI at top must push rows down and drop the bottom row",
+        );
+        assert_eq!(
+            pane.total_lines(),
+            0,
+            "reverse scroll must not feed anything to scrollback",
+        );
+    }
+
+    #[test]
+    fn ri_at_top_of_a_decstbm_region_scrolls_only_the_region() {
+        // Mirror of `primary_scroll_region_limits_linefeed_scrolling`
+        // but for RI: rows outside the [top, bottom] band must be
+        // untouched, and the discarded line is the region's bottom row,
+        // not the viewport's.
+        let mut pane = Pane::new("shell", 32, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 32));
+
+        ingest.ingest_bytes(&mut pane, b"top\none\ntwo\nbottom");
+        // Region rows 2..3 (1-based) covers "one"/"two". DECSTBM parks
+        // the cursor at (0,0), so explicitly return to the region's top
+        // row before sending RI.
+        ingest.ingest_bytes(&mut pane, b"\x1b[2;3r\x1b[2;1H\x1bM");
+
+        let rendered = ingest.render_lines(&pane);
+        assert_eq!(rendered[0], "top", "row above region changed: {rendered:?}");
+        assert_eq!(rendered[1], "", "region top must go blank: {rendered:?}");
+        assert_eq!(
+            rendered[2], "one",
+            "region content shifted down: {rendered:?}"
+        );
+        assert_eq!(
+            rendered[3], "bottom",
+            "row below region changed: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn ind_at_bottom_of_a_decstbm_region_scrolls_only_the_region_and_holds_column() {
+        let mut pane = Pane::new("shell", 32, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 32));
+
+        ingest.ingest_bytes(&mut pane, b"top\none\ntwo\nbottom");
+        // Region rows 2..3 (1-based) covers "one"/"two". Land on the
+        // region's bottom row at column 2 (not 0) — IND must scroll
+        // the region up in place without resetting the column, unlike
+        // linefeed/NEL which fold in a carriage return.
+        let reply = ingest.ingest_bytes(&mut pane, b"\x1b[2;3r\x1b[3;2H\x1bD\x1b[6n");
+        assert_eq!(
+            reply, b"\x1b[3;2R",
+            "IND at the region margin must hold column"
+        );
+
+        let rendered = ingest.render_lines(&pane);
+        assert_eq!(rendered[0], "top", "row above region changed: {rendered:?}");
+        assert_eq!(
+            rendered[1], "two",
+            "region content shifted up: {rendered:?}"
+        );
+        assert_eq!(rendered[2], "", "region bottom must go blank: {rendered:?}");
+        assert_eq!(
+            rendered[3], "bottom",
+            "row below region changed: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn nel_is_carriage_return_plus_index() {
+        let mut pane = Pane::new("shell", 32, 5);
+        let mut ingest = TerminalIngest::new(PtySize::new(5, 32));
+
+        ingest.ingest_bytes(&mut pane, b"aa\nbb\ncc\ndd\nee");
+        // Park mid-row (row 2, col 3) — NEL must both drop to column 0
+        // AND advance a row, same as a real carriage-return + IND pair.
+        let reply = ingest.ingest_bytes(&mut pane, b"\x1b[2;3H\x1bE\x1b[6n");
+        assert_eq!(
+            reply, b"\x1b[3;1R",
+            "NEL must CR to col 1 and advance one row"
+        );
+
+        assert_eq!(
+            ingest.render_lines(&pane),
+            vec!["aa", "bb", "cc", "dd", "ee"],
+            "NEL away from any margin must not mutate content",
         );
     }
 }
