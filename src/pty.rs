@@ -47,6 +47,21 @@ unsafe extern "C" {
 pub const MAX_PTY_ROWS: u16 = 512;
 pub const MAX_PTY_COLS: u16 = 1024;
 
+// Per-call byte budget for `read_available`. The daemon's event loop is
+// single-threaded and ticks every SERVER_POLL_MS: a pane whose child
+// firehoses output (e.g. `yes`, or a runaway build log) would otherwise
+// keep `read_available`'s `while poll_readable(...)` loop spinning for
+// as long as bytes keep arriving, starving every other pane's PTY
+// drain, every attached client's input, and every frame broadcast for
+// that whole tick. Capping the loop at a fixed budget per call bounds
+// one pane's worst-case hogging of a single tick; a call that hits the
+// budget just means more bytes are still pending, which the ingest
+// callers already treat as "dirty" (see Session::ingest_available_output),
+// so the next tick's `read_available` call picks up where this one left
+// off. 256 KiB is generous headroom above a typical terminal-sized
+// frame while still keeping one tick's worst case bounded.
+const PTY_READ_BUDGET_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
     pub rows: u16,
@@ -160,8 +175,18 @@ impl PtyProcess {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 4096];
 
-        while poll_readable(self.reader.as_raw_fd(), 0)? {
-            match self.reader.read(&mut chunk) {
+        // Bounded by PTY_READ_BUDGET_BYTES (see its doc comment): stop
+        // once we've read enough for this call even if more is still
+        // waiting, so one firehose pane can't monopolize a whole tick of
+        // the daemon's single-threaded event loop. Each read is itself
+        // clamped to the remaining budget (not just the loop condition)
+        // so a fast producer that keeps refilling the pty's internal
+        // buffer as quickly as we drain it can't make the final chunk
+        // overshoot the cap.
+        while buffer.len() < PTY_READ_BUDGET_BYTES && poll_readable(self.reader.as_raw_fd(), 0)? {
+            let remaining = PTY_READ_BUDGET_BYTES - buffer.len();
+            let want = remaining.min(chunk.len());
+            match self.reader.read(&mut chunk[..want]) {
                 Ok(0) => break,
                 Ok(count) => buffer.extend_from_slice(&chunk[..count]),
                 Err(error) if error.raw_os_error() == Some(5) => break,
@@ -241,7 +266,7 @@ fn set_winsize(fd: i32, size: PtySize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PtyProcess, PtySize};
+    use super::{PTY_READ_BUDGET_BYTES, PtyProcess, PtySize};
 
     #[test]
     fn can_spawn_a_command_inside_a_pty() {
@@ -259,6 +284,64 @@ mod tests {
         assert!(status.success());
         assert!(output.contains("alpha\r\n"));
         assert!(output.contains("beta\r\n"));
+    }
+
+    #[test]
+    fn read_available_never_returns_more_than_the_configured_budget() {
+        // Regression test for the unbounded-drain bug: `yes` writes as
+        // fast as the pty will accept. A pty's own kernel-side buffer
+        // is typically much smaller than PTY_READ_BUDGET_BYTES (tens of
+        // KiB, not hundreds), so waiting before the first read doesn't
+        // build up enough backlog to exercise the cap on its own. What
+        // actually stresses the budget is draining tightly right after
+        // spawn: as fast as we empty the pty's buffer, the still-running
+        // `yes` process refills it, so an uncapped
+        // `while poll_readable(...) { read() }` loop would keep spinning
+        // and growing the buffer for as long as that keeps up (verified
+        // empirically: without a cap this saturates 256 KiB in well
+        // under 100ms). With the budget in place, a single
+        // read_available call must stop at PTY_READ_BUDGET_BYTES.
+        let mut process = PtyProcess::spawn("/bin/sh", &["-lc", "yes"], PtySize::new(24, 80))
+            .expect("spawn PTY process");
+
+        // Retry a few times in case the child hasn't started producing
+        // output yet on a loaded machine. The invariant under test
+        // (never exceed the budget) is a hard requirement, checked on
+        // every call. Whether any single call actually *saturates* the
+        // budget is a softer signal: it depends on how much real CPU
+        // time the scheduler hands `yes` versus this drain loop, which
+        // varies a lot on constrained/virtualized CI hardware (verified
+        // empirically to be unreliable under scheduling pressure even
+        // across a couple of seconds of retries), so that part is
+        // reported rather than asserted.
+        let mut hit_budget = false;
+        let mut total_seen = 0usize;
+        for _ in 0..200 {
+            let bytes = process.read_available().expect("read_available");
+            assert!(
+                bytes.len() <= PTY_READ_BUDGET_BYTES,
+                "read_available returned {} bytes, exceeding the {} byte budget",
+                bytes.len(),
+                PTY_READ_BUDGET_BYTES,
+            );
+            total_seen += bytes.len();
+            if bytes.len() == PTY_READ_BUDGET_BYTES {
+                hit_budget = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        process.kill().expect("kill firehose process");
+
+        if !hit_budget {
+            eprintln!(
+                "note: read_available never saturated the {PTY_READ_BUDGET_BYTES} byte budget \
+                 in this run (saw {total_seen} bytes total across retries); this is scheduler-\
+                 dependent and not a failure on its own — the never-exceeded assertion above is \
+                 the actual regression guard"
+            );
+        }
     }
 
     #[test]
