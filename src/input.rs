@@ -117,8 +117,18 @@ impl InputParser {
             }
 
             if self.pending[1] != b'[' {
-                if self.pending.len() < 2 {
-                    break;
+                // A second ESC landing right after the first isn't a
+                // 2-byte (Alt-key style) sequence together with it — it's
+                // either the start of a real escape sequence in its own
+                // right (a stale lone ESC immediately followed by, say,
+                // an arrow key's `ESC [ A`) or just another standalone
+                // Escape keypress. Flush only the first byte and let the
+                // loop re-examine the second ESC from scratch, instead of
+                // consuming both as one malformed 2-byte Forward and
+                // orphaning whatever follows.
+                if self.pending[1] == 0x1b {
+                    actions.push(InputAction::Forward(self.pending.drain(..1).collect()));
+                    continue;
                 }
 
                 actions.push(InputAction::Forward(self.pending.drain(..2).collect()));
@@ -162,6 +172,29 @@ impl InputParser {
         }
 
         actions
+    }
+
+    // A lone ESC sitting in `pending` with nothing after it is
+    // ambiguous: it could be the first byte of a multi-byte escape
+    // sequence still in flight, or it could be the user pressing
+    // Escape by itself — vim/Claude Code's exit-insert-mode key, say.
+    // `push_bytes` alone can't tell these apart and, left to buffer
+    // forever, a genuine lone ESC would never reach the pane until some
+    // unrelated keypress arrived to disambiguate it.
+    //
+    // The caller resolves the ambiguity with timing: a complete escape
+    // sequence arrives from a real terminal in a single burst, so if a
+    // full poll tick passes with no more bytes from this client, nothing
+    // else is coming — the ESC was real. Call this once per quiet tick
+    // (see daemon.rs's client loop and its SERVER_POLL_MS, which doubles
+    // as this escape-time) to flush it through. No-op, and safe to call
+    // repeatedly, whenever `pending` doesn't hold exactly a lone ESC.
+    pub fn flush_pending(&mut self) -> Option<InputAction> {
+        if self.pending == [0x1b] {
+            self.pending.clear();
+            return Some(InputAction::Forward(vec![0x1b]));
+        }
+        None
     }
 }
 
@@ -371,5 +404,132 @@ mod tests {
             }
         );
         assert_eq!(translated.encode_sgr(), b"\x1b[<64;9;6M");
+    }
+
+    #[test]
+    fn lone_esc_is_buffered_not_forwarded_immediately() {
+        // A single ESC byte is ambiguous on its own — it might be the
+        // first byte of a longer sequence still in flight — so
+        // push_bytes must hold it rather than guessing.
+        let mut parser = InputParser::default();
+        let actions = parser.push_bytes(b"\x1b");
+
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn flush_pending_emits_a_buffered_lone_esc() {
+        let mut parser = InputParser::default();
+        assert!(parser.push_bytes(b"\x1b").is_empty());
+
+        let flushed = parser.flush_pending();
+
+        assert_eq!(flushed, Some(InputAction::Forward(vec![0x1b])));
+    }
+
+    #[test]
+    fn flush_pending_is_a_no_op_with_nothing_buffered() {
+        let mut parser = InputParser::default();
+
+        assert_eq!(parser.flush_pending(), None);
+    }
+
+    #[test]
+    fn flush_pending_does_not_double_flush() {
+        let mut parser = InputParser::default();
+        assert!(parser.push_bytes(b"\x1b").is_empty());
+
+        assert_eq!(
+            parser.flush_pending(),
+            Some(InputAction::Forward(vec![0x1b]))
+        );
+        // The buffered ESC was already drained by the first flush;
+        // a second call must not manufacture another one.
+        assert_eq!(parser.flush_pending(), None);
+    }
+
+    #[test]
+    fn flush_pending_ignores_a_sequence_still_in_flight() {
+        // Two bytes of an unfinished CSI sequence (no final byte yet)
+        // is not the "lone ESC" case flush_pending exists for — it's
+        // still legitimately waiting on more bytes.
+        let mut parser = InputParser::default();
+        assert!(parser.push_bytes(b"\x1b[").is_empty());
+
+        assert_eq!(parser.flush_pending(), None);
+    }
+
+    #[test]
+    fn stale_lone_esc_followed_by_an_arrow_key_forwards_both_intact() {
+        // The exact regression this bug describes: ESC arrives alone
+        // in one read (buffered, nothing forwarded yet), then an Up
+        // arrow (`ESC [ A`) arrives in a later read before any flush
+        // happened. The stale ESC must come out as its own standalone
+        // Forward, and the arrow key must survive as one intact
+        // 3-byte Forward — not merged into a mangled `ESC ESC` pair
+        // with the arrow's `[A` orphaned as literal text.
+        let mut parser = InputParser::default();
+
+        let first = parser.push_bytes(b"\x1b");
+        assert!(first.is_empty());
+
+        let second = parser.push_bytes(b"\x1b[A");
+        assert_eq!(
+            second,
+            vec![
+                InputAction::Forward(vec![0x1b]),
+                InputAction::Forward(b"\x1b[A".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_arrow_sequence_still_reassembles_across_reads() {
+        // A genuinely split (not stale-ESC-prefixed) arrow key must
+        // still reassemble into one Forward, same as before this fix.
+        let mut parser = InputParser::default();
+
+        let first = parser.push_bytes(b"\x1b[");
+        assert!(first.is_empty());
+
+        let second = parser.push_bytes(b"A");
+        assert_eq!(second, vec![InputAction::Forward(b"\x1b[A".to_vec())]);
+    }
+
+    #[test]
+    fn consecutive_escape_keypresses_peel_off_one_at_a_time() {
+        // Three real, separate Escape presses arriving in the same read
+        // (fast typing, no intervening quiet tick) must come out as
+        // standalone ESC forwards one at a time, never merged into a
+        // multi-byte pair. The trailing ESC is still ambiguous on its
+        // own and stays buffered for flush_pending, same as any other
+        // lone ESC.
+        let mut parser = InputParser::default();
+        let actions = parser.push_bytes(b"\x1b\x1b\x1b");
+
+        assert_eq!(
+            actions,
+            vec![
+                InputAction::Forward(vec![0x1b]),
+                InputAction::Forward(vec![0x1b]),
+            ]
+        );
+        assert_eq!(
+            parser.flush_pending(),
+            Some(InputAction::Forward(vec![0x1b]))
+        );
+    }
+
+    #[test]
+    fn esc_followed_by_an_unrelated_byte_is_still_treated_as_a_meta_combo() {
+        // Pre-existing behavior, unrelated to the flush fix: `ESC` then
+        // an ordinary byte that isn't `[` or another ESC is forwarded
+        // as a single 2-byte unit (the Alt/Meta-key convention many
+        // terminals use). Only ESC-then-ESC and ESC-then-CSI needed to
+        // change.
+        let mut parser = InputParser::default();
+        let actions = parser.push_bytes(b"\x1bx");
+
+        assert_eq!(actions, vec![InputAction::Forward(b"\x1bx".to_vec())]);
     }
 }

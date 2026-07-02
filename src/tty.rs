@@ -100,7 +100,13 @@ impl TerminalGuard {
             last_size: None,
             last_cursor: None,
         };
-        guard.write_escape("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
+        // `?1049h` alt-screen, `?25l` hide cursor, clear+home. `?2004h`
+        // (bracketed paste) tells the host terminal to wrap multiline
+        // pastes in `ESC[200~ ... ESC[201~` markers instead of sending
+        // bare newlines — without it, pasting multiline text into a
+        // pane submits line-by-line (vim/Claude Code mis-fire on every
+        // embedded newline) instead of landing as a single paste.
+        guard.write_escape("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?2004h")?;
         guard.set_mouse_tracking_mode(MouseTrackingMode::Click)?;
         Ok(guard)
     }
@@ -118,23 +124,23 @@ impl TerminalGuard {
     }
 
     pub fn read_input(&mut self, timeout_ms: i32) -> io::Result<Vec<u8>> {
-        let mut poll_fd = [PollFd {
-            fd: self.stdin_fd,
-            events: POLLIN,
-            revents: 0,
-        }];
-
-        let ready = unsafe { poll(poll_fd.as_mut_ptr(), poll_fd.len(), timeout_ms) };
-        if ready == -1 {
-            return Err(io::Error::last_os_error());
-        }
-
-        if ready == 0 || poll_fd[0].revents & POLLIN == 0 {
+        if !poll_readable(self.stdin_fd, timeout_ms)? {
             return Ok(Vec::new());
         }
 
         let mut buffer = vec![0u8; 1024];
-        let count = io::stdin().read(&mut buffer)?;
+        // A stray signal (zmux installs no handlers today, but a future
+        // one — or a signal a library installs on our behalf — must not
+        // turn a routine interrupt into a lost read) can make this
+        // return EINTR with nothing actually wrong; retry rather than
+        // surfacing it as a hard error.
+        let count = loop {
+            match io::stdin().read(&mut buffer) {
+                Ok(count) => break count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        };
         buffer.truncate(count);
         Ok(buffer)
     }
@@ -311,8 +317,13 @@ fn mouse_tracking_sequence(mouse_tracking_mode: MouseTrackingMode) -> String {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Undo every mode `enter()` turned on before leaving the alt
+        // screen: mouse tracking, then bracketed paste (`?2004l`), then
+        // show the cursor. Leaving `?2004h` set would have the host
+        // terminal keep wrapping pastes in `ESC[200~`/`ESC[201~` markers
+        // for whatever the user runs next in this terminal.
         let _ = self.write_escape(&format!(
-            "\x1b[0m{}\x1b[?25h\x1b[?1049l",
+            "\x1b[0m{}\x1b[?2004l\x1b[?25h\x1b[?1049l",
             mouse_tracking_reset_sequence()
         ));
         let _ = write_termios(self.stdin_fd, &self.original_mode);
@@ -326,12 +337,24 @@ pub fn poll_readable(fd: i32, timeout_ms: i32) -> io::Result<bool> {
         revents: 0,
     }];
 
-    let ready = unsafe { poll(poll_fd.as_mut_ptr(), poll_fd.len(), timeout_ms) };
-    if ready == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    // Retry on EINTR rather than propagating it: a signal landing mid-poll
+    // isn't a poll failure, and treating it as one would make an
+    // otherwise-routine signal look like a dead fd to every caller
+    // (client reads, PTY reads, the accept-loop) — see daemon.rs's
+    // client-read handling, which used to tear down the whole session
+    // on exactly this.
+    loop {
+        let ready = unsafe { poll(poll_fd.as_mut_ptr(), poll_fd.len(), timeout_ms) };
+        if ready == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
 
-    Ok(ready > 0 && poll_fd[0].revents & POLLIN != 0)
+        return Ok(ready > 0 && poll_fd[0].revents & POLLIN != 0);
+    }
 }
 
 fn read_termios(fd: i32) -> io::Result<Termios> {

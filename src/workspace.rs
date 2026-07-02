@@ -2309,7 +2309,11 @@ impl Workspace {
                         if session.exit_status.is_some() {
                             continue;
                         }
-                        session.session.write_input(&bytes)?;
+                        let payload = forward_payload_for_pane(
+                            session.session.bracketed_paste_enabled(),
+                            &bytes,
+                        );
+                        session.session.write_input(&payload)?;
                         wrote_any = true;
                     }
                     return Ok(wrote_any);
@@ -2317,7 +2321,9 @@ impl Workspace {
                 if let Some(active) = self.session_for_mut(self.active)
                     && active.exit_status.is_none()
                 {
-                    active.session.write_input(&bytes)?;
+                    let payload =
+                        forward_payload_for_pane(active.session.bracketed_paste_enabled(), &bytes);
+                    active.session.write_input(&payload)?;
                     return Ok(true);
                 }
                 Ok(false)
@@ -3179,6 +3185,41 @@ pub(crate) fn bracket_paste_if_enabled(enabled: bool, text: &str) -> Vec<u8> {
     out
 }
 
+// Bytes forwarded from the host terminal (`InputAction::Forward`) carry
+// the `ESC[200~`/`ESC[201~` bracketed-paste markers once the host has
+// DECSET 2004 enabled (see `TerminalGuard::enter`). Whether the
+// destination pane's own shell wants to see those markers depends on
+// whether IT asked for bracketed paste, independent of the host: pass
+// them through untouched when the pane's DECSET 2004 is on (the shell
+// knows what to do with them), otherwise strip the marker sequences and
+// deliver just the pasted text — a shell that never enabled bracketed
+// paste has no idea what `ESC[200~` means and would otherwise echo it
+// as literal garbage.
+fn forward_payload_for_pane(pane_bracketed_paste_enabled: bool, bytes: &[u8]) -> Vec<u8> {
+    if pane_bracketed_paste_enabled {
+        return bytes.to_vec();
+    }
+    strip_bracketed_paste_markers(bytes)
+}
+
+fn strip_bracketed_paste_markers(bytes: &[u8]) -> Vec<u8> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(START) {
+            index += START.len();
+        } else if bytes[index..].starts_with(END) {
+            index += END.len();
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
 // Produce a short, header-friendly label for a shell command. Takes the
 // first whitespace token so "tail -f /var/log/syslog" becomes "tail".
 // If there's no token, fall back to something non-empty so the pane
@@ -3273,6 +3314,84 @@ mod tests {
         assert_eq!(
             wrapped, b"\x1b[200~hello\n\x1b[201~",
             "wrapped form must include both the open and close markers",
+        );
+    }
+
+    #[test]
+    fn forward_payload_passes_bracketed_paste_markers_through_when_pane_wants_them() {
+        // Mirror image of the yank/paste helper above, but for bytes
+        // arriving from the *host* terminal via InputAction::Forward:
+        // when the destination pane's own shell has DECSET 2004 on, the
+        // `ESC[200~ ... ESC[201~` markers the host sent must reach it
+        // byte-for-byte untouched.
+        use super::forward_payload_for_pane;
+
+        let bytes = b"\x1b[200~hello\nworld\x1b[201~";
+        assert_eq!(forward_payload_for_pane(true, bytes), bytes.to_vec());
+    }
+
+    #[test]
+    fn forward_payload_strips_bracketed_paste_markers_when_pane_never_enabled_them() {
+        // A shell that never sent `ESC[?2004h` has no idea what the
+        // marker bytes mean and would otherwise echo them as literal
+        // garbage — strip the markers and deliver just the payload.
+        use super::forward_payload_for_pane;
+
+        let bytes = b"\x1b[200~hello\nworld\x1b[201~";
+        assert_eq!(
+            forward_payload_for_pane(false, bytes),
+            b"hello\nworld".to_vec()
+        );
+    }
+
+    #[test]
+    fn forward_payload_leaves_plain_bytes_alone_either_way() {
+        use super::forward_payload_for_pane;
+
+        assert_eq!(forward_payload_for_pane(true, b"ls -la\r"), b"ls -la\r");
+        assert_eq!(forward_payload_for_pane(false, b"ls -la\r"), b"ls -la\r");
+    }
+
+    #[test]
+    fn handle_input_strips_paste_markers_for_a_pane_without_bracketed_paste() {
+        // End-to-end through `handle_input`: a fresh pane's shell
+        // hasn't enabled DECSET 2004, so a host-forwarded paste
+        // envelope must land in the pane with the markers gone and
+        // only the payload written to the PTY (which the shell then
+        // echoes back, proving the stripped text actually arrived).
+        let size = PtySize { rows: 24, cols: 80 };
+        let mut ws = Workspace::spawn_single("/bin/sh", size).expect("spawn workspace");
+        assert!(
+            !ws.sessions[0].session.bracketed_paste_enabled(),
+            "a fresh pane's shell has not enabled bracketed paste"
+        );
+
+        let payload = b"\x1b[200~echo paste-marker-probe\r\x1b[201~".to_vec();
+        ws.handle_input(InputAction::Forward(payload))
+            .expect("forward input");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut plain = String::new();
+        while std::time::Instant::now() < deadline {
+            let _ = ws.ingest_available_output();
+            plain = ws
+                .render_frame()
+                .iter()
+                .map(|row| strip_ansi(row))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if plain.contains("paste-marker-probe") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            plain.contains("paste-marker-probe"),
+            "expected the stripped payload text on screen, got: {plain:?}"
+        );
+        assert!(
+            !plain.contains("200~") && !plain.contains("201~"),
+            "bracketed-paste markers must not reach a pane that never enabled 2004: {plain:?}"
         );
     }
 

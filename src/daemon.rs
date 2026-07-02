@@ -32,6 +32,13 @@ unsafe extern "C" {
 }
 
 const DEFAULT_SESSION_NAME: &str = "default";
+// Also doubles as the escape-time for a lone ESC buffered in a client's
+// InputParser (see InputParser::flush_pending, and the `Ok(None)` arm of
+// the client-read loop below). A real multi-byte escape sequence arrives
+// from a terminal in a single burst, so one quiet poll tick with no more
+// bytes from that client is already a generous bound for "nothing else
+// is coming" — well under the ~25-50ms escape-time terminals
+// conventionally use for this same ambiguity.
 const SERVER_POLL_MS: u64 = 20;
 const STARTUP_WAIT_MS: u64 = 1_000;
 
@@ -792,7 +799,24 @@ fn run_server_loop(
             let read = read_socket_available(clients[index].stream_mut());
             let bytes = match read {
                 Ok(Some(bytes)) => bytes,
-                Ok(None) => continue,
+                Ok(None) => {
+                    // Quiet tick for this client: nothing arrived since
+                    // the last poll. A complete escape sequence would
+                    // have shown up by now (see SERVER_POLL_MS), so a
+                    // lone ESC still sitting in this client's
+                    // InputParser is a real, standalone Escape keypress
+                    // — flush it through rather than leaving it
+                    // buffered until an unrelated keypress arrives.
+                    // Never during the supervisor overlay: it reads raw
+                    // bytes directly and never touches input_parser, so
+                    // there's nothing meaningful to route a flush to.
+                    if !windows.supervisor_open()
+                        && let Some(action) = clients[index].input_parser.flush_pending()
+                    {
+                        dirty |= windows.active_mut().handle_input(action)?;
+                    }
+                    continue;
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -804,6 +828,12 @@ fn run_server_loop(
                     to_remove.push(index);
                     continue;
                 }
+                // Signals are latent today (zmux installs no handlers),
+                // but a future one — or one a library installs on our
+                // behalf — must not tear down the whole session just
+                // because a read got interrupted mid-syscall. Skip this
+                // client for this tick; the next tick tries again.
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             };
 
@@ -1703,6 +1733,9 @@ fn read_socket_available(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>>
                 break;
             }
             Ok(count) => buffer.extend_from_slice(&chunk[..count]),
+            // A signal interrupting the read mid-syscall isn't a real
+            // error — retry the same read rather than surfacing it.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
             Err(error) => return Err(error),
         }
