@@ -403,6 +403,24 @@ impl TerminalIngest {
         }
         self.primary_cursor_row = 0;
         self.primary_cursor_col = 0;
+        // Unlike ED 2/3, this DOES need to drop the saved cursor. This
+        // isn't an xterm-modeled escape sequence — it's zmux's internal
+        // grid->scrollback drain, and it just changed the coordinate
+        // frame out from under any pending save: the live cursor above
+        // was reset to (0, 0) on a now-EMPTY grid, so a saved (row, col)
+        // from before the drain no longer identifies "the same cell it
+        // did a moment ago" the way it still does across an in-place ED
+        // erase (same grid, same addressable region, content wiped but
+        // coordinates unchanged). primary_set_cursor's clamp keeps a
+        // stale saved position in bounds, but in-bounds isn't the same
+        // as correct here: replaying it after a drain would silently
+        // relocate a future DECRC onto unrelated freshly-printed content
+        // instead of leaving DECRC as the pre-existing no-op. Keeping
+        // the clear can't break a real DECSC/CSI-2J/DECRC bracket in
+        // practice because a flush never lands between those three
+        // bytes of one escape-sequence-driven redraw — it's only
+        // triggered from outside the ingest loop (MCP snapshot reads,
+        // session teardown), never mid-parse.
         self.primary_saved_cursor = None;
         self.primary_wrap_pending = false;
         self.primary_flushed_to_scrollback = appended;
@@ -847,7 +865,16 @@ impl TerminalIngest {
                         self.primary_grid.clear();
                         self.primary_cursor_row = 0;
                         self.primary_cursor_col = 0;
-                        self.primary_saved_cursor = None;
+                        // Do NOT clear primary_saved_cursor here. xterm
+                        // does not invalidate the DECSC-saved cursor when
+                        // the display is erased — a DECSC … CSI 2J …
+                        // DECRC bracket gets its position and pen back.
+                        // A stale saved position can't land out of
+                        // bounds either: primary_set_cursor (the only
+                        // path DECRC uses to apply it) clamps to the
+                        // viewport (alternate.rows/cols), not grid.len(),
+                        // so restoring after the grid was just emptied is
+                        // safe by construction.
                         self.primary_wrap_pending = false;
                         if mode == 3 {
                             pane.clear_scrollback();
@@ -1110,6 +1137,11 @@ impl TerminalIngest {
         }
         self.primary_cursor_row = 0;
         self.primary_cursor_col = 0;
+        // Unlike ED 2/3, dropping the save here is correct per xterm:
+        // both RIS (hard_reset) and DECSTR (soft_reset) route through
+        // this and are documented to reset DECSC-saved cursor state to
+        // its power-up default, not just leave the display/cursor alone
+        // like a plain erase does.
         self.primary_saved_cursor = None;
         self.primary_scroll_top = 0;
         self.primary_scroll_bottom = self.alternate.rows.saturating_sub(1);
@@ -3710,6 +3742,45 @@ mod tests {
                 cell.ch,
             );
         }
+    }
+
+    #[test]
+    fn decrc_survives_ed2_restoring_position_and_pen_on_primary() {
+        // xterm does NOT invalidate the DECSC-saved cursor when the
+        // screen is erased: a program that does DECSC, CSI 2J, DECRC
+        // gets its cursor position AND SGR pen back. Full-screen
+        // redraws that bracket a clear with save/restore (park cursor,
+        // wipe screen, jump back, resume styled output) rely on this
+        // round-trip landing where they left off instead of wherever
+        // the clear left the cursor with whatever pen was active then.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(
+            &mut pane,
+            // Park the cursor at (row 1, col 5) with a red pen, DECSC.
+            // Switch to an underlined green pen and move to the top
+            // left, then erase the whole display, then DECRC, then
+            // print — the 'X' must land back at (1, 5) in red, not at
+            // (0, 0) in underlined green.
+            b"line1\nline2\x1b[31m\x1b7\x1b[4;32m\x1b[1;1H\x1b[2J\x1b8X",
+        );
+
+        let cells = ingest.render_cells(&pane);
+        let cell = &cells[1][5];
+        assert_eq!(
+            cell.ch, 'X',
+            "DECRC must restore the saved position across CSI 2J, not leave the cursor at (0, 0)",
+        );
+        assert_eq!(
+            cell.style.fg,
+            Color::Indexed(1),
+            "DECRC must restore the saved (red) pen across CSI 2J, not the post-erase pen",
+        );
+        assert!(
+            !cell.style.attrs.underline,
+            "DECRC must restore the saved pen across CSI 2J; CSI 2J must not drop the saved cursor/pen",
+        );
     }
 
     #[test]
