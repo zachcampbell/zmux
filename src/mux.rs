@@ -37,7 +37,11 @@ pub fn run_mux() -> io::Result<i32> {
         terminal.set_mouse_tracking_mode(workspace.mouse_tracking_mode())?;
 
         if dirty {
-            terminal.render_frame(&workspace.render_frame(), current_size)?;
+            terminal.render_frame(
+                &workspace.render_frame(),
+                current_size,
+                workspace.cursor_screen_position(),
+            )?;
             dirty = false;
         }
 

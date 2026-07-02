@@ -2368,6 +2368,48 @@ impl Workspace {
         self.sessions.len()
     }
 
+    // Absolute 1-based screen cell where the attached client should
+    // paint the host cursor, or None to keep it hidden. Hidden when:
+    // full-screen/status chrome owns the keyboard (supervisor overlay,
+    // command prompt, rename, scrollback search), the active pane's
+    // viewport detached from live output (the cursor's cell isn't on
+    // screen), the app hid its cursor via DECTCEM, or the cursor sits
+    // outside the pane's content rect. The column is clamped instead of
+    // hidden at the right edge so a pending-wrap cursor (one past the
+    // last column) still shows on the edge cell, like real terminals.
+    pub fn cursor_screen_position(&self) -> Option<(u16, u16)> {
+        if self.supervisor.is_some()
+            || self.command_input.is_some()
+            || self.rename_input.is_some()
+            || self.search_input.is_some()
+            || self.selection.is_some()
+        {
+            return None;
+        }
+        let content = self
+            .layout
+            .panes
+            .iter()
+            .find(|(id, _)| *id == self.active)
+            .map(|(_, layout)| layout.content)?;
+        if content.width == 0 || content.height == 0 {
+            return None;
+        }
+        let session = self.session_for(self.active)?;
+        if !session.session.follow_output() {
+            return None;
+        }
+        let (row, col) = session.session.screen_cursor()?;
+        if row >= content.height as usize {
+            return None;
+        }
+        let col = col.min(content.width as usize - 1);
+        Some((
+            content.y.saturating_add(row as u16).saturating_add(1),
+            content.x.saturating_add(col as u16).saturating_add(1),
+        ))
+    }
+
     pub fn render_frame(&self) -> Vec<String> {
         let rows = self.size.rows as usize;
         let cols = self.size.cols as usize;
@@ -3241,6 +3283,68 @@ mod tests {
 
         let rendered: String = frame.remove(0).iter().map(|cell| cell.ch).collect();
         assert_eq!(rendered, " abcd   ");
+    }
+
+    #[test]
+    fn cursor_screen_position_maps_active_pane_and_hides_for_overlays() {
+        // The attached client paints the host cursor wherever this
+        // says; None means "keep it hidden". A fresh pane's cursor sits
+        // at its content origin (1-based absolute screen coords, below
+        // the pane header). Any full-screen chrome that owns the
+        // keyboard (supervisor, command prompt, rename) must suppress
+        // the pane cursor while it's up.
+        let mut workspace =
+            Workspace::spawn_two_pane("/bin/sh", PtySize::new(24, 80)).expect("spawn workspace");
+
+        let content = workspace
+            .layout
+            .panes
+            .iter()
+            .find(|(id, _)| *id == workspace.active)
+            .map(|(_, layout)| layout.content)
+            .expect("active pane layout");
+        assert_eq!(
+            workspace.cursor_screen_position(),
+            Some((content.y + 1, content.x + 1)),
+            "fresh active pane shows its cursor at the content origin",
+        );
+
+        workspace.open_supervisor();
+        assert_eq!(
+            workspace.cursor_screen_position(),
+            None,
+            "supervisor overlay suppresses the pane cursor",
+        );
+        workspace.close_supervisor();
+        assert!(workspace.cursor_screen_position().is_some());
+
+        workspace.rename_input = Some(String::new());
+        assert_eq!(
+            workspace.cursor_screen_position(),
+            None,
+            "rename prompt suppresses the pane cursor",
+        );
+        workspace.rename_input = None;
+
+        // A pane whose viewport detached from the live bottom (user
+        // scrolled back) hides the cursor — it refers to a cell that
+        // isn't on screen.
+        let active = workspace.active;
+        let session = workspace
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == active)
+            .expect("active session");
+        for _ in 0..64 {
+            session.session.pane_mut().append_output_line(vec![]);
+        }
+        session.session.wheel_up(8);
+        assert!(!session.session.follow_output());
+        assert_eq!(
+            workspace.cursor_screen_position(),
+            None,
+            "scrolled-back pane suppresses the cursor",
+        );
     }
 
     #[test]

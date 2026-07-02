@@ -157,11 +157,12 @@ pub fn attach_session(name: &str) -> io::Result<AttachOutcome> {
                         size,
                         mouse_tracking_mode,
                         lines,
+                        cursor,
                     } => {
                         terminal.set_mouse_tracking_mode(
                             mouse_tracking_mode.max(MouseTrackingMode::Click),
                         )?;
-                        terminal.render_frame(&lines, size)?;
+                        terminal.render_frame(&lines, size, cursor)?;
                     }
                     ServerMessage::Exited { code } => return Ok(AttachOutcome::Exited(code)),
                     ServerMessage::Error(message) => return Err(io::Error::other(message)),
@@ -1390,6 +1391,7 @@ fn broadcast_frame(
         size: windows.size(),
         mouse_tracking_mode: windows.mouse_tracking_mode(),
         lines: windows.active().render_frame(),
+        cursor: windows.active().cursor_screen_position(),
     };
     let mut dead: Vec<usize> = Vec::new();
     for (index, client) in clients.iter_mut().enumerate() {

@@ -244,6 +244,13 @@ impl Session {
         self.pane.follow_output()
     }
 
+    // Viewport-relative cursor cell for the attached client's host
+    // cursor, or None when the app hid it via DECTCEM. See
+    // `TerminalIngest::screen_cursor`.
+    pub fn screen_cursor(&self) -> Option<(usize, usize)> {
+        self.ingest.screen_cursor(&self.pane)
+    }
+
     pub fn total_lines(&self) -> usize {
         self.pane.total_lines()
     }

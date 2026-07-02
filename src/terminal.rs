@@ -73,6 +73,12 @@ pub struct TerminalIngest {
     primary_wrap_pending: bool,
     primary_auto_wrap: bool,
     alternate: AlternateScreen,
+    // DECTCEM (`CSI ?25 h/l`): whether the application wants its text
+    // cursor shown. One global flag, not per-screen — xterm treats it
+    // as a mode, and DECSC/1049 do not save or restore it. The attached
+    // client uses this (via `screen_cursor`) to decide whether to paint
+    // a host cursor at the pane's cursor cell.
+    cursor_visible: bool,
     // Pen saved by DECSC while the alternate screen is active. The
     // position half lives inside AlternateScreen; the pen lives here
     // because `current_style` does. Defaults to Style::DEFAULT, which
@@ -177,6 +183,7 @@ impl TerminalIngest {
             primary_wrap_pending: false,
             primary_auto_wrap: true,
             alternate: AlternateScreen::new(size.rows as usize, size.cols as usize),
+            cursor_visible: true,
             alt_saved_pen: Style::DEFAULT,
             current_style: Style::DEFAULT,
             utf8_buffer: Vec::new(),
@@ -1034,6 +1041,7 @@ impl TerminalIngest {
                             self.set_primary_auto_wrap(true);
                             self.alternate.set_auto_wrap(true);
                         }
+                        25 => self.cursor_visible = true,
                         1000 => {
                             mouse_tracking_mode = mouse_tracking_mode.max(MouseTrackingMode::Click)
                         }
@@ -1078,6 +1086,7 @@ impl TerminalIngest {
                             self.set_primary_auto_wrap(false);
                             self.alternate.set_auto_wrap(false);
                         }
+                        25 => self.cursor_visible = false,
                         1000 | 1002 | 1003 => disable_mouse = true,
                         1004 => self.focus_events = false,
                         2004 => self.bracketed_paste = false,
@@ -1132,6 +1141,35 @@ impl TerminalIngest {
         None
     }
 
+    // Where the attached client should paint the host cursor, in
+    // viewport-relative 0-based (row, col) — or None when the
+    // application asked for it to be hidden (DECTCEM), or the primary
+    // cursor has scrolled above the visible viewport. The primary
+    // mapping mirrors `render_primary_cells`: when the grid outgrew the
+    // viewport the client paints the grid's last `viewport` rows, so
+    // the grid-absolute cursor row is rebased against that window.
+    pub fn screen_cursor(&self, pane: &Pane) -> Option<(usize, usize)> {
+        if !self.cursor_visible {
+            return None;
+        }
+        match pane.screen_mode() {
+            ScreenMode::Primary => {
+                let viewport = pane.viewport_height().max(1);
+                let start = if self.primary_grid.len() >= viewport {
+                    self.primary_grid.len() - viewport
+                } else {
+                    0
+                };
+                let row = self.primary_cursor_row.checked_sub(start)?;
+                if row >= viewport {
+                    return None;
+                }
+                Some((row, self.primary_cursor_col))
+            }
+            ScreenMode::Alternate => Some((self.alternate.cursor_row, self.alternate.cursor_col)),
+        }
+    }
+
     fn cursor_position_report(&self, pane: &Pane) -> Vec<u8> {
         let (row, col) = match pane.screen_mode() {
             ScreenMode::Primary => (
@@ -1157,6 +1195,7 @@ impl TerminalIngest {
         self.alternate.set_auto_wrap(true);
         self.reset_primary_modes(true);
         self.cursor_shape = CursorShape::Default;
+        self.cursor_visible = true;
         self.last_graphic = None;
         self.bracketed_paste = false;
         self.focus_events = false;
@@ -1174,6 +1213,8 @@ impl TerminalIngest {
         self.alternate.scroll_top = 0;
         self.alternate.scroll_bottom = self.alternate.rows.saturating_sub(1);
         self.cursor_shape = CursorShape::Default;
+        // DECSTR resets DECTCEM to visible, same as xterm.
+        self.cursor_visible = true;
         self.bracketed_paste = false;
         self.focus_events = false;
         self.synchronized_buffer = None;
@@ -4188,6 +4229,49 @@ mod tests {
             vec!["aa", "bb", "cc", "dd", "ee"],
             "NEL away from any margin must not mutate content",
         );
+    }
+
+    #[test]
+    fn screen_cursor_tracks_dectcem_and_viewport_mapping() {
+        // DECTCEM (`CSI ?25 h/l`) drives whether the attached client
+        // paints a host cursor at the pane's cursor cell. Agent TUIs
+        // toggle it constantly (hide during a redraw burst, show at
+        // rest); ignoring it would leave the client's cursor glued on
+        // while claude repaints its input box.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 32));
+
+        ingest.ingest_bytes(&mut pane, b"ab");
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((0, 2)),
+            "cursor defaults to visible, after the printed text",
+        );
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[?25l");
+        assert_eq!(ingest.screen_cursor(&pane), None, "?25l hides the cursor");
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[?25hc");
+        assert_eq!(ingest.screen_cursor(&pane), Some((0, 3)));
+
+        // When the primary grid outgrows the viewport, the reported
+        // position must be viewport-relative (the client paints the
+        // grid's last `viewport` rows), not grid-absolute.
+        ingest.ingest_bytes(&mut pane, b"\r\n1\r\n2\r\n3\r\n4\r\n5\r\nx");
+        let (row, col) = ingest.screen_cursor(&pane).expect("visible");
+        assert_eq!(
+            (row, col),
+            (3, 1),
+            "cursor lands on the last viewport row after scrolling",
+        );
+
+        // Alt screen reports its own grid position.
+        ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b[2;5H");
+        assert_eq!(ingest.screen_cursor(&pane), Some((1, 4)));
+
+        // RIS restores visibility along with everything else.
+        ingest.ingest_bytes(&mut pane, b"\x1b[?25l\x1bc");
+        assert_eq!(ingest.screen_cursor(&pane), Some((0, 0)));
     }
 
     #[test]

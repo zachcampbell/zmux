@@ -76,6 +76,11 @@ pub struct TerminalGuard {
     // is needed (e.g. after a resize, the row count changes).
     last_frame: Vec<String>,
     last_size: Option<PtySize>,
+    // Cursor state from the last frame, so a cursor-only change (the
+    // app moved its cursor without altering any row's content — arrow
+    // keys on a readline, say) still triggers a write even though every
+    // row diffed clean.
+    last_cursor: Option<(u16, u16)>,
 }
 
 impl TerminalGuard {
@@ -93,6 +98,7 @@ impl TerminalGuard {
             mouse_tracking_mode: MouseTrackingMode::Off,
             last_frame: Vec::new(),
             last_size: None,
+            last_cursor: None,
         };
         guard.write_escape("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
         guard.set_mouse_tracking_mode(MouseTrackingMode::Click)?;
@@ -150,10 +156,15 @@ impl TerminalGuard {
         let _ = write!(&mut status_line, "{title} | {status}");
         rows.push(status_line);
 
-        self.render_frame(&rows, size)
+        self.render_frame(&rows, size, None)
     }
 
-    pub fn render_frame(&mut self, rows: &[String], size: PtySize) -> io::Result<()> {
+    pub fn render_frame(
+        &mut self,
+        rows: &[String],
+        size: PtySize,
+        cursor: Option<(u16, u16)>,
+    ) -> io::Result<()> {
         let expected_rows = size.rows as usize;
         // Repaint every row when the terminal size changes or the cache was
         // invalidated; otherwise redraw only rows whose serialized content
@@ -197,17 +208,21 @@ impl TerminalGuard {
             append_row_update(&mut buffer, index, new_row);
         }
 
-        // Park the cursor on the status row's leftmost column so the
-        // hidden cursor is at a predictable spot; some terminals render a
-        // visible shadow block even while hidden.
-        let _ = write!(&mut buffer, "\x1b[{};1H", expected_rows);
+        // Land the host cursor: at the active pane's cursor cell when
+        // the daemon says it's visible, otherwise hidden and parked on
+        // the status row's leftmost column so terminals that render a
+        // shadow block for hidden cursors keep it somewhere predictable.
+        append_cursor_tail(&mut buffer, cursor, expected_rows);
         buffer.push_str("\x1b[?2026l");
 
-        if full_repaint || changed_rows > 0 {
+        // A cursor-only change (position moved or visibility flipped)
+        // must still write even when every row diffed clean.
+        if full_repaint || changed_rows > 0 || cursor != self.last_cursor {
             self.write_escape(&buffer)?;
         }
         self.last_frame = target_rows;
         self.last_size = Some(size);
+        self.last_cursor = cursor;
         Ok(())
     }
 
@@ -262,6 +277,21 @@ fn append_row_update(buffer: &mut String, index: usize, row: &str) {
     let _ = write!(buffer, "\x1b[{};1H\x1b[0m\x1b[2K", index + 1);
     buffer.push_str(row);
     buffer.push_str("\x1b[0m");
+}
+
+// The frame's final cursor placement. `cursor` is absolute 1-based
+// (row, col) from the daemon — Some means "show the host cursor there"
+// (DECTCEM show after the move so the cursor never flashes at a stale
+// position), None means keep it hidden and parked below the content.
+fn append_cursor_tail(buffer: &mut String, cursor: Option<(u16, u16)>, park_row: usize) {
+    match cursor {
+        Some((row, col)) => {
+            let _ = write!(buffer, "\x1b[{row};{col}H\x1b[?25h");
+        }
+        None => {
+            let _ = write!(buffer, "\x1b[?25l\x1b[{park_row};1H");
+        }
+    }
 }
 
 fn mouse_tracking_reset_sequence() -> &'static str {
@@ -335,8 +365,24 @@ fn make_raw(mut termios: Termios) -> Termios {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_row_update, mouse_tracking_reset_sequence, mouse_tracking_sequence};
+    use super::{
+        append_cursor_tail, append_row_update, mouse_tracking_reset_sequence,
+        mouse_tracking_sequence,
+    };
     use crate::mouse::MouseTrackingMode;
+
+    #[test]
+    fn cursor_tail_shows_at_position_or_hides_and_parks() {
+        // Move BEFORE show so the cursor can't flash at its stale spot;
+        // hide BEFORE park for the same reason in reverse.
+        let mut shown = String::new();
+        append_cursor_tail(&mut shown, Some((3, 12)), 38);
+        assert_eq!(shown, "\x1b[3;12H\x1b[?25h");
+
+        let mut hidden = String::new();
+        append_cursor_tail(&mut hidden, None, 38);
+        assert_eq!(hidden, "\x1b[?25l\x1b[38;1H");
+    }
 
     #[test]
     fn row_updates_reset_and_clear_before_redraw() {

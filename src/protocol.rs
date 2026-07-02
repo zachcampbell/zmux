@@ -204,6 +204,11 @@ pub enum ServerMessage {
         size: PtySize,
         mouse_tracking_mode: MouseTrackingMode,
         lines: Vec<String>,
+        /// Absolute 1-based (row, col) where the client should show the
+        /// host cursor; None keeps it hidden. Encoded as an optional
+        /// trailing section so frames from older daemons (which end at
+        /// the last line) still decode — as None.
+        cursor: Option<(u16, u16)>,
     },
     Exited {
         code: i32,
@@ -378,6 +383,7 @@ pub fn encode_server_message(message: &ServerMessage) -> io::Result<Vec<u8>> {
             size,
             mouse_tracking_mode,
             lines,
+            cursor,
         } => {
             body.push(SERVER_FRAME);
             write_size(&mut body, *size);
@@ -387,6 +393,14 @@ pub fn encode_server_message(message: &ServerMessage) -> io::Result<Vec<u8>> {
                 let bytes = line.as_bytes();
                 write_u32(&mut body, bytes.len() as u32);
                 body.extend_from_slice(bytes);
+            }
+            match cursor {
+                None => body.push(0),
+                Some((row, col)) => {
+                    body.push(1);
+                    write_u16(&mut body, *row);
+                    write_u16(&mut body, *col);
+                }
             }
         }
         ServerMessage::Exited { code } => {
@@ -700,6 +714,23 @@ fn parse_server_message(frame: &[u8]) -> io::Result<ServerMessage> {
                 lines.push(line.to_string());
                 rest = &rest[length as usize..];
             }
+            // Optional cursor tail. Frames from pre-cursor daemons end
+            // right after the last line; treat that as "hidden" so a
+            // newer client can attach to an older running daemon.
+            let cursor = match rest.split_first() {
+                None => None,
+                Some((0, tail)) => {
+                    rest = tail;
+                    None
+                }
+                Some((1, tail)) => {
+                    let (row, next) = take_u16(tail)?;
+                    let (col, next) = take_u16(next)?;
+                    rest = next;
+                    Some((row, col))
+                }
+                Some(_) => return Err(invalid_data("invalid cursor tail in frame")),
+            };
             if !rest.is_empty() {
                 return Err(invalid_data("trailing bytes in frame"));
             }
@@ -707,6 +738,7 @@ fn parse_server_message(frame: &[u8]) -> io::Result<ServerMessage> {
                 size,
                 mouse_tracking_mode,
                 lines,
+                cursor,
             })
         }
         SERVER_EXITED => {
@@ -1009,6 +1041,13 @@ mod tests {
                 size: PtySize::new(24, 80),
                 mouse_tracking_mode: MouseTrackingMode::Drag,
                 lines: vec!["left".into(), "right".into()],
+                cursor: Some((3, 42)),
+            },
+            ServerMessage::Frame {
+                size: PtySize::new(24, 80),
+                mouse_tracking_mode: MouseTrackingMode::Off,
+                lines: vec!["only".into()],
+                cursor: None,
             },
             ServerMessage::Exited { code: 7 },
             ServerMessage::Busy,
@@ -1022,6 +1061,34 @@ mod tests {
         let mut decoder = ServerDecoder::default();
         let decoded = decoder.push_bytes(&encoded).expect("decode servers");
         assert_eq!(decoded, messages);
+    }
+
+    #[test]
+    fn frame_without_cursor_tail_decodes_as_hidden() {
+        // Frames from a pre-0.3 daemon end right after the lines — no
+        // cursor tail. A newer client must treat that as "no cursor"
+        // (today's behavior) instead of erroring, so attaching to an
+        // old running daemon keeps working.
+        let mut body = Vec::new();
+        body.push(super::SERVER_FRAME);
+        super::write_size(&mut body, PtySize::new(24, 80));
+        body.push(MouseTrackingMode::Off.as_u8());
+        super::write_u16(&mut body, 1);
+        super::write_u32(&mut body, 2);
+        body.extend_from_slice(b"hi");
+        let framed = super::wrap_frame(body).expect("wrap frame");
+
+        let mut decoder = ServerDecoder::default();
+        let decoded = decoder.push_bytes(&framed).expect("decode legacy frame");
+        assert_eq!(
+            decoded,
+            vec![ServerMessage::Frame {
+                size: PtySize::new(24, 80),
+                mouse_tracking_mode: MouseTrackingMode::Off,
+                lines: vec!["hi".into()],
+                cursor: None,
+            }],
+        );
     }
 
     #[test]
