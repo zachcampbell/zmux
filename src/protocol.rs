@@ -6,6 +6,27 @@ use std::io;
 use crate::mouse::MouseTrackingMode;
 use crate::pty::PtySize;
 
+// Upper bound on a single wire frame's body, checked against the 4-byte
+// length prefix before any bytes are buffered for it. Without this, a
+// peer (hostile, or just a bug) that sends a length prefix near
+// u32::MAX can make `pending` grow without bound while `take_frame`
+// waits for a body that may never fully arrive — an easy multi-GB
+// memory bomb against a daemon that otherwise has no other cap on
+// per-connection buffering.
+//
+// Sized from the largest frame a well-behaved daemon can legitimately
+// produce: SERVER_FRAME at the PTY size cap (pty::MAX_PTY_ROWS = 512,
+// pty::MAX_PTY_COLS = 1024, i.e. 524,288 cells). Each line is
+// serialized by `style::serialize_row`, which emits an SGR escape
+// transition whenever a cell's style differs from its predecessor;
+// pathological per-cell style thrashing plus a multi-byte UTF-8
+// character puts a generous upper bound around 60-70 bytes/cell,
+// so ~512 * 1024 * 64 bytes is on the order of 32 MiB in the worst
+// realistic case. 64 MiB doubles that headroom (also comfortably
+// covers a giant clipboard paste via SERVER_CLIPBOARD) while staying
+// nowhere near the original unbounded-allocation exposure.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 const CLIENT_ATTACH: u8 = 1;
 const CLIENT_RESIZE: u8 = 2;
 const CLIENT_INPUT: u8 = 3;
@@ -479,6 +500,20 @@ fn take_frame(pending: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
     }
 
     let length = u32::from_le_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
+    // Reject an oversized length prefix as soon as it's known, before
+    // checking whether the body has fully arrived. Checking the other
+    // order would let a peer trickle bytes in behind a huge length
+    // prefix forever: `pending` would keep growing on every push_bytes
+    // call while `pending.len() < 4 + length` stayed true indefinitely.
+    // This is a protocol error, not a "wait for more data" condition,
+    // so it tears down the connection (both decoders share this
+    // helper) instead of buffering.
+    if length > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame length {length} exceeds MAX_FRAME_BYTES ({MAX_FRAME_BYTES})"),
+        ));
+    }
     if pending.len() < 4 + length {
         return Ok(None);
     }
@@ -905,8 +940,9 @@ mod tests {
     use crate::mouse::MouseTrackingMode;
 
     use super::{
-        ClientDecoder, ClientMessage, CommandPromptKind, PaneSummary, SelectionKind, SelectionMove,
-        ServerDecoder, ServerMessage, encode_client_message, encode_server_message,
+        ClientDecoder, ClientMessage, CommandPromptKind, MAX_FRAME_BYTES, PaneSummary,
+        SelectionKind, SelectionMove, ServerDecoder, ServerMessage, encode_client_message,
+        encode_server_message,
     };
     use crate::pty::PtySize;
 
@@ -947,6 +983,48 @@ mod tests {
             decoder.push_bytes(&frame).is_err(),
             "huge line count must be rejected, not allocated"
         );
+    }
+
+    #[test]
+    fn oversized_frame_length_prefix_is_rejected_immediately() {
+        // Just the 4-byte length prefix, claiming a body bigger than
+        // MAX_FRAME_BYTES, with NO body bytes following at all. If the
+        // rejection required the full body to have arrived first, this
+        // would return Ok(None) ("need more data") forever instead of
+        // erroring — exactly the unbounded-buffering hazard this cap
+        // exists to prevent.
+        let oversized = (MAX_FRAME_BYTES as u32) + 1;
+        let frame_prefix = oversized.to_le_bytes().to_vec();
+
+        let mut client_decoder = ClientDecoder::default();
+        assert!(
+            client_decoder.push_bytes(&frame_prefix).is_err(),
+            "an oversized length prefix must be rejected without waiting for a body"
+        );
+
+        let mut server_decoder = ServerDecoder::default();
+        assert!(
+            server_decoder.push_bytes(&frame_prefix).is_err(),
+            "ServerDecoder shares take_frame with ClientDecoder and must reject it too"
+        );
+    }
+
+    #[test]
+    fn frame_length_prefix_exactly_at_the_cap_is_not_rejected_by_the_cap_check() {
+        // A length prefix equal to MAX_FRAME_BYTES must not be treated
+        // as oversized (off-by-one guard on the `>` vs `>=` choice).
+        // The body never arrives here, so this should read as "need
+        // more data" (Ok, no messages yet), not as a protocol error.
+        let at_cap = MAX_FRAME_BYTES as u32;
+        let frame_prefix = at_cap.to_le_bytes().to_vec();
+
+        let mut decoder = ClientDecoder::default();
+        let result = decoder.push_bytes(&frame_prefix);
+        assert!(
+            result.is_ok(),
+            "a length prefix exactly at MAX_FRAME_BYTES must not be rejected by the cap check"
+        );
+        assert!(result.unwrap().is_empty(), "body hasn't arrived yet");
     }
 
     #[test]
