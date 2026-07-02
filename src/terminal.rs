@@ -29,12 +29,61 @@ pub enum CursorShape {
 // (ESC 8) / CSI u. Per xterm, the save covers the SGR pen as well as
 // the position — TUIs bracket styled fragments with save/restore and
 // rely on the pen coming back, so restoring position alone leaks the
-// styled pen into everything printed afterwards.
+// styled pen into everything printed afterwards. Real DECSC saves the
+// character-set state too (which glyph table G0/G1 point at, and which
+// of them GL is currently reading through) — without that, a save/
+// restore bracketing a `\x1b(0 ... \x1b(B` charset dance can strand the
+// terminal in graphics mode, so `charset` rides along with `pen`.
 #[derive(Debug, Clone)]
 struct SavedCursor {
     row: usize,
     col: usize,
     pen: Style,
+    charset: CharsetState,
+}
+
+// A G0/G1 designator's target character set. `ESC ( 0` / `ESC ) 0`
+// select DecSpecialGraphics (the vt100 "line drawing" set); every other
+// final byte we recognize as a valid designator (`B` = US-ASCII, `A` =
+// UK, and anything else we don't special-case) maps back to plain
+// Ascii passthrough — those variants only ever differ from ASCII in a
+// couple of currency/punctuation glyphs that don't matter to a
+// headless multiplexer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Charset {
+    #[default]
+    Ascii,
+    DecSpecialGraphics,
+}
+
+// Which designated slot (G0 or G1) GL currently reads through. Selected
+// by SI (0x0F, -> G0) / SO (0x0E, -> G1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CharsetSlot {
+    #[default]
+    G0,
+    G1,
+}
+
+// Bundles the two designated slots plus which one is currently active,
+// so the live state (`TerminalIngest::charset`), the alt-screen's own
+// DECSC save slot (`alt_saved_charset`), and the primary DECSC save
+// slot (`SavedCursor::charset`) can all share one type instead of three
+// parallel fields apiece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CharsetState {
+    g0: Charset,
+    g1: Charset,
+    active: CharsetSlot,
+}
+
+impl CharsetState {
+    fn active_charset(&self) -> Charset {
+        match self.active {
+            CharsetSlot::G0 => self.g0,
+            CharsetSlot::G1 => self.g1,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -90,6 +139,18 @@ pub struct TerminalIngest {
     // scrollback and the alternate-screen grid both carry these styles
     // for their lifetime.
     current_style: Style,
+    // Live G0/G1 designations and which of them GL currently reads
+    // through. Global like `current_style` (not per-screen): switching
+    // to the alternate screen carries whatever charset was active on
+    // the way in, exactly like the pen does. Set by `ESC ( <byte>` /
+    // `ESC ) <byte>` (designation) and SI/SO (0x0F/0x0E, slot select).
+    charset: CharsetState,
+    // Charset half of `alt_saved_pen`: the alternate screen's own DECSC
+    // save slot, separate from `primary_saved_cursor` so a DECSC issued
+    // while the alt screen is up doesn't clobber the pre-1049 primary
+    // state. Reset to CharsetState::default() on alt-screen entry, same
+    // as `alt_saved_pen`.
+    alt_saved_charset: CharsetState,
     // Accumulator for multi-byte UTF-8 sequences so we can reassemble
     // them into a single `char`. A byte 0xC0..=0xFD in the ground state
     // starts a sequence whose total length is encoded in its leading
@@ -162,7 +223,11 @@ enum ParseState {
     // so this state exists purely to eat that one byte instead of
     // letting it fall through to Ground and print literally.
     EscapeHash,
-    Charset,
+    // Mid `ESC ( <byte>` / `ESC ) <byte>` (Some(slot): which of G0/G1 the
+    // pending final byte designates) or `ESC * / + / - / . / <byte>`
+    // (None: a G2/G3 designator we don't track state for — the next byte
+    // is swallowed and discarded either way).
+    Charset(Option<CharsetSlot>),
     Csi,
     Osc,
     OscEscape,
@@ -198,6 +263,8 @@ impl TerminalIngest {
             cursor_visible: true,
             alt_saved_pen: Style::DEFAULT,
             current_style: Style::DEFAULT,
+            charset: CharsetState::default(),
+            alt_saved_charset: CharsetState::default(),
             utf8_buffer: Vec::new(),
             utf8_remaining: 0,
             cursor_shape: CursorShape::Default,
@@ -362,7 +429,16 @@ impl TerminalIngest {
                 ParseState::Ground => self.handle_ground(pane, byte),
                 ParseState::Escape => self.handle_escape(pane, byte),
                 ParseState::EscapeHash => self.handle_escape_hash(byte),
-                ParseState::Charset => self.state = ParseState::Ground,
+                ParseState::Charset(slot) => {
+                    self.state = ParseState::Ground;
+                    // G2/G3 (`slot == None`) designators are swallowed
+                    // without being tracked — see the ParseState::Charset
+                    // doc comment. Only a real G0/G1 designator updates
+                    // charset state.
+                    if let Some(slot) = slot {
+                        self.designate_charset(slot, byte);
+                    }
+                }
                 ParseState::Csi => {
                     if let Some(reply) = self.handle_csi(pane, byte) {
                         replies.extend(reply);
@@ -612,6 +688,12 @@ impl TerminalIngest {
             b'\r' => self.handle_carriage_return(pane),
             b'\x08' => self.handle_backspace(pane),
             b'\t' => self.handle_tab(pane),
+            // SI/SO: point GL at G0/G1. ncurses toggles between an ACS
+            // border drawn via SO and normal text via SI on terminals
+            // that designate the line-drawing set into G1 instead of
+            // (or in addition to) G0.
+            0x0f => self.charset.active = CharsetSlot::G0, // SI
+            0x0e => self.charset.active = CharsetSlot::G1, // SO
             0x20..=0x7e => self.handle_printable(pane, byte as char),
             0xC0..=0xDF => self.start_utf8_sequence(byte, 1),
             0xE0..=0xEF => self.start_utf8_sequence(byte, 2),
@@ -657,7 +739,15 @@ impl TerminalIngest {
             // eats that one byte so it doesn't fall through to Ground
             // and print literally (e.g. `ESC # 8` printing a stray "8").
             b'#' => ParseState::EscapeHash,
-            b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => ParseState::Charset,
+            // `ESC ( <byte>` / `ESC ) <byte>` designate G0 / G1. The
+            // other four intermediates (`* + - .` for G2/G3, and `/`
+            // for a 96-charset G3 variant) select slots zmux never
+            // reads from, so their final byte is swallowed with no
+            // state recorded — same as before this parser tracked
+            // charsets at all.
+            b'(' => ParseState::Charset(Some(CharsetSlot::G0)),
+            b')' => ParseState::Charset(Some(CharsetSlot::G1)),
+            b'*' | b'+' | b'-' | b'.' | b'/' => ParseState::Charset(None),
             b'7' => {
                 // DECSC: stash (row, col) + pen so the next `ESC 8` can
                 // put both right back. claude and friends use this to
@@ -705,6 +795,23 @@ impl TerminalIngest {
             b'=' | b'>' => ParseState::Ground,
             _ => ParseState::Ground,
         };
+    }
+
+    // `ESC ( <designator>` / `ESC ) <designator>`: point G0 or G1 at a
+    // character set. `0` is DEC Special Graphics (line drawing); every
+    // other designator we might see (`B` US-ASCII, `A` UK, `1`/`2` the
+    // alternate-ROM variants some old apps probe for) is treated as
+    // plain ASCII since none of them remap a glyph zmux's headless
+    // grid needs to care about.
+    fn designate_charset(&mut self, slot: CharsetSlot, designator: u8) {
+        let charset = match designator {
+            b'0' => Charset::DecSpecialGraphics,
+            _ => Charset::Ascii,
+        };
+        match slot {
+            CharsetSlot::G0 => self.charset.g0 = charset,
+            CharsetSlot::G1 => self.charset.g1 = charset,
+        }
     }
 
     fn handle_csi(&mut self, pane: &mut Pane, byte: u8) -> Option<Vec<u8>> {
@@ -1098,6 +1205,7 @@ impl TerminalIngest {
                             // resync it now that reset() is done clearing.
                             self.alternate.set_fill_style(self.current_style.clone());
                             self.alt_saved_pen = Style::DEFAULT;
+                            self.alt_saved_charset = CharsetState::default();
                         }
                         7 => {
                             self.set_primary_auto_wrap(true);
@@ -1254,6 +1362,7 @@ impl TerminalIngest {
         // reset to default in this same call.
         self.alternate.reset();
         self.alt_saved_pen = Style::DEFAULT;
+        self.alt_saved_charset = CharsetState::default();
         self.alternate.set_auto_wrap(true);
         self.reset_primary_modes(true);
         self.cursor_shape = CursorShape::Default;
@@ -1264,6 +1373,9 @@ impl TerminalIngest {
         self.synchronized_buffer = None;
         self.utf8_buffer.clear();
         self.utf8_remaining = 0;
+        // RIS reinitializes character-set state: G0/G1 back to ASCII,
+        // GL back to G0.
+        self.charset = CharsetState::default();
     }
 
     fn soft_reset(&mut self, pane: &mut Pane) {
@@ -1280,6 +1392,9 @@ impl TerminalIngest {
         self.bracketed_paste = false;
         self.focus_events = false;
         self.synchronized_buffer = None;
+        // DECSTR also reinvokes the default character sets (G0/G1 ->
+        // ASCII, GL -> G0), same as RIS.
+        self.charset = CharsetState::default();
     }
 
     fn reset_primary_modes(&mut self, clear_screen: bool) {
@@ -1301,7 +1416,8 @@ impl TerminalIngest {
         self.primary_auto_wrap = true;
     }
 
-    // DECSC / CSI s. Saves position + pen for whichever screen is active.
+    // DECSC / CSI s. Saves position + pen + charset state for whichever
+    // screen is active.
     fn save_cursor_state(&mut self, pane: &Pane) {
         match pane.screen_mode() {
             ScreenMode::Primary => {
@@ -1309,30 +1425,35 @@ impl TerminalIngest {
                     row: self.primary_cursor_row,
                     col: self.primary_cursor_col,
                     pen: self.current_style.clone(),
+                    charset: self.charset,
                 });
             }
             ScreenMode::Alternate => {
                 self.alternate.save_cursor();
                 self.alt_saved_pen = self.current_style.clone();
+                self.alt_saved_charset = self.charset;
             }
         }
     }
 
-    // DECRC / CSI u. Restores position + pen. Primary keeps its
-    // historical no-op when nothing was saved; the alternate screen
-    // restores its (home, default-pen) baseline, matching xterm's
-    // reset-attributes behavior for DECRC without a prior DECSC.
+    // DECRC / CSI u. Restores position + pen + charset state. Primary
+    // keeps its historical no-op when nothing was saved; the alternate
+    // screen restores its (home, default-pen, default-charset) baseline,
+    // matching xterm's reset-attributes behavior for DECRC without a
+    // prior DECSC.
     fn restore_cursor_state(&mut self, pane: &Pane) {
         match pane.screen_mode() {
             ScreenMode::Primary => {
                 if let Some(saved) = self.primary_saved_cursor.clone() {
                     self.primary_set_cursor(saved.row, saved.col);
                     self.current_style = saved.pen;
+                    self.charset = saved.charset;
                 }
             }
             ScreenMode::Alternate => {
                 self.alternate.restore_cursor();
                 self.current_style = self.alt_saved_pen.clone();
+                self.charset = self.alt_saved_charset;
             }
         }
         // Erase/scroll fills must blank with the restored pen, same as
@@ -1747,6 +1868,22 @@ impl TerminalIngest {
     }
 
     fn handle_printable(&mut self, pane: &mut Pane, ch: char) {
+        // DEC Special Graphics substitutes 31 GL positions (0x60..=0x7e,
+        // backtick through tilde) with line-drawing / math glyphs; every
+        // other GL byte — including the digits and lower punctuation —
+        // prints literally even while the slot is active. This only
+        // ever fires for single-byte ASCII printables: `ch` arrives
+        // here either straight from the 0x20..=0x7e ground-state arm or
+        // as a fully reassembled UTF-8 multibyte char (always >= 0x80),
+        // so a decoded multibyte char can never land in the translated
+        // range and passes through untouched, as required.
+        let ch = if self.charset.active_charset() == Charset::DecSpecialGraphics
+            && ('\u{60}'..='\u{7e}').contains(&ch)
+        {
+            dec_special_graphics(ch)
+        } else {
+            ch
+        };
         match pane.screen_mode() {
             ScreenMode::Primary => self.primary_put_char(pane, ch),
             ScreenMode::Alternate => self.alternate.put_char(ch, self.current_style.clone()),
@@ -1754,7 +1891,9 @@ impl TerminalIngest {
         // Remember the last graphic char so CSI `b` (REP) can repeat it.
         // Only printable chars qualify — control codes (newline, CR,
         // backspace, tab) are routed elsewhere and intentionally do
-        // not poison this slot.
+        // not poison this slot. Stored POST-translation so a REP that
+        // follows a box-drawing char repeats the drawn glyph, not the
+        // ASCII letter that was sent for it.
         self.last_graphic = Some(ch);
     }
 
@@ -2360,6 +2499,57 @@ impl AlternateScreen {
         for row in region.iter_mut().take(count) {
             row.fill(self.fill.clone());
         }
+    }
+}
+
+// Translates one GL byte through the DEC Special Graphics ("line
+// drawing") character set — the table `ESC ( 0` / `ESC ) 0` designate.
+// This is the table xterm (and the terminfo `acsc`-driven glyphs
+// ncurses apps rely on for `ACS_*` constants) implements for the vt100
+// "0" character set: box-drawing, math comparison signs, and the vt100
+// control-picture symbols. Only called for chars in 0x60..=0x7e — the
+// full standard table's range; everything below `` ` `` (including the
+// digits and `_`) was never part of the vt100 mapping and always prints
+// as itself, graphics mode or not.
+//
+// This is the table dialog/whiptail (and anything else built on old
+// ncurses ACS borders) rely on: without it `smacs`/`rmacs` bytes swap
+// the border in but the corner/edge glyphs render as the literal
+// letters `l`, `q`, `k`, etc. instead of `┌`, `─`, `┐`.
+fn dec_special_graphics(ch: char) -> char {
+    match ch {
+        '`' => '◆', // U+25C6 diamond
+        'a' => '▒', // U+2592 checkerboard (medium shade)
+        'b' => '␉', // U+2409 HT symbol
+        'c' => '␌', // U+240C FF symbol
+        'd' => '␍', // U+240D CR symbol
+        'e' => '␊', // U+240A LF symbol
+        'f' => '°', // U+00B0 degree
+        'g' => '±', // U+00B1 plus/minus
+        'h' => '␤', // U+2424 NL symbol
+        'i' => '␋', // U+240B VT symbol
+        'j' => '┘', // U+2518 lower-right corner
+        'k' => '┐', // U+2510 upper-right corner
+        'l' => '┌', // U+250C upper-left corner
+        'm' => '└', // U+2514 lower-left corner
+        'n' => '┼', // U+253C crossing lines
+        'o' => '⎺', // U+23BA scan line 1 (top)
+        'p' => '⎻', // U+23BB scan line 3
+        'q' => '─', // U+2500 scan line 5 (horizontal line)
+        'r' => '⎼', // U+23BC scan line 7
+        's' => '⎽', // U+23BD scan line 9 (bottom)
+        't' => '├', // U+251C left tee
+        'u' => '┤', // U+2524 right tee
+        'v' => '┴', // U+2534 bottom tee
+        'w' => '┬', // U+252C top tee
+        'x' => '│', // U+2502 vertical line
+        'y' => '≤', // U+2264 less-than-or-equal
+        'z' => '≥', // U+2265 greater-than-or-equal
+        '{' => 'π', // U+03C0 pi
+        '|' => '≠', // U+2260 not-equal
+        '}' => '£', // U+00A3 UK pound
+        '~' => '·', // U+00B7 centered dot
+        other => other,
     }
 }
 
@@ -3435,6 +3625,151 @@ mod tests {
         ingest.flush_incomplete_line(&mut pane);
 
         assert!(pane.visible_text().iter().all(|line| line.is_empty()));
+    }
+
+    #[test]
+    fn dec_special_graphics_charset_draws_ncurses_acs_borders() {
+        // `ESC ( 0` designates G0 as DEC Special Graphics (vt100 line
+        // drawing); ncurses' ACS_* border glyphs are just ASCII letters
+        // sent under that charset. xterm-256color's terminfo `smacs`/
+        // `rmacs` are exactly `\E(0` / `\E(B`, so this is dialog/
+        // whiptail's actual wire format for a box's top border. Before
+        // charset tracking, `ESC ( 0` was swallowed with no effect and
+        // this printed the literal letters `lqqqk`.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b(0lqqqk\x1b(B");
+        ingest.flush_incomplete_line(&mut pane);
+
+        assert_eq!(ingest.render_lines(&pane), vec!["┌───┐"]);
+    }
+
+    #[test]
+    fn charset_reverts_to_ascii_after_g0_is_redesignated_as_usascii() {
+        // `ESC ( B` re-designates G0 as US-ASCII. GL bytes that fall in
+        // the graphics-substitution range must print literally again
+        // afterwards instead of staying translated.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b(0q\x1b(Bq");
+        ingest.flush_incomplete_line(&mut pane);
+
+        assert_eq!(ingest.render_lines(&pane), vec!["─q"]);
+    }
+
+    #[test]
+    fn so_si_switch_gl_between_g0_ascii_and_g1_graphics() {
+        // Some ncurses builds designate line-drawing into G1 and flip
+        // GL with SO (0x0E, shift out to G1) / SI (0x0F, shift back to
+        // G0) instead of redesignating G0 directly. G0 stays ASCII the
+        // whole time here; only the active slot moves.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b)0a\x0eq\x0fq");
+        ingest.flush_incomplete_line(&mut pane);
+
+        // 'a' prints under the still-default G0/ASCII slot. SO moves GL
+        // to G1 (graphics), so 'q' -> '─'. SI moves GL back to G0
+        // (ASCII), so the final 'q' prints literally.
+        assert_eq!(ingest.render_lines(&pane), vec!["a─q"]);
+    }
+
+    #[test]
+    fn utf8_multibyte_chars_pass_through_untranslated_in_graphics_mode() {
+        // DEC Special Graphics only remaps single-byte GL positions
+        // 0x60..=0x7e. A UTF-8 multibyte char reassembled by the ground
+        // state always decodes to >= U+0080, so it can never land in
+        // that range — text interleaved with box-drawing must render
+        // untouched.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, "\x1b(0q你好q".as_bytes());
+        ingest.flush_incomplete_line(&mut pane);
+
+        assert_eq!(ingest.render_lines(&pane), vec!["─你好─"]);
+    }
+
+    #[test]
+    fn decsc_decrc_save_and_restore_charset_state() {
+        // Real DECSC saves charset state (G0/G1 + active slot) along
+        // with the pen and cursor position. Enter graphics mode, save,
+        // switch to ASCII and print (which also advances the cursor),
+        // then restore: DECRC puts the cursor back at the save point
+        // AND puts the charset back in graphics mode, so the restored
+        // write overwrites the interim char with a translated glyph
+        // instead of a literal letter.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b(0\x1b7\x1b(Bq\x1b8q");
+        ingest.flush_incomplete_line(&mut pane);
+
+        assert_eq!(ingest.render_lines(&pane), vec!["─"]);
+    }
+
+    #[test]
+    fn alt_screen_1049_roundtrip_preserves_primary_charset() {
+        // 1049 does an implicit DECSC/DECRC bracketing the alt-screen
+        // visit. A TUI that flips into a different charset inside the
+        // alt screen must not leak that into the primary screen on
+        // exit — the primary's own charset (set before entering alt)
+        // must survive the round trip.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b(0q\x1b[?1049h\x1b(Bq\x1b[?1049lq");
+        ingest.flush_incomplete_line(&mut pane);
+
+        // Primary: 'q' under graphics ('─') before entering alt screen.
+        // Inside alt, `\x1b(B` and the following 'q' land on the alt
+        // grid and never touch primary. After 1049l (implicit DECRC),
+        // the primary charset from before 1049h — graphics — must be
+        // active again, so the final 'q' also renders as '─'.
+        assert_eq!(ingest.render_lines(&pane), vec!["──"]);
+    }
+
+    #[test]
+    fn rep_repeats_the_translated_graphics_char() {
+        // CSI `b` (REP) must repeat what was actually drawn. A
+        // box-drawing run compressed with REP should repeat '─', not
+        // the raw ASCII 'q' that was sent for it.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b(0q\x1b[9b");
+        ingest.flush_incomplete_line(&mut pane);
+
+        assert_eq!(ingest.render_lines(&pane), vec!["─".repeat(10)]);
+    }
+
+    #[test]
+    fn hard_reset_clears_charset_state() {
+        // RIS (`ESC c`) must put G0/G1 back to ASCII and GL back to G0,
+        // so graphics mode left dangling by a killed app doesn't poison
+        // whatever runs next in the same pane.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b(0\x1bcq");
+        ingest.flush_incomplete_line(&mut pane);
+
+        assert_eq!(ingest.render_lines(&pane), vec!["q"]);
+    }
+
+    #[test]
+    fn soft_reset_clears_charset_state() {
+        // DECSTR (`CSI ! p`) resets charset state the same way RIS does.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b(0\x1b[!pq");
+        ingest.flush_incomplete_line(&mut pane);
+
+        assert_eq!(ingest.render_lines(&pane), vec!["q"]);
     }
 
     #[test]
