@@ -224,6 +224,13 @@ impl Session {
         self.pane.extract_scrollback_lines(start, end)
     }
 
+    // See `Pane::scrollback_line_cells` — cell-level line access that
+    // preserves wide-char continuation sentinels for visual-column
+    // slicing.
+    pub fn scrollback_line_cells(&self, index: usize) -> crate::scrollback::ScrollbackLine {
+        self.pane.scrollback_line_cells(index)
+    }
+
     pub fn output_byte_cursor(&self) -> u64 {
         self.pane.output_byte_cursor()
     }

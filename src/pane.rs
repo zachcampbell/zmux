@@ -465,6 +465,15 @@ impl Pane {
         self.scrollback.extract_lines(start, end)
     }
 
+    // Cell-level counterpart to `extract_scrollback_lines` for a single
+    // line: keeps wide-char continuation sentinels in place so a
+    // caller doing visual-column math (mouse selections) can index by
+    // on-screen cell rather than by post-filter char position. See
+    // `ScrollbackBuffer::line_cells`.
+    pub fn scrollback_line_cells(&self, index: usize) -> ScrollbackLine {
+        self.scrollback.line_cells(index)
+    }
+
     pub fn scrollback_viewport_top(&self) -> usize {
         self.scrollback.viewport_top()
     }

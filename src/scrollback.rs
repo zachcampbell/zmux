@@ -163,6 +163,15 @@ impl ScrollbackBuffer {
     // Out-of-range indices are silently skipped so the caller can pass
     // cursor/anchor pairs without worrying about buffer churn racing
     // with a live shell between the user pressing `v` and pressing `y`.
+    //
+    // Wide-char continuation sentinels (`\0`, see `style::char_width`)
+    // are dropped from the output — every other read path (`Pane::
+    // visible_text`, `scrollback_text`, `TerminalIngest::render_lines`)
+    // already filters them so a copied CJK/emoji line reads as plain
+    // text instead of embedding NUL bytes in the clipboard. The
+    // trailing-blank scan still walks the raw cells (a `\0` is `!=
+    // ' '`, so it correctly keeps a wide glyph that sits at the end of
+    // the line) — only the final push loop skips it.
     pub fn extract_lines(&self, start: usize, end: usize) -> String {
         let (low, high) = if start <= end {
             (start, end)
@@ -181,11 +190,26 @@ impl ScrollbackBuffer {
                     .map(|i| i + 1)
                     .unwrap_or(0);
                 for cell in &cells[..trailing] {
-                    out.push(cell.ch);
+                    if cell.ch != '\0' {
+                        out.push(cell.ch);
+                    }
                 }
             }
         }
         out
+    }
+
+    // Raw cells of a single buffer line, or an empty vec when `index`
+    // is out of range. Unlike `extract_lines`, the wide-char
+    // continuation sentinel (`\0`) is kept in place — callers that
+    // need to slice a line by *visual* column (mouse-driven char/rect
+    // selections) must index into the same cell array the renderer
+    // and the mouse coordinate math both use, where one on-screen
+    // column is one `Cell`, wide char or not. Filtering `\0` here
+    // would shift every cell after a wide glyph one column to the
+    // left of where the click actually landed.
+    pub fn line_cells(&self, index: usize) -> ScrollbackLine {
+        self.lines.get(index).cloned().unwrap_or_default()
     }
 
     // Position the viewport so `line_index` is centered vertically when

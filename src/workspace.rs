@@ -991,6 +991,14 @@ impl Workspace {
         let Some(active) = self.session_for_mut(self.active) else {
             return true;
         };
+        // Drain the live primary grid into scrollback before searching
+        // it. `search_scrollback` only scans committed scrollback
+        // lines; in follow-output mode the rendered viewport can be
+        // entirely the ingester's live grid (rows that haven't reached
+        // `pane.scrollback` yet — see `TerminalIngest::
+        // render_primary_cells`), so without this a query matching text
+        // that's plainly on screen comes back with zero hits.
+        active.session.flush_grid_to_scrollback();
         let matches = active.session.search_scrollback(&query);
         if matches.is_empty() {
             self.search_results = Some(SearchResults {
@@ -1069,6 +1077,17 @@ impl Workspace {
     // and cursor both start at the top-left of the visible viewport
     // so the user can extend down/right to grow the range.
     pub fn begin_selection(&mut self, mode: SelectionMode) -> bool {
+        // Same drain the mouse press path needs (see `handle_mouse`):
+        // `scrollback_viewport_top` below is read against committed
+        // scrollback only, but in follow-output mode what's actually
+        // on screen can be entirely the ingester's live grid. Without
+        // draining first, the anchor this computes doesn't name the
+        // line the user is looking at, and every later `y` inherits
+        // the wrong line — the keyboard-copy-mode twin of the mouse
+        // drag-copy bug.
+        if let Some(session) = self.session_for_mut(self.active) {
+            session.session.flush_grid_to_scrollback();
+        }
         let Some(session) = self.session_for(self.active) else {
             return false;
         };
@@ -1167,6 +1186,14 @@ impl Workspace {
     // multi-line selections. Clears the selection on success.
     pub fn yank_selection(&mut self) -> Option<String> {
         let selection = self.selection.take()?;
+        // Drain before extracting, not just at selection-start: new
+        // output may have streamed into the live grid between
+        // `begin_selection`/the mouse press and this yank, and
+        // `extract_scrollback_lines`/`scrollback_line_cells` only see
+        // committed scrollback.
+        if let Some(active) = self.session_for_mut(self.active) {
+            active.session.flush_grid_to_scrollback();
+        }
         let active = self.session_for(self.active)?;
         let text = match selection.mode {
             SelectionMode::Line => {
@@ -2838,10 +2865,9 @@ impl Workspace {
             // Read-only probes up front, so the mutable borrow needed
             // for `handle_mouse_event` later doesn't conflict with
             // `self.selection` / `self.mouse_drag_active` access.
-            let (is_primary, viewport_top, exit_status) = match self.session_for(pane_id) {
+            let (is_primary, exit_status) = match self.session_for(pane_id) {
                 Some(managed) => (
                     managed.session.screen_mode() == ScreenMode::Primary,
-                    managed.session.scrollback_viewport_top(),
                     managed.exit_status,
                 ),
                 None => return Ok(active_changed),
@@ -2856,6 +2882,34 @@ impl Workspace {
             // screen (vim, less, etc.) is left alone; those apps enable
             // their own mouse tracking and we just forward to them.
             if is_primary {
+                if mouse.is_left_press() || (mouse.is_left_drag_motion() && self.mouse_drag_active)
+                {
+                    // Drain the live primary grid into scrollback
+                    // before turning this screen coordinate into a
+                    // scrollback-line index. In follow-output mode the
+                    // rendered viewport can be entirely the ingester's
+                    // live grid (`TerminalIngest::render_primary_cells`)
+                    // whose rows haven't reached `pane.scrollback` yet;
+                    // without this, `viewport_top` below is computed
+                    // against a shorter, stale timeline and
+                    // `viewport_top + local_row` names the wrong
+                    // scrollback line — the highlight tracks the mouse
+                    // correctly (it's drawn from the same live grid the
+                    // renderer uses) but the eventual yank resolves to
+                    // whatever stale content happens to sit at that
+                    // index. Draining on every press/drag tick (not
+                    // just once) keeps this correct even if output kept
+                    // streaming in mid-drag; `primary_flushed_to_
+                    // scrollback` makes a drain with nothing new to
+                    // move a cheap no-op.
+                    if let Some(managed) = self.session_for_mut(pane_id) {
+                        managed.session.flush_grid_to_scrollback();
+                    }
+                }
+                let viewport_top = match self.session_for(pane_id) {
+                    Some(managed) => managed.session.scrollback_viewport_top(),
+                    None => return Ok(active_changed),
+                };
                 if mouse.is_left_press() {
                     let buffer_line = viewport_top + local_row as usize;
                     let buffer_col = local_col as usize;
@@ -2886,16 +2940,25 @@ impl Workspace {
                             // the same cell). Nothing to copy; drop the
                             // stray [SEL char] tag.
                             self.selection = None;
-                        } else if let Some(active) = self.session_for(self.active) {
-                            // Auto-yank the drag selection so the user
-                            // gets the desktop-terminal UX: release the
-                            // mouse and the highlight is on the
-                            // clipboard. Selection stays visible until
-                            // the next click so the user sees what was
-                            // copied.
-                            let text = extract_char_stream(active, sel);
-                            self.paste_buffer = Some(text.clone());
-                            self.pending_clipboard = Some(text);
+                        } else {
+                            // Drain once more immediately before
+                            // extraction: output may have streamed in
+                            // since the last press/drag drain above,
+                            // and extraction reads scrollback directly.
+                            if let Some(managed) = self.session_for_mut(pane_id) {
+                                managed.session.flush_grid_to_scrollback();
+                            }
+                            if let Some(active) = self.session_for(self.active) {
+                                // Auto-yank the drag selection so the
+                                // user gets the desktop-terminal UX:
+                                // release the mouse and the highlight
+                                // is on the clipboard. Selection stays
+                                // visible until the next click so the
+                                // user sees what was copied.
+                                let text = extract_char_stream(active, sel);
+                                self.paste_buffer = Some(text.clone());
+                                self.pending_clipboard = Some(text);
+                            }
                         }
                     }
                     return Ok(true);
@@ -3057,9 +3120,29 @@ fn local_hms() -> String {
 // end.col. Trailing blanks are trimmed only from the final line —
 // middle lines keep their full content so aligned output (like tree
 // views or tables) survives the yank.
+// Append cells `[lo, hi)` (a half-open, already-clamped range over
+// visual columns) to `out`, dropping wide-char continuation sentinels
+// (`\0`) so the copied text never embeds a NUL. Slicing happens on the
+// raw `Cell` array — one element per on-screen column, wide glyph or
+// not — so `lo`/`hi` stay in the same coordinate space the mouse and
+// `Selection` use. Filtering `\0` only at push time (not by shrinking
+// the array first) is what keeps column semantics visual: a wide char
+// still consumes two indices even though it contributes one `char` to
+// the output.
+fn push_cell_range(out: &mut String, cells: &[Cell], lo: usize, hi: usize) {
+    if hi <= lo {
+        return;
+    }
+    for cell in &cells[lo..hi] {
+        if cell.ch != '\0' {
+            out.push(cell.ch);
+        }
+    }
+}
+
 fn extract_char_stream(active: &ManagedSession, sel: Selection) -> String {
     // Clamp an inclusive column index to the `[0, len]` slice range
-    // used for `chars[lo..hi]`: `end_col + 1` capped at the line length.
+    // used for `cells[lo..hi]`: `end_col + 1` capped at the line length.
     fn slice_end(end_col: usize, len: usize) -> usize {
         end_col.saturating_add(1).min(len)
     }
@@ -3067,24 +3150,20 @@ fn extract_char_stream(active: &ManagedSession, sel: Selection) -> String {
     let mut out = String::new();
     // One-line case: just the substring.
     if start.0 == end.0 {
-        let line_text = active.session.extract_scrollback_lines(start.0, start.0);
-        let chars: Vec<char> = line_text.chars().collect();
-        let lo = start.1.min(chars.len());
-        let hi = slice_end(end.1, chars.len());
-        if hi > lo {
-            out.extend(chars[lo..hi].iter());
-        }
+        let cells = active.session.scrollback_line_cells(start.0);
+        let lo = start.1.min(cells.len());
+        let hi = slice_end(end.1, cells.len());
+        push_cell_range(&mut out, &cells, lo, hi);
         return out;
     }
     // Multi-line: partial first line.
-    let first = active.session.extract_scrollback_lines(start.0, start.0);
-    let first_chars: Vec<char> = first.chars().collect();
-    let lo = start.1.min(first_chars.len());
-    if first_chars.len() > lo {
-        out.extend(first_chars[lo..].iter());
-    }
+    let first_cells = active.session.scrollback_line_cells(start.0);
+    let lo = start.1.min(first_cells.len());
+    push_cell_range(&mut out, &first_cells, lo, first_cells.len());
     out.push('\n');
-    // Middle lines, if any.
+    // Middle lines, if any. These are taken whole (no column slicing),
+    // so the trimmed-string accessor is fine here — it already skips
+    // `\0` on output (see `ScrollbackBuffer::extract_lines`).
     if end.0 > start.0 + 1 {
         let middle = active
             .session
@@ -3093,12 +3172,9 @@ fn extract_char_stream(active: &ManagedSession, sel: Selection) -> String {
         out.push('\n');
     }
     // Partial last line.
-    let last = active.session.extract_scrollback_lines(end.0, end.0);
-    let last_chars: Vec<char> = last.chars().collect();
-    let hi = slice_end(end.1, last_chars.len());
-    if hi > 0 {
-        out.extend(last_chars[..hi].iter());
-    }
+    let last_cells = active.session.scrollback_line_cells(end.0);
+    let hi = slice_end(end.1, last_cells.len());
+    push_cell_range(&mut out, &last_cells, 0, hi);
     out
 }
 
@@ -3113,12 +3189,22 @@ fn handle_mouse_test_input(col: u16, row: u16, button: u16, final_byte: u8) -> M
 }
 
 // Pull a rectangular region out of the active pane's scrollback. For
-// every line in [row_lo, row_hi], take chars[col_lo..=col_hi] with
+// every line in [row_lo, row_hi], take cells[col_lo..=col_hi] with
 // padding when the row is shorter than col_hi + 1 (so the result
 // keeps its column alignment). Rows are joined with newlines.
 // Trailing whitespace on each row slice is preserved — rectangular
 // selections are for aligned table-style output where trimming would
 // destroy the alignment.
+//
+// Column lookup happens against the raw cells (`scrollback_line_cells`,
+// which keeps `\0` continuation sentinels in place), not the trimmed,
+// already-`\0`-filtered string `extract_scrollback_lines` returns —
+// filtering first would shift every column after a wide glyph one
+// index left of where the rectangle's edges actually are. A `\0` cell
+// inside the rectangle contributes nothing to the output (it's the
+// second half of a wide glyph whose first half already used this
+// rect's column budget); an out-of-range column still pads with a
+// space so unrelated rows keep their alignment.
 fn extract_rect_stream(active: &ManagedSession, sel: Selection) -> String {
     let (row_lo, row_hi) = sel.line_range();
     let (col_lo, col_hi) = sel.col_range();
@@ -3128,14 +3214,13 @@ fn extract_rect_stream(active: &ManagedSession, sel: Selection) -> String {
         if row > row_lo {
             out.push('\n');
         }
-        let line_text = active.session.extract_scrollback_lines(row, row);
-        let chars: Vec<char> = line_text.chars().collect();
+        let cells = active.session.scrollback_line_cells(row);
         for offset in 0..width {
             let col = col_lo + offset;
-            if let Some(ch) = chars.get(col) {
-                out.push(*ch);
-            } else {
-                out.push(' ');
+            match cells.get(col) {
+                Some(cell) if cell.ch != '\0' => out.push(cell.ch),
+                Some(_) => {}
+                None => out.push(' '),
             }
         }
     }
@@ -3284,6 +3369,68 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Drive `workspace`'s real PTY-ingest loop (VT100 parser -> live
+    /// primary grid, exactly the path a mouse drag or `/` search has to
+    /// contend with) until `snapshot_visible_lines` contains a trimmed
+    /// line equal to `expected`, then return that snapshot. Deliberately
+    /// NOT `append_output_line`/`append_plain`: those helpers write
+    /// straight into committed scrollback and skip the live grid
+    /// entirely, which is exactly the code path that hides the
+    /// highlight/copy mismatch this suite is guarding against.
+    fn wait_for_visible_line(
+        workspace: &mut Workspace,
+        pane_id: u32,
+        expected: &str,
+    ) -> Vec<String> {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = workspace.ingest_available_output().expect("ingest");
+            if let Some(lines) = workspace.snapshot_visible_lines(pane_id)
+                && lines.iter().any(|line| line.trim() == expected)
+            {
+                return lines;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {expected:?} to appear on screen; last snapshot: {:?}",
+                workspace.snapshot_visible_lines(pane_id)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Block until the freshly spawned shell has printed its first
+    /// prompt. Writing test input immediately after `spawn_single`
+    /// races the child process's own startup: if we write before the
+    /// shell has read+printed anything, the kernel's line-discipline
+    /// echo of our keystrokes can reach the PTY master *before* the
+    /// shell's delayed first prompt does, so the prompt ends up glued
+    /// onto a later row (in front of the command's real output)
+    /// instead of prefixing the echoed command line. That's a shell/
+    /// PTY startup race, not a zmux ingest bug — but it makes any test
+    /// that types immediately after spawn nondeterministic. Waiting
+    /// here for *something* to be visible first pins the shell to a
+    /// known-ready state before the test's real input goes out.
+    fn wait_for_shell_ready(workspace: &mut Workspace, pane_id: u32) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = workspace.ingest_available_output().expect("ingest");
+            if workspace
+                .snapshot_visible_lines(pane_id)
+                .is_some_and(|lines| !lines.is_empty())
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the shell to print its first prompt"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -3762,48 +3909,219 @@ mod tests {
         use super::handle_mouse_test_input as press;
         let mut workspace =
             Workspace::spawn_single("/bin/sh", PtySize::new(24, 120)).expect("spawn workspace");
+        let pane_id = workspace.active_pane_id() as u32;
+        wait_for_shell_ready(&mut workspace, pane_id);
 
-        // Row 0 is the pane header — use row 1 for content. Press at
-        // (col=2, row=1) anchors a char selection.
+        // Drive real content through the actual PTY-ingest path so this
+        // test exercises the same live-grid rendering the mouse
+        // highlight uses. The regression this guards against is
+        // "highlight paints on one string, copy resolves to another" —
+        // asserting only `Some(_)` on the yank (as this test used to)
+        // can't catch that; the exact text has to match the cells the
+        // press/drag/release walked over.
         workspace
-            .handle_input(InputAction::Mouse(press(2, 1, 0, b'M')))
+            .handle_input(InputAction::Forward(b"printf 'abcdefghij\\n'\r".to_vec()))
+            .expect("forward printf");
+        let lines = wait_for_visible_line(&mut workspace, pane_id, "abcdefghij");
+        let content_row = lines
+            .iter()
+            .position(|line| line.trim() == "abcdefghij")
+            .expect("printf output must be visible") as u16;
+        // +1 for the pane header row that `content_position` strips.
+        let screen_row = content_row + 1;
+
+        // Press at (col=2, row=screen_row) anchors a char selection on
+        // the 'c' of "abcdefghij".
+        workspace
+            .handle_input(InputAction::Mouse(press(2, screen_row, 0, b'M')))
             .expect("press");
         assert!(workspace.has_selection(), "press must start a selection");
         assert!(workspace.mouse_drag_active, "drag flag should be true");
 
-        // Drag motion: left button held (button | 32), col advances.
+        // Drag motion: left button held (button | 32), col advances to
+        // 6 ('g') — the selection now spans columns 2..=6 ("cdefg").
         workspace
-            .handle_input(InputAction::Mouse(press(6, 1, 32, b'M')))
+            .handle_input(InputAction::Mouse(press(6, screen_row, 32, b'M')))
             .expect("drag");
         let sel = workspace.selection.expect("still selecting");
         assert_eq!(sel.cursor_col, 6);
 
-        // Release: drag flag clears; pending_clipboard populates because
-        // the selection spans more than one cell.
+        // Release: drag flag clears; pending_clipboard holds exactly
+        // the highlighted substring, not stale or column-shifted
+        // content.
         workspace
-            .handle_input(InputAction::Mouse(press(6, 1, 0, b'm')))
+            .handle_input(InputAction::Mouse(press(6, screen_row, 0, b'm')))
             .expect("release");
         assert!(
             !workspace.mouse_drag_active,
             "drag flag must clear on release"
         );
-        let _yanked = workspace
+        let yanked = workspace
             .take_pending_clipboard()
             .expect("auto-yank must produce text");
+        assert_eq!(
+            yanked, "cdefg",
+            "copied text must match the highlighted cells exactly"
+        );
 
         // A second click + release on the same cell is treated as a
         // bare click: selection clears, no pending clipboard.
         workspace
-            .handle_input(InputAction::Mouse(press(1, 1, 0, b'M')))
+            .handle_input(InputAction::Mouse(press(1, screen_row, 0, b'M')))
             .expect("press");
         workspace
-            .handle_input(InputAction::Mouse(press(1, 1, 0, b'm')))
+            .handle_input(InputAction::Mouse(press(1, screen_row, 0, b'm')))
             .expect("release");
         assert!(
             !workspace.has_selection(),
             "collapsed click must not leave a selection"
         );
         assert!(workspace.take_pending_clipboard().is_none());
+    }
+
+    #[test]
+    fn mouse_drag_over_live_grid_content_copies_the_highlighted_line() {
+        use super::handle_mouse_test_input as press;
+
+        // Reproduces the bug report exactly: a fresh 20-content-row
+        // session (21-row frame minus the 1-row pane header), `seq 100
+        // 129` (30 lines — more than the viewport holds), drag over the
+        // line showing "115". `seq` emits enough output that by the
+        // time it finishes some lines have been evicted into committed
+        // scrollback while the rest still sit only in the ingester's
+        // live primary grid, undrained. Before the fix, mapping the
+        // click through `scrollback_viewport_top()` (which counts only
+        // committed scrollback) resolved to the wrong line: the
+        // highlight tracked the mouse correctly (it's drawn from the
+        // same live grid the renderer uses) but the yank read stale
+        // scrollback content that happened to sit at that numeric
+        // index — highlighting "115" while copying "103".
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(21, 80)).expect("spawn workspace");
+        let pane_id = workspace.active_pane_id() as u32;
+        wait_for_shell_ready(&mut workspace, pane_id);
+
+        workspace
+            .handle_input(InputAction::Forward(b"seq 100 129\r".to_vec()))
+            .expect("forward seq");
+        let lines = wait_for_visible_line(&mut workspace, pane_id, "129");
+
+        let target_row = lines
+            .iter()
+            .position(|line| line.trim() == "115")
+            .expect("115 must still be visible in a 20-row viewport after seq 100..129");
+        // +1 for the pane header row that `content_position` strips.
+        let screen_row = (target_row + 1) as u16;
+
+        // Drag across all three digits of "115".
+        workspace
+            .handle_input(InputAction::Mouse(press(0, screen_row, 0, b'M')))
+            .expect("press");
+        workspace
+            .handle_input(InputAction::Mouse(press(2, screen_row, 32, b'M')))
+            .expect("drag");
+        workspace
+            .handle_input(InputAction::Mouse(press(2, screen_row, 0, b'm')))
+            .expect("release");
+
+        let yanked = workspace
+            .take_pending_clipboard()
+            .expect("auto-yank must produce text");
+        assert_eq!(
+            yanked.trim(),
+            "115",
+            "highlighted line must match the copied line, not stale/shifted scrollback"
+        );
+    }
+
+    #[test]
+    fn mouse_drag_over_wide_chars_excludes_continuation_sentinels() {
+        use super::handle_mouse_test_input as press;
+
+        // "你好ok" occupies exactly 6 terminal columns: col0-1 for 你
+        // (glyph cell + `\0` continuation sentinel), col2-3 for 好,
+        // col4 for 'o', col5 for 'k'. A selection dragged across all
+        // six columns must yank the plain 4-glyph string with no `\0`
+        // bytes, and the trailing ASCII "ok" must land at the right
+        // characters rather than being shifted by the two sentinel
+        // cells.
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(24, 80)).expect("spawn workspace");
+        let pane_id = workspace.active_pane_id() as u32;
+        wait_for_shell_ready(&mut workspace, pane_id);
+
+        workspace
+            .handle_input(InputAction::Forward(
+                "printf '你好ok\\n'\r".as_bytes().to_vec(),
+            ))
+            .expect("forward printf");
+        let lines = wait_for_visible_line(&mut workspace, pane_id, "你好ok");
+        let content_row = lines
+            .iter()
+            .position(|line| line.trim() == "你好ok")
+            .expect("printf output must be visible") as u16;
+        let screen_row = content_row + 1;
+
+        // Drag across all 6 columns the two-cell-per-glyph layout
+        // occupies.
+        workspace
+            .handle_input(InputAction::Mouse(press(0, screen_row, 0, b'M')))
+            .expect("press");
+        workspace
+            .handle_input(InputAction::Mouse(press(5, screen_row, 32, b'M')))
+            .expect("drag");
+        workspace
+            .handle_input(InputAction::Mouse(press(5, screen_row, 0, b'm')))
+            .expect("release");
+
+        let yanked = workspace
+            .take_pending_clipboard()
+            .expect("auto-yank must produce text");
+        assert_eq!(
+            yanked, "你好ok",
+            "wide-char selection must yank the exact visible text"
+        );
+        assert!(
+            !yanked.contains('\0'),
+            "clipboard must never contain a wide-char continuation sentinel"
+        );
+    }
+
+    #[test]
+    fn search_finds_a_query_that_is_still_only_in_the_live_grid() {
+        // `/` search (`commit_search` -> `search_scrollback`) only
+        // scanned committed scrollback. In follow-output mode the
+        // rendered viewport can be entirely the ingester's live grid —
+        // rows that plainly exist on screen but haven't reached
+        // `pane.scrollback` yet. A small pane with only a couple of
+        // lines of output never triggers grid eviction, so this content
+        // is guaranteed to still be live-grid-only when we search.
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(24, 80)).expect("spawn workspace");
+        let pane_id = workspace.active_pane_id() as u32;
+        wait_for_shell_ready(&mut workspace, pane_id);
+
+        workspace
+            .handle_input(InputAction::Forward(b"printf 'zmuxneedle\\n'\r".to_vec()))
+            .expect("forward printf");
+        let _ = wait_for_visible_line(&mut workspace, pane_id, "zmuxneedle");
+
+        assert!(
+            workspace.begin_search(),
+            "begin_search should open the prompt"
+        );
+        workspace.search_input_bytes(b"zmuxneedle");
+        assert!(workspace.commit_search(), "commit_search should run");
+
+        let results = workspace
+            .search_results
+            .as_ref()
+            .expect("commit must populate results");
+        assert!(
+            !results.matches.is_empty(),
+            "search must find a query that's plainly visible on screen, even though \
+             it hasn't been drained into committed scrollback yet",
+        );
     }
 
     #[test]
