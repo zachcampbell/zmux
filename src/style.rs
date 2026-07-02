@@ -68,6 +68,9 @@ impl Style {
             3 => self.attrs.italic = true,
             4 => self.attrs.underline = true,
             7 => self.attrs.reverse = true,
+            // Double underline (ECMA-48 / modern xterm). Rendered as a
+            // plain underline; SGR 24 clears it like any other.
+            21 => self.attrs.underline = true,
             22 => {
                 self.attrs.bold = false;
                 self.attrs.dim = false;
@@ -81,11 +84,69 @@ impl Style {
             40..=47 => self.bg = Color::Indexed((param - 40) as u8),
             48 => return apply_extended_color(&mut self.bg, remaining),
             49 => self.bg = Color::Default,
+            // Underline color — untracked, but its payload must be
+            // consumed so `58;2;R;G;B` doesn't misread 2 as "dim" and
+            // B as a color code. 59 (reset underline color) is a no-op.
+            58 => {
+                let mut discard = Color::Default;
+                return apply_extended_color(&mut discard, remaining);
+            }
+            59 => {}
             90..=97 => self.fg = Color::Indexed((param - 90 + 8) as u8),
             100..=107 => self.bg = Color::Indexed((param - 100 + 8) as u8),
             _ => {} // ignore unknown SGR params rather than panicking
         }
         0
+    }
+
+    // Colon-subparameter SGR forms (ISO 8613-6, kitty underline styles).
+    // The whole `lead:sub:sub…` group arrives as one ';'-separated part;
+    // unknown groups are dropped as a unit — misreading `4:3` as SGR 0
+    // resets the entire style, which is exactly the failure mode this
+    // path exists to avoid.
+    pub fn apply_sgr_colon(&mut self, lead: u16, subs: &[u16]) {
+        match lead {
+            // kitty underline styles: 4:0 = off, 4:1..=5 = single /
+            // double / curly / dotted / dashed — all rendered as a
+            // plain underline.
+            4 => self.attrs.underline = subs.first().is_some_and(|&sub| sub != 0),
+            38 => {
+                if let Some(color) = colon_extended_color(subs) {
+                    self.fg = color;
+                }
+            }
+            48 => {
+                if let Some(color) = colon_extended_color(subs) {
+                    self.bg = color;
+                }
+            }
+            // Underline color: untracked, consumed without side effects.
+            58 | 59 => {}
+            _ => {}
+        }
+    }
+}
+
+// `38:5:N`, `38:2:R:G:B`, and the ITU-T form `38:2:<colorspace>:R:G:B`
+// (five or more subparameters mean the first payload value is a
+// colorspace id). Returns None for malformed groups so the caller
+// leaves the style untouched.
+fn colon_extended_color(subs: &[u16]) -> Option<Color> {
+    match subs.first().copied() {
+        Some(5) => subs.get(1).map(|&n| color_from_256(n.min(255) as u8)),
+        Some(2) => {
+            let rgb = if subs.len() >= 5 {
+                &subs[2..5]
+            } else {
+                subs.get(1..4)?
+            };
+            Some(Color::Rgb(
+                rgb[0].min(255) as u8,
+                rgb[1].min(255) as u8,
+                rgb[2].min(255) as u8,
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -494,6 +555,54 @@ mod tests {
         let consumed = apply_extended_color(&mut fg, &[2, 200, 50, 10]);
         assert_eq!(consumed, 4);
         assert_eq!(fg, Color::Rgb(200, 50, 10));
+    }
+
+    #[test]
+    fn sgr_58_consumes_underline_color_payload() {
+        let mut style = Style::DEFAULT;
+        style.apply_sgr(31, &[]);
+        let consumed = style.apply_sgr(58, &[2, 10, 20, 30]);
+        assert_eq!(consumed, 4, "58;2;R;G;B payload must be swallowed");
+        assert_eq!(style.fg, Color::Indexed(1), "58 must not touch fg");
+        assert!(!style.attrs.dim);
+
+        let consumed = style.apply_sgr(58, &[5, 7]);
+        assert_eq!(consumed, 2, "58;5;N payload must be swallowed");
+        assert_eq!(style.fg, Color::Indexed(1));
+    }
+
+    #[test]
+    fn sgr_colon_underline_styles_toggle_underline() {
+        let mut style = Style::DEFAULT;
+        style.apply_sgr_colon(4, &[3]); // curly
+        assert!(style.attrs.underline);
+        style.apply_sgr_colon(4, &[0]); // kitty underline-off
+        assert!(!style.attrs.underline);
+    }
+
+    #[test]
+    fn sgr_colon_truecolor_handles_itu_colorspace_form() {
+        let mut style = Style::DEFAULT;
+        // 38:2:R:G:B — three payload values, no colorspace id.
+        style.apply_sgr_colon(38, &[2, 10, 20, 30]);
+        assert_eq!(style.fg, Color::Rgb(10, 20, 30));
+        // 38:2::R:G:B — ITU form, empty colorspace id first.
+        style.apply_sgr_colon(38, &[2, 0, 40, 50, 60]);
+        assert_eq!(style.fg, Color::Rgb(40, 50, 60));
+    }
+
+    #[test]
+    fn sgr_colon_malformed_groups_leave_style_untouched() {
+        let mut style = Style::DEFAULT;
+        style.apply_sgr(31, &[]);
+        style.apply_sgr(4, &[]);
+        let before = style.clone();
+
+        style.apply_sgr_colon(38, &[9, 1, 2]); // unknown color mode
+        style.apply_sgr_colon(38, &[2, 10]); // truncated truecolor
+        style.apply_sgr_colon(58, &[2, 10, 20, 30]); // underline color
+        style.apply_sgr_colon(7, &[1]); // colon form of a plain attr
+        assert_eq!(style, before);
     }
 
     #[test]

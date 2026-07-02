@@ -7,7 +7,7 @@ A terminal multiplexer with pane-local mouse wheel scrolling, an in-daemon MCP s
 **Core multiplexer:**
 - bounded scrollback ring per pane, viewport that detaches from the live bottom on wheel events
 - pane-local mouse wheel routing, with translated SGR pass-through for alt-screen apps
-- VT ingester covering alternate-screen, cursor save/restore, scroll regions, line/char editing, mouse modes, Synchronized Output (mode 2026), REP, OSC 10/11 color queries with terminator round-trip, DECSCUSR, bracketed paste (2004), focus events (1004), and a wide-char width table audited for emoji / CJK / box drawing
+- VT ingester covering alternate-screen, cursor save/restore (position + SGR pen, including the implicit DECSC/DECRC on 1049 alt-screen switches), scroll regions, line/char editing, mouse modes, Synchronized Output (mode 2026), REP, colon-SGR subparameters (kitty underline styles, colon-form extended colors, underline-color consumption), OSC 10/11 color queries with terminator round-trip, DECSCUSR, bracketed paste (2004), focus events (1004), and a wide-char width table audited for emoji / CJK / box drawing
 - detached per-session daemon, named-session attach/reattach, multi-window workspace
 - Ctrl-a-prefix bindings for splits, resize, focus cycling, layout presets, OSC 52 yank, scrollback search, paste, and more
 

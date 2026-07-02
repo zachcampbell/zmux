@@ -654,23 +654,36 @@ impl TerminalIngest {
 
         match final_byte {
             b'm' => {
-                // SGR: update the running style so subsequent chars in the
-                // alternate screen are written with the correct color /
-                // attributes. `parse_params` hands us Option<usize> slots
-                // to model "empty" → "0" per the CSI spec; we flatten
-                // unset positions into 0 (reset) which matches what most
-                // terminals do.
-                let params: Vec<u16> = if body.is_empty() {
-                    vec![0]
+                // SGR: update the running style so subsequent chars are
+                // written with the correct color / attributes. Each
+                // ';'-separated part may carry ':' subparameters (kitty
+                // underline styles, colon-form extended colors); those
+                // dispatch as a self-contained group, while plain numeric
+                // parts run through the legacy path with lookahead for
+                // `38;5;N` / `38;2;R;G;B` payloads. Empty parts default
+                // to 0 (reset) per the CSI spec.
+                let parts: Vec<&str> = if body.is_empty() {
+                    vec![""]
                 } else {
-                    params.iter().map(|slot| slot.unwrap_or(0) as u16).collect()
+                    body.split(';').collect()
                 };
+                let leads: Vec<u16> = parts
+                    .iter()
+                    .map(|part| sgr_value(part.split(':').next().unwrap_or("")))
+                    .collect();
                 let mut index = 0;
-                while index < params.len() {
-                    let consumed = self
-                        .current_style
-                        .apply_sgr(params[index], &params[index + 1..]);
-                    index += 1 + consumed;
+                while index < parts.len() {
+                    if parts[index].contains(':') {
+                        let subs: Vec<u16> =
+                            parts[index].split(':').skip(1).map(sgr_value).collect();
+                        self.current_style.apply_sgr_colon(leads[index], &subs);
+                        index += 1;
+                    } else {
+                        let consumed = self
+                            .current_style
+                            .apply_sgr(leads[index], &leads[index + 1..]);
+                        index += 1 + consumed;
+                    }
                 }
                 // Keep the alt-screen's fill cell in sync so subsequent
                 // erase / scroll / insert / delete operations paint blank
@@ -2217,6 +2230,18 @@ fn parse_osc_palette_query(payload: &str, terminator: OscTerminator) -> Option<V
 // sub-params) stay `None` and pick up each control's default.
 const CSI_PARAM_MAX: usize = 65_535;
 
+// A single SGR value: empty → 0 (the CSI default), non-numeric → 0
+// (matching the old flatten behavior for garbage), clamped like every
+// other CSI parameter.
+fn sgr_value(text: &str) -> u16 {
+    if text.is_empty() {
+        return 0;
+    }
+    text.parse::<usize>()
+        .map(|value| value.min(CSI_PARAM_MAX) as u16)
+        .unwrap_or(0)
+}
+
 fn parse_params(body: &str) -> Vec<Option<usize>> {
     if body.is_empty() {
         return Vec::new();
@@ -3685,5 +3710,90 @@ mod tests {
                 cell.ch,
             );
         }
+    }
+
+    #[test]
+    fn colon_underline_subparams_do_not_reset_style() {
+        // kitty-style underline (ISO 8613-6 colon subparameters):
+        // `CSI 4:3m` = curly underline on, `CSI 4:0m` = underline off.
+        // A parser that can't read colon parts must drop them as a
+        // unit — flattening them to SGR 0 nukes the whole style.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[31mred \x1b[4:3mcurly\x1b[4:0moff");
+
+        let cells = ingest.render_cells(&pane);
+        let text: String = cells[0].iter().map(|cell| cell.ch).collect();
+        assert_eq!(text, "red curlyoff");
+        for cell in cells[0].iter().skip(4).take(5) {
+            assert_eq!(
+                cell.style.fg,
+                Color::Indexed(1),
+                "4:3 must not reset the foreground on {:?}",
+                cell.ch,
+            );
+            assert!(
+                cell.style.attrs.underline,
+                "4:3 is an underline style; {:?} should be underlined",
+                cell.ch,
+            );
+        }
+        for cell in cells[0].iter().skip(9).take(3) {
+            assert!(
+                !cell.style.attrs.underline,
+                "4:0 clears the underline; {:?} kept it",
+                cell.ch,
+            );
+            assert_eq!(cell.style.fg, Color::Indexed(1));
+        }
+    }
+
+    #[test]
+    fn underline_color_sgr_is_consumed_without_side_effects() {
+        // SGR 58 (underline color) isn't tracked, but its payload must
+        // be consumed: `58;2;10;20;30` misread param-by-param turns 2
+        // into "dim" and 30 into "black foreground".
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[31m\x1b[58;2;10;20;30mx\x1b[58:5:7my");
+
+        let cells = ingest.render_cells(&pane);
+        let x = &cells[0][0];
+        assert_eq!(x.ch, 'x');
+        assert_eq!(x.style.fg, Color::Indexed(1), "58;2;R;G;B payload leaked");
+        assert!(!x.style.attrs.dim, "58's `2` payload was misread as dim");
+        let y = &cells[0][1];
+        assert_eq!(y.ch, 'y');
+        assert_eq!(y.style.fg, Color::Indexed(1), "58:5:N reset the style");
+    }
+
+    #[test]
+    fn colon_form_extended_colors_match_semicolon_forms() {
+        let mut semi_pane = Pane::new("shell", 64, 4);
+        let mut semi = TerminalIngest::default();
+        semi.ingest_bytes(
+            &mut semi_pane,
+            b"\x1b[38;5;196ma\x1b[0m\x1b[38;2;10;20;30mb",
+        );
+
+        let mut colon_pane = Pane::new("shell", 64, 4);
+        let mut colon = TerminalIngest::default();
+        colon.ingest_bytes(
+            &mut colon_pane,
+            b"\x1b[38:5:196ma\x1b[0m\x1b[38:2:10:20:30mb",
+        );
+
+        let semi_cells = semi.render_cells(&semi_pane);
+        let colon_cells = colon.render_cells(&colon_pane);
+        assert_eq!(
+            semi_cells[0][0].style, colon_cells[0][0].style,
+            "38:5:N should match 38;5;N",
+        );
+        assert_eq!(
+            semi_cells[0][1].style, colon_cells[0][1].style,
+            "38:2:R:G:B should match 38;2;R;G;B",
+        );
     }
 }
