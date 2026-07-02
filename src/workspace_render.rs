@@ -38,7 +38,22 @@ pub(crate) fn stamp_row_text(row: &mut [Cell], start: usize, end: usize, text: &
         if cursor >= row.len() || cursor >= end {
             break;
         }
-        row[cursor] = Cell::styled(ch, style.clone());
+        // Defense in depth: every real pane's PTY output is parsed by
+        // the VT100 state machine in terminal.rs before it ever becomes
+        // a Cell, which strips control chars out of the printable
+        // stream. Text stamped here (status bar label/clock, pane
+        // headers, rename/command-prompt overlays) bypasses that parser
+        // entirely and writes straight into cells - so a control char
+        // that reaches this function (an ESC starting a raw escape
+        // sequence, a NUL, etc.) would otherwise ride straight through
+        // to `style::serialize_row` and out to a client's real
+        // terminal. Callers are expected to validate their inputs
+        // upstream too (see validate_session_name), but replacing
+        // control chars with a space here means no current or future
+        // text source reaching this shared choke point can inject
+        // escape sequences into another client's screen.
+        let safe_ch = if ch.is_control() { ' ' } else { ch };
+        row[cursor] = Cell::styled(safe_ch, style.clone());
         cursor += 1;
     }
 }

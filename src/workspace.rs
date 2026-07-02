@@ -3405,6 +3405,23 @@ mod tests {
     }
 
     #[test]
+    fn stamp_text_replaces_control_characters_with_a_space() {
+        // Defense in depth for the shared stamp_row_text choke point:
+        // text stamped into cells here (status bar label/clock, pane
+        // headers, rename/command-prompt overlays) bypasses the VT100
+        // parser that normally strips control chars out of real pane
+        // output before it becomes a Cell. A control char that reaches
+        // this function - e.g. an ESC starting a raw escape sequence
+        // smuggled in via an injected session name - must never ride
+        // through to a rendered cell verbatim.
+        let mut frame = vec![vec![Cell::BLANK; 4]];
+        stamp_text(&mut frame, 0, 0, 4, "a\x1bb", Style::DEFAULT);
+
+        let rendered: String = frame.remove(0).iter().map(|cell| cell.ch).collect();
+        assert_eq!(rendered, "a b ");
+    }
+
+    #[test]
     fn cursor_screen_position_maps_active_pane_and_hides_for_overlays() {
         // The attached client paints the host cursor wherever this
         // says; None means "keep it hidden". A fresh pane's cursor sits

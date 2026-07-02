@@ -1833,10 +1833,20 @@ fn session_socket_path(name: &str) -> PathBuf {
 }
 
 fn validate_session_name(name: &str) -> io::Result<()> {
-    if name.is_empty() || name.contains('/') || name.contains('\0') {
+    // char::is_control() covers C0 (0x00-0x1F, including '\0' and
+    // '\n'/'\r'), DEL (0x7F), and C1 (0x80-0x9F) controls - a superset
+    // of the old explicit '\0' check. The session name ends up in the
+    // socket filename (session_socket_path) and, via the status bar's
+    // "name@host" label, directly in another client's rendered
+    // terminal (see stamp_row_text's own control-char filtering for
+    // the defense-in-depth half of this fix); rejecting control chars
+    // here stops both a malformed socket path and an escape-sequence
+    // injection at the source instead of relying only on the
+    // downstream filter.
+    if name.is_empty() || name.contains('/') || name.chars().any(char::is_control) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "session names must be non-empty and cannot contain '/'",
+            "session names must be non-empty and cannot contain '/' or control characters",
         ));
     }
     Ok(())
@@ -2151,7 +2161,7 @@ pub fn print_session_list_verbose(
 mod tests {
     use super::{
         AttachInput, PrefixKeyParser, coalesce_resizes, is_dead_client_write_error,
-        print_session_list, send_server_message,
+        print_session_list, send_server_message, validate_session_name,
     };
     use crate::protocol::{ClientMessage, ServerMessage};
     use crate::pty::PtySize;
@@ -2496,5 +2506,37 @@ mod tests {
     #[test]
     fn coalesce_resizes_handles_an_empty_batch() {
         assert_eq!(coalesce_resizes(Vec::new()), Vec::new());
+    }
+
+    #[test]
+    fn validate_session_name_accepts_ordinary_names() {
+        assert!(validate_session_name("work").is_ok());
+        assert!(validate_session_name("my-session_2").is_ok());
+    }
+
+    #[test]
+    fn validate_session_name_rejects_empty_and_slash() {
+        assert!(validate_session_name("").is_err());
+        assert!(validate_session_name("a/b").is_err());
+    }
+
+    #[test]
+    fn validate_session_name_rejects_control_characters() {
+        // NUL (the original check), plus other C0 controls, DEL, and an
+        // escape sequence a hostile name could use to try to inject
+        // terminal control codes into another attached client's screen
+        // via the status bar label ("name@host").
+        assert!(validate_session_name("evil\0name").is_err(), "NUL");
+        assert!(validate_session_name("evil\nname").is_err(), "newline");
+        assert!(
+            validate_session_name("evil\rname").is_err(),
+            "carriage return"
+        );
+        assert!(validate_session_name("evil\tname").is_err(), "tab");
+        assert!(
+            validate_session_name("evil\x1b[31mname").is_err(),
+            "ESC/CSI"
+        );
+        assert!(validate_session_name("evil\x7fname").is_err(), "DEL");
     }
 }
