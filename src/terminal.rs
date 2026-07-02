@@ -1975,7 +1975,10 @@ impl AlternateScreen {
         if self.cursor_row == self.scroll_top {
             self.scroll_down_within_region(1);
         } else {
-            self.cursor_row -= 1;
+            // saturating: DECSTBM homes the cursor to (0, 0), so a
+            // region with top > 0 leaves the cursor above scroll_top
+            // and RI from row 0 would underflow here.
+            self.cursor_row = self.cursor_row.saturating_sub(1);
         }
     }
 
@@ -4071,6 +4074,27 @@ mod tests {
             ingest.render_lines(&pane),
             vec!["aa", "bb", "cc", "dd", "ee"],
             "NEL away from any margin must not mutate content",
+        );
+    }
+
+    #[test]
+    fn alt_screen_ri_above_the_region_top_does_not_underflow() {
+        // DECSTBM parks the cursor at (0, 0), so a region whose top
+        // margin isn't row 0 leaves the cursor sitting ABOVE
+        // scroll_top. RI from there takes the "not at the margin"
+        // branch, and a bare `cursor_row -= 1` underflows: panic in
+        // debug builds, a usize wrap (and out-of-bounds row index on
+        // the next write) in release. The cursor must clamp at row 0
+        // like every other vertical move.
+        let mut pane = Pane::new("shell", 32, 8);
+        let mut ingest = TerminalIngest::new(PtySize::new(8, 32));
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b[3;6r\x1bM\x1bMx");
+
+        let cells = ingest.render_cells(&pane);
+        assert_eq!(
+            cells[0][0].ch, 'x',
+            "RI above the region top clamps at row 0",
         );
     }
 }
