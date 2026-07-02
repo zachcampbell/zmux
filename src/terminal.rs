@@ -157,12 +157,24 @@ enum ParseState {
     #[default]
     Ground,
     Escape,
+    // `ESC #` (DECDHL / DECSWL / DECDWL / DECALN): a single private
+    // byte follows and zmux doesn't model any of the five variants,
+    // so this state exists purely to eat that one byte instead of
+    // letting it fall through to Ground and print literally.
+    EscapeHash,
     Charset,
     Csi,
     Osc,
     OscEscape,
-    Dcs,
-    DcsEscape,
+    // Generic "swallow a string up to the String Terminator" state
+    // shared by DCS (`ESC P`), APC (`ESC _`), PM (`ESC ^`), and SOS
+    // (`ESC X`). zmux doesn't interpret any of their payloads (device
+    // control data, kitty graphics protocol blobs, application/
+    // privacy-message strings), so all four get the same treatment:
+    // consume bytes without storing or printing them until ST
+    // (`ESC \`) closes the string.
+    StringSwallow,
+    StringSwallowEscape,
 }
 
 impl TerminalIngest {
@@ -349,6 +361,7 @@ impl TerminalIngest {
             match self.state {
                 ParseState::Ground => self.handle_ground(pane, byte),
                 ParseState::Escape => self.handle_escape(pane, byte),
+                ParseState::EscapeHash => self.handle_escape_hash(byte),
                 ParseState::Charset => self.state = ParseState::Ground,
                 ParseState::Csi => {
                     if let Some(reply) = self.handle_csi(pane, byte) {
@@ -365,8 +378,8 @@ impl TerminalIngest {
                         replies.extend(reply);
                     }
                 }
-                ParseState::Dcs => self.handle_dcs(byte),
-                ParseState::DcsEscape => self.handle_dcs_escape(byte),
+                ParseState::StringSwallow => self.handle_string_swallow(byte),
+                ParseState::StringSwallowEscape => self.handle_string_swallow_escape(byte),
             }
 
             // The CSI handler may have just armed Synchronized Output
@@ -585,7 +598,17 @@ impl TerminalIngest {
 
         match byte {
             b'\x1b' => self.state = ParseState::Escape,
-            b'\n' => self.handle_newline(pane),
+            // VT (0x0B) and FF (0x0C): real terminals treat both as a
+            // linefeed rather than dropping them (there's no glyph for
+            // either). Routing them into the exact same handler as `\n`
+            // means they inherit whatever this parser's `\n` already
+            // does for the active screen — CR+IND on primary,
+            // column-preserving IND on the alt screen (see
+            // `primary_linefeed` / `AlternateScreen::linefeed`) —
+            // instead of needing their own copy of that logic.
+            // `printf`'s `\v`/`\f` and stray form-feeds from piped
+            // output hit this.
+            b'\n' | b'\x0b' | b'\x0c' => self.handle_newline(pane),
             b'\r' => self.handle_carriage_return(pane),
             b'\x08' => self.handle_backspace(pane),
             b'\t' => self.handle_tab(pane),
@@ -615,7 +638,25 @@ impl TerminalIngest {
                 self.osc_overflow = false;
                 ParseState::Osc
             }
-            b'P' => ParseState::Dcs,
+            // DCS (`ESC P`), APC (`ESC _`), PM (`ESC ^`), SOS (`ESC X`):
+            // all four introduce a string that runs to the String
+            // Terminator (`ESC \`). zmux doesn't interpret any of their
+            // payloads, so all four route into the same swallow state.
+            // Before this arm existed, only DCS was caught here — APC/
+            // PM/SOS fell through to the wildcard below and landed in
+            // Ground, so the string BODY was parsed as plain text and
+            // printed to the screen. That's a real-world problem: kitty's
+            // graphics protocol opens an APC with a base64-encoded image
+            // payload that can run tens of KB, and notcurses/chafa probe
+            // it the same way, so every terminal-capability probe from
+            // those tools used to spray a garbage blob onto the pane.
+            b'P' | b'_' | b'^' | b'X' => ParseState::StringSwallow,
+            // `ESC #`: DECDHL (`3`/`4`), DECSWL (`5`), DECDWL (`6`), and
+            // DECALN (`8`, screen-alignment test) all follow with a
+            // single byte. zmux models none of them; EscapeHash just
+            // eats that one byte so it doesn't fall through to Ground
+            // and print literally (e.g. `ESC # 8` printing a stray "8").
+            b'#' => ParseState::EscapeHash,
             b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => ParseState::Charset,
             b'7' => {
                 // DECSC: stash (row, col) + pen so the next `ESC 8` can
@@ -694,6 +735,27 @@ impl TerminalIngest {
             Some(b'!') => Some(b'!'),
             _ => None,
         };
+        // `s` / `u` / `m` below are the unmarked-final-byte sequences
+        // SCOSC / DECRC / SGR — but those same final bytes also close
+        // marked sequences this parser doesn't implement: the kitty
+        // keyboard protocol's push/pop/query (`CSI > 1 u`, `CSI < u`,
+        // `CSI ? u`) and xterm's modifyOtherKeys query/set (`CSI > 4 m`,
+        // `CSI > 4 ; 2 m`). Every one of those leads with a private
+        // marker byte (`<`, `=`, `>`, `?`) that plain SCOSC/DECRC/SGR
+        // never carry. `prefix` above only tracks the three markers
+        // this parser gives other meaning to elsewhere (`?`, `>`, `!`),
+        // so check the raw lead byte here instead — that also catches
+        // `<` and `=`, which `prefix` doesn't. Without this guard,
+        // kitty's probes fall through to DECRC and teleport the cursor
+        // mid-redraw (fatal on the alt screen, since Claude Code sends
+        // these at startup), and modifyOtherKeys falls through to SGR
+        // and turns on underline for everything printed afterwards.
+        // zmux implements none of these marked protocols, so the
+        // correct behavior for the marked forms is exactly what falls
+        // out of leaving them to the catch-all `_ => {}` below: no
+        // state change, no reply — apps fall back correctly when an
+        // unsupported probe goes unanswered.
+        let has_private_marker = matches!(buffer.first(), Some(b'<' | b'=' | b'>' | b'?'));
         let body_with_intermediate = if prefix.is_some() {
             &buffer[1..]
         } else {
@@ -718,7 +780,7 @@ impl TerminalIngest {
         let params = parse_params(body);
 
         match final_byte {
-            b'm' => {
+            b'm' if !has_private_marker => {
                 // SGR: update the running style so subsequent chars are
                 // written with the correct color / attributes. Each
                 // ';'-separated part may carry ':' subparameters (kitty
@@ -755,8 +817,8 @@ impl TerminalIngest {
                 // cells with the current background.
                 self.alternate.set_fill_style(self.current_style.clone());
             }
-            b's' => self.save_cursor_state(pane),
-            b'u' => self.restore_cursor_state(pane),
+            b's' if !has_private_marker => self.save_cursor_state(pane),
+            b'u' if !has_private_marker => self.restore_cursor_state(pane),
             b'H' | b'f' => {
                 let row = params.first().and_then(|value| *value).unwrap_or(1);
                 let col = params.get(1).and_then(|value| *value).unwrap_or(1);
@@ -1608,18 +1670,33 @@ impl TerminalIngest {
         reply
     }
 
-    fn handle_dcs(&mut self, byte: u8) {
+    // Shared swallow loop for DCS/APC/PM/SOS (see the `ParseState`
+    // variant doc). No buffer, no cap needed: unlike OSC (which has to
+    // hold onto its payload to dispatch title/hyperlink/palette-query
+    // actions) these four are consumed and thrown away byte-by-byte, so
+    // there's nothing here that can grow unbounded the way an
+    // unterminated OSC's stored buffer could.
+    fn handle_string_swallow(&mut self, byte: u8) {
         self.state = match byte {
-            b'\x1b' => ParseState::DcsEscape,
-            _ => ParseState::Dcs,
+            b'\x1b' => ParseState::StringSwallowEscape,
+            _ => ParseState::StringSwallow,
         };
     }
 
-    fn handle_dcs_escape(&mut self, byte: u8) {
+    fn handle_string_swallow_escape(&mut self, byte: u8) {
         self.state = match byte {
             b'\\' => ParseState::Ground,
-            _ => ParseState::Dcs,
+            _ => ParseState::StringSwallow,
         };
+    }
+
+    // `ESC #` DEC private single-byte sequences (DECDHL/DECSWL/DECDWL/
+    // DECALN). zmux doesn't model line-height/width attributes or the
+    // DECALN screen-alignment fill, so the following byte is simply
+    // discarded — the point of this state is only to keep it from
+    // falling through to Ground and printing as a stray character.
+    fn handle_escape_hash(&mut self, _byte: u8) {
+        self.state = ParseState::Ground;
     }
 
     fn handle_newline(&mut self, pane: &mut Pane) {
@@ -3825,6 +3902,171 @@ mod tests {
         ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b(B\x1bPzz\x1b\\ok");
 
         assert_eq!(ingest.render_lines(&pane)[0], "ok");
+    }
+
+    #[test]
+    fn apc_pm_sos_strings_do_not_leak_bytes_into_the_screen() {
+        // Kitty's graphics protocol opens an APC (`ESC _`) with a
+        // base64-encoded image payload and closes it with ST (`ESC \`);
+        // notcurses and chafa probe capabilities the same way. PM
+        // (`ESC ^`) and SOS (`ESC X`) are the same shape. Before routing
+        // all three into the DCS-style swallow state, they fell through
+        // to Ground and the payload printed as literal garbage. Mirrors
+        // `dcs_and_charset_sequences_do_not_leak_bytes_into_the_screen`
+        // above.
+        let mut pane = Pane::new("shell", 32, 5);
+        let mut ingest = TerminalIngest::new(PtySize::new(5, 32));
+
+        ingest.ingest_bytes(&mut pane, b"\x1b_Gf=100,a=T;aGVsbG8gd29ybGQ=\x1b\\ok");
+        assert_eq!(
+            ingest.render_lines(&pane)[0],
+            "ok",
+            "APC payload must not print, and parsing must resume normally after ST",
+        );
+
+        let mut pane = Pane::new("shell", 32, 5);
+        let mut ingest = TerminalIngest::new(PtySize::new(5, 32));
+        ingest.ingest_bytes(&mut pane, b"\x1b^privacy message\x1b\\pm");
+        assert_eq!(ingest.render_lines(&pane)[0], "pm");
+
+        let mut pane = Pane::new("shell", 32, 5);
+        let mut ingest = TerminalIngest::new(PtySize::new(5, 32));
+        ingest.ingest_bytes(&mut pane, b"\x1bXsos body\x1b\\sos");
+        assert_eq!(ingest.render_lines(&pane)[0], "sos");
+    }
+
+    #[test]
+    fn escape_hash_sequences_swallow_their_argument_byte() {
+        // `ESC #` (DECDHL/DECSWL/DECDWL/DECALN) takes exactly one more
+        // byte. Before EscapeHash existed, `#` fell through to the
+        // wildcard arm straight to Ground, so the following byte (e.g.
+        // the `8` in DECALN's screen-alignment test `ESC # 8`) printed
+        // as a stray character instead of being consumed as part of the
+        // sequence.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 16));
+
+        ingest.ingest_bytes(&mut pane, b"\x1b#8ok");
+
+        assert_eq!(
+            ingest.render_lines(&pane)[0],
+            "ok",
+            "the '8' argument byte of ESC # 8 must not print",
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_protocol_csi_u_does_not_restore_cursor_on_alt_screen() {
+        // Kitty keyboard protocol push/pop/query (`CSI > Ps u`,
+        // `CSI < u`, `CSI ? u`) share the `u` final byte with DECRC
+        // (`CSI u`). Claude Code probes these at startup. Before the
+        // private-marker guard, they fell through to
+        // restore_cursor_state and teleported the cursor to the alt
+        // screen's saved position (which defaults to (0, 0) any time
+        // nothing has explicitly saved it, e.g. right after 1049 entry)
+        // — corrupting an in-progress redraw.
+        let mut pane = Pane::new("shell", 40, 10);
+        let mut ingest = TerminalIngest::new(PtySize::new(10, 40));
+
+        // Enter the alt screen and move well away from (0, 0), which is
+        // where the (unset) saved cursor still points.
+        ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b[5;10H");
+        assert_eq!(ingest.screen_cursor(&pane), Some((4, 9)));
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[>1u");
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((4, 9)),
+            "CSI > 1 u (kitty push) must not restore the cursor",
+        );
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[<u");
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((4, 9)),
+            "CSI < u (kitty pop) must not restore the cursor",
+        );
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[?u");
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((4, 9)),
+            "CSI ? u (kitty query) must not restore the cursor",
+        );
+
+        // A following redraw write lands exactly where it was left,
+        // confirming the parser's own state wasn't corrupted either.
+        ingest.ingest_bytes(&mut pane, b"X");
+        let cells = ingest.render_cells(&pane);
+        assert_eq!(cells[4][9].ch, 'X');
+
+        // Plain DECRC (no private marker) still works.
+        ingest.ingest_bytes(&mut pane, b"\x1b[u");
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((0, 0)),
+            "unmarked CSI u must still restore the (default) saved cursor",
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_csi_m_does_not_touch_sgr_pen() {
+        // xterm modifyOtherKeys query/set (`CSI > 4 m`, `CSI > 4 ; 2 m`)
+        // share the `m` final byte with SGR. Before the private-marker
+        // guard, `CSI > 4 ; 2 m` fell through to the SGR arm and applied
+        // SGR 4 (underline) to every subsequent character — a live
+        // source of "everything underlined" bug reports.
+        let mut pane = Pane::new("shell", 40, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 40));
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[>4;2ma");
+        let cells = ingest.render_cells(&pane);
+        assert!(
+            !cells[0][0].style.attrs.underline,
+            "CSI > 4 ; 2 m must not touch the SGR pen",
+        );
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[>4mb");
+        let cells = ingest.render_cells(&pane);
+        assert!(
+            !cells[0][1].style.attrs.underline,
+            "CSI > 4 m must not touch the SGR pen",
+        );
+
+        // Plain SGR (no private marker) still works.
+        ingest.ingest_bytes(&mut pane, b"\x1b[4mc");
+        let cells = ingest.render_cells(&pane);
+        assert!(
+            cells[0][2].style.attrs.underline,
+            "plain CSI 4 m must still enable underline",
+        );
+    }
+
+    #[test]
+    fn vt_and_ff_act_as_newline() {
+        // VT (0x0B) and FF (0x0C) have no glyph; real terminals treat
+        // both as a linefeed rather than dropping them. Before this
+        // fix, handle_ground had no arm for either byte and both were
+        // silently swallowed with no cursor movement at all — a
+        // `printf 'one\x0btwo'` stream would land as "onetwo" glued on
+        // one line. Routed into the exact same handler as `\n`, so on
+        // the primary screen they inherit `\n`'s existing CR+IND
+        // behavior here (see `primary_linefeed`).
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 16));
+
+        ingest.ingest_bytes(&mut pane, b"one\x0btwo");
+        let rendered = ingest.render_lines(&pane);
+        assert_eq!(rendered[0], "one");
+        assert_eq!(rendered[1], "two", "VT (0x0B) must drop to the next line");
+
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 16));
+
+        ingest.ingest_bytes(&mut pane, b"abc\x0cxyz");
+        let rendered = ingest.render_lines(&pane);
+        assert_eq!(rendered[0], "abc");
+        assert_eq!(rendered[1], "xyz", "FF (0x0C) must drop to the next line");
     }
 
     #[test]
