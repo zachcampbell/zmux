@@ -441,6 +441,16 @@ impl TerminalIngest {
             .collect()
     }
 
+    // Cell-level counterpart to `primary_grid_text`: same rows, styled.
+    // Used by `Session::snapshot_scrollback_cells` so MCP `read_pane`'s
+    // `strip_ansi=false` scrollback mode can re-serialize real SGR
+    // instead of the plain-char passthrough. Wide-char continuation
+    // sentinels are left in place — `style::serialize_row` already
+    // skips them, matching `primary_grid_text`'s filter.
+    pub fn primary_grid_cells(&self) -> Vec<Vec<Cell>> {
+        self.primary_grid.clone()
+    }
+
     // Cells in the cursor's current grid row — NOT the bottom of
     // the live area. After a CUU this lands on a previously-painted
     // row; callers wanting the bottom should use `primary_grid.last()`.
@@ -464,32 +474,46 @@ impl TerminalIngest {
         }
     }
 
-    pub fn render_lines(&self, pane: &Pane) -> Vec<String> {
-        let mut lines: Vec<String> = self
-            .render_cells(pane)
-            .iter()
-            .map(|row| {
-                // Produce a plain-text rendering (no ANSI escapes) — this
-                // is what older tests inspect. Trim trailing blank cells
-                // so the strings match the pre-cell behavior. Skip the
-                // '\0' continuation sentinel that follows a wide char so
-                // the text output matches what a human would see.
-                let trimmed_end = row
-                    .iter()
-                    .rposition(|cell| *cell != Cell::BLANK)
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                row[..trimmed_end]
-                    .iter()
-                    .filter(|c| c.ch != '\0')
-                    .map(|c| c.ch)
-                    .collect()
-            })
-            .collect();
-        while lines.last().is_some_and(|line| line.is_empty()) {
-            lines.pop();
+    // Cell-level counterpart to `render_lines`: same viewport rows and
+    // trimming rules, but the cells keep their SGR style instead of
+    // being collapsed to chars. Shared by `render_lines` (which
+    // collapses the result to plain text) and MCP `read_pane`'s
+    // `strip_ansi=false` path (which re-serializes it through
+    // `style::serialize_row`) so both representations describe
+    // exactly the same visible region.
+    //
+    // Trims trailing blank cells per row (a cell equal to `Cell::BLANK`
+    // — a plain space with default style; a styled blank, e.g. a
+    // painted background, is kept) and drops trailing rows that carry
+    // no visible character, mirroring the pre-cell text behavior.
+    pub fn render_visible_cells(&self, pane: &Pane) -> Vec<Vec<Cell>> {
+        let mut rows = self.render_cells(pane);
+        for row in &mut rows {
+            let trimmed_end = row
+                .iter()
+                .rposition(|cell| *cell != Cell::BLANK)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            row.truncate(trimmed_end);
         }
-        lines
+        while rows
+            .last()
+            .is_some_and(|row| row.iter().all(|cell| cell.ch == '\0'))
+        {
+            rows.pop();
+        }
+        rows
+    }
+
+    pub fn render_lines(&self, pane: &Pane) -> Vec<String> {
+        // Produce a plain-text rendering (no ANSI escapes) — this is
+        // what older tests inspect. Skip the '\0' continuation
+        // sentinel that follows a wide char so the text output matches
+        // what a human would see.
+        self.render_visible_cells(pane)
+            .iter()
+            .map(|row| row.iter().filter(|c| c.ch != '\0').map(|c| c.ch).collect())
+            .collect()
     }
 
     // Cell-level rendering used by the workspace compositor so it can

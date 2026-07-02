@@ -1821,6 +1821,14 @@ impl Workspace {
             .map(|managed| managed.session.snapshot_visible_lines())
     }
 
+    /// Cell-level counterpart to `snapshot_visible_lines`, styled. See
+    /// MCP `read_pane`'s `strip_ansi=false` path.
+    pub fn snapshot_visible_cells(&self, pane_id: u32) -> Option<Vec<Vec<Cell>>> {
+        let target: PaneId = pane_id as PaneId;
+        self.session_for(target)
+            .map(|managed| managed.session.snapshot_visible_cells())
+    }
+
     /// Non-mutating tail-of-scrollback snapshot, spanning the pane's
     /// scrollback plus the live primary grid. See `snapshot_visible_lines`
     /// for the rationale.
@@ -1828,6 +1836,14 @@ impl Workspace {
         let target: PaneId = pane_id as PaneId;
         self.session_for(target)
             .map(|managed| managed.session.snapshot_scrollback_lines(lines))
+    }
+
+    /// Cell-level counterpart to `snapshot_scrollback_lines`, styled.
+    /// See MCP `read_pane`'s `strip_ansi=false` path.
+    pub fn snapshot_scrollback_cells(&self, pane_id: u32, lines: usize) -> Option<Vec<Vec<Cell>>> {
+        let target: PaneId = pane_id as PaneId;
+        self.session_for(target)
+            .map(|managed| managed.session.snapshot_scrollback_cells(lines))
     }
 
     /// Cursor-based raw-output transcript slice for the named pane.

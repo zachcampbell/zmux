@@ -214,7 +214,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "read_pane",
-            "description": "Read a snapshot of a pane's rendered text. `mode` chooses \"visible\" (the current viewport, default) or \"scrollback\" (up to `lines` of recent history). `lines` defaults to 200; `strip_ansi` (default false) post-processes the lines through the ANSI-stripping helper. Returns `{ text, cursor_at_bottom }` where `text` is newline-joined and `cursor_at_bottom` reports whether the viewport is pinned to the latest output.",
+            "description": "Read a snapshot of a pane's rendered text. `mode` chooses \"visible\" (the current viewport, default) or \"scrollback\" (up to `lines` of recent history). `lines` defaults to 200. `strip_ansi` (default false) returns real SGR-styled text — colors and attributes re-serialized as ANSI escape sequences — for both modes; set it to `true` for plain text with escapes stripped. Returns `{ text, cursor_at_bottom }` where `text` is newline-joined and `cursor_at_bottom` reports whether the viewport is pinned to the latest output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

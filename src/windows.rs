@@ -164,6 +164,18 @@ impl WindowSet {
         None
     }
 
+    /// Cross-window non-mutating visible-lines snapshot, styled. Same
+    /// rationale as `snapshot_visible_lines`; covers MCP `read_pane`'s
+    /// `strip_ansi=false` path.
+    pub fn snapshot_visible_cells(&self, pane_id: u32) -> Option<Vec<Vec<crate::style::Cell>>> {
+        for window in self.windows.iter() {
+            if let Some(cells) = window.snapshot_visible_cells(pane_id) {
+                return Some(cells);
+            }
+        }
+        None
+    }
+
     /// Cross-window non-mutating tail-of-scrollback snapshot. Same
     /// rationale as `snapshot_visible_lines`; covers MCP `read_pane`'s
     /// scrollback mode.
@@ -171,6 +183,22 @@ impl WindowSet {
         for window in self.windows.iter() {
             if let Some(snapshot) = window.snapshot_scrollback_lines(pane_id, lines) {
                 return Some(snapshot);
+            }
+        }
+        None
+    }
+
+    /// Cross-window non-mutating tail-of-scrollback snapshot, styled.
+    /// Same rationale as `snapshot_scrollback_lines`; covers MCP
+    /// `read_pane`'s `strip_ansi=false` scrollback mode.
+    pub fn snapshot_scrollback_cells(
+        &self,
+        pane_id: u32,
+        lines: usize,
+    ) -> Option<Vec<Vec<crate::style::Cell>>> {
+        for window in self.windows.iter() {
+            if let Some(cells) = window.snapshot_scrollback_cells(pane_id, lines) {
+                return Some(cells);
             }
         }
         None

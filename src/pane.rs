@@ -208,6 +208,17 @@ impl Pane {
             .collect()
     }
 
+    // Cell-level counterpart to `scrollback_text`: the same tail-of-buffer
+    // slice, but returning the styled cells instead of collapsing them to
+    // plain chars. Scrollback lines are stored as `Cell`s already (see
+    // `ScrollbackBuffer::tail_lines`), so this is a direct passthrough —
+    // no separate raw-byte storage needed. Used by MCP `read_pane`'s
+    // `strip_ansi=false` path so callers asking for real output get real
+    // SGR, not the historical chars-only passthrough.
+    pub fn scrollback_cells(&self, lines: usize) -> Vec<ScrollbackLine> {
+        self.scrollback.tail_lines(lines)
+    }
+
     // VT-capture tap. Attaches a sink that will receive a copy of every
     // raw PTY-byte chunk fed into this pane (see `mirror_capture`).
     // `Session::ingest_available_output` is the actual call site once

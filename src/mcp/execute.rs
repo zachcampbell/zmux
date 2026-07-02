@@ -385,39 +385,64 @@ fn execute_read_pane(
 ) -> Outcome {
     // Non-mutating read: flushing the grid into scrollback would
     // break TUIs that revisit primary-grid rows with CUU/CHA.
-    let lines_vec_opt = match mode {
-        ReadMode::Visible => windows.snapshot_visible_lines(pane_id),
-        ReadMode::Scrollback => windows.snapshot_scrollback_lines(pane_id, lines as usize),
-    };
-    let lines_vec = match lines_vec_opt {
-        Some(v) => v,
-        None => {
-            return Outcome::Done(
-                McpResponse::Err(format!(
-                    "read_pane: no pane with id {pane_id} in any window"
-                )),
-                false,
-            );
-        }
+    //
+    // strip_ansi=true keeps the historical plain-char snapshot path
+    // (both modes are already escape-free at this point, so
+    // `strip_ansi_inplace` is a no-op today — kept for forward-compat
+    // with a future raw-byte snapshot). strip_ansi=false instead pulls
+    // the same rows as styled `Cell`s and re-serializes them through
+    // `style::serialize_row`, so callers asking for styled output (to
+    // inspect colors/attributes, detect an SGR leak, etc.) get real
+    // SGR instead of plain text. Both `Visible` and `Scrollback` modes
+    // support this: the live grid and scrollback both already store
+    // styled cells (see `pane.rs` / `scrollback.rs`), so no raw-byte
+    // plumbing is needed for either.
+    let text = if strip_ansi {
+        let lines_vec_opt = match mode {
+            ReadMode::Visible => windows.snapshot_visible_lines(pane_id),
+            ReadMode::Scrollback => windows.snapshot_scrollback_lines(pane_id, lines as usize),
+        };
+        let lines_vec = match lines_vec_opt {
+            Some(v) => v,
+            None => {
+                return Outcome::Done(
+                    McpResponse::Err(format!(
+                        "read_pane: no pane with id {pane_id} in any window"
+                    )),
+                    false,
+                );
+            }
+        };
+        lines_vec
+            .into_iter()
+            .map(|line| crate::pane::strip_ansi_inplace(&line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        let cells_opt = match mode {
+            ReadMode::Visible => windows.snapshot_visible_cells(pane_id),
+            ReadMode::Scrollback => windows.snapshot_scrollback_cells(pane_id, lines as usize),
+        };
+        let rows = match cells_opt {
+            Some(v) => v,
+            None => {
+                return Outcome::Done(
+                    McpResponse::Err(format!(
+                        "read_pane: no pane with id {pane_id} in any window"
+                    )),
+                    false,
+                );
+            }
+        };
+        rows.iter()
+            .map(|row| crate::style::serialize_row(row))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     let cursor_at_bottom = windows
         .find_pane_mut(pane_id as usize)
         .map(|p| p.viewport_following_live())
         .unwrap_or(true);
-    // Snapshot helpers already strip wide-char continuation sentinels;
-    // honor the strip_ansi knob for forward-compat with a future raw-byte
-    // snapshot mode. Today's snapshot is escape-free so this is a no-op
-    // when strip_ansi=true and a passthrough when false. Matches the
-    // `Pane::scrollback_text` contract.
-    let lines_vec = if strip_ansi {
-        lines_vec
-            .into_iter()
-            .map(|line| crate::pane::strip_ansi_inplace(&line))
-            .collect()
-    } else {
-        lines_vec
-    };
-    let text = lines_vec.join("\n");
     Outcome::Done(
         McpResponse::Ok(json!({
             "text": text,

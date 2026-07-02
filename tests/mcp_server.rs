@@ -619,6 +619,148 @@ fn read_pane_visible_returns_recent_output_with_strip_ansi() {
 }
 
 #[test]
+fn read_pane_strip_ansi_false_returns_styled_sgr_text() {
+    let name = unique_name("mcp-read-styled");
+    let child = spawn_serve(&name);
+    let spawn = round_trip(
+        &name,
+        json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"spawn_pane","arguments":{
+                "command": "printf '\\033[31mred\\033[0m line\\n'; sleep 5"
+            }}
+        }),
+    );
+    assert_eq!(spawn["result"]["isError"], false, "spawn: {spawn}");
+    let pane_id = spawn["result"]["structuredContent"]["pane_id"]
+        .as_u64()
+        .unwrap() as u32;
+
+    // Wait for the print to actually land in the pane's viewport.
+    thread::sleep(Duration::from_millis(250));
+
+    // strip_ansi=false (the default) must reflect the real cell
+    // styling — a red foreground on "red" — as SGR escapes, not a
+    // plain-text passthrough.
+    let styled = round_trip(
+        &name,
+        json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"read_pane","arguments":{
+                "pane_id": pane_id, "strip_ansi": false, "lines": 5
+            }}
+        }),
+    );
+    assert_eq!(styled["result"]["isError"], false, "read: {styled}");
+    let styled_text = styled["result"]["structuredContent"]["text"]
+        .as_str()
+        .expect("text field");
+    assert!(
+        styled_text.contains("\x1b[31m"),
+        "expected red SGR escape (\\x1b[31m) in styled text, got: {styled_text:?}"
+    );
+    assert!(
+        styled_text.contains("red") && styled_text.contains("line"),
+        "expected visible chars alongside styling, got: {styled_text:?}"
+    );
+
+    // strip_ansi=true must give back plain text with no escape bytes
+    // at all, even though the same cells are styled underneath.
+    let plain = round_trip(
+        &name,
+        json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"read_pane","arguments":{
+                "pane_id": pane_id, "strip_ansi": true, "lines": 5
+            }}
+        }),
+    );
+    assert_eq!(plain["result"]["isError"], false, "read: {plain}");
+    let plain_text = plain["result"]["structuredContent"]["text"]
+        .as_str()
+        .expect("text field");
+    assert!(
+        !plain_text.contains('\u{1b}'),
+        "expected no escape bytes in stripped text, got: {plain_text:?}"
+    );
+    assert!(
+        plain_text.contains("red") && plain_text.contains("line"),
+        "expected visible chars to survive stripping, got: {plain_text:?}"
+    );
+
+    cleanup(&name, child);
+}
+
+#[test]
+fn read_pane_scrollback_strip_ansi_false_returns_styled_sgr_text() {
+    // Scrollback storage already keeps styled `Cell`s (see
+    // scrollback.rs / pane.rs), so mode="scrollback" gets the same
+    // SGR-serialization treatment as mode="visible" — no raw-byte
+    // plumbing needed. Ask for far more lines than the viewport holds
+    // so the composition path pulls the full grid (plus whatever
+    // scrollback history exists) rather than just a tail slice.
+    let name = unique_name("mcp-read-scroll-styled");
+    let child = spawn_serve(&name);
+    let spawn = round_trip(
+        &name,
+        json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"spawn_pane","arguments":{
+                "command": "printf '\\033[31mred\\033[0m line\\n'; sleep 5"
+            }}
+        }),
+    );
+    assert_eq!(spawn["result"]["isError"], false, "spawn: {spawn}");
+    let pane_id = spawn["result"]["structuredContent"]["pane_id"]
+        .as_u64()
+        .unwrap() as u32;
+
+    thread::sleep(Duration::from_millis(250));
+
+    let styled = round_trip(
+        &name,
+        json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"read_pane","arguments":{
+                "pane_id": pane_id, "mode": "scrollback", "strip_ansi": false, "lines": 500
+            }}
+        }),
+    );
+    assert_eq!(styled["result"]["isError"], false, "read: {styled}");
+    let styled_text = styled["result"]["structuredContent"]["text"]
+        .as_str()
+        .expect("text field");
+    assert!(
+        styled_text.contains("\x1b[31m"),
+        "expected red SGR escape (\\x1b[31m) in styled scrollback text, got: {styled_text:?}"
+    );
+    assert!(
+        styled_text.contains("red") && styled_text.contains("line"),
+        "expected visible chars alongside styling, got: {styled_text:?}"
+    );
+
+    let plain = round_trip(
+        &name,
+        json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"read_pane","arguments":{
+                "pane_id": pane_id, "mode": "scrollback", "strip_ansi": true, "lines": 500
+            }}
+        }),
+    );
+    assert_eq!(plain["result"]["isError"], false, "read: {plain}");
+    let plain_text = plain["result"]["structuredContent"]["text"]
+        .as_str()
+        .expect("text field");
+    assert!(
+        !plain_text.contains('\u{1b}'),
+        "expected no escape bytes in stripped scrollback text, got: {plain_text:?}"
+    );
+
+    cleanup(&name, child);
+}
+
+#[test]
 fn read_pane_output_returns_cursor_based_raw_transcript() {
     let name = unique_name("mcp-read-output");
     let child = spawn_serve(&name);

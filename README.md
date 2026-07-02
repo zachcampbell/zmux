@@ -189,7 +189,7 @@ Now Claude Code can call:
 | `spawn_pane` | spawn a new pane running a command (`split`: `"h"`, `"v"`, or `"window"`; window spawns land in the background and do not steal the attached client's view) |
 | `send_keys` | type into a pane (`enter: true` presses Enter; `clear_input` sends Ctrl-U first; `expect_text` waits for a sentinel in settled output) |
 | `wait_pane` | wait for a pane to settle or for `expect_text` without sending input |
-| `read_pane` | read pane text (`mode`: `"visible"` \| `"scrollback"`, optional `strip_ansi`) |
+| `read_pane` | read pane text (`mode`: `"visible"` \| `"scrollback"`); `strip_ansi` defaults to `false`, returning real SGR-styled text for either mode — pass `true` for plain text |
 | `read_pane_output` | cursor-based raw PTY transcript (`max_bytes: 0` returns just the current cursor; `since_byte` reads from a saved cursor) |
 | `kill_pane` | close a pane; if it is the only pane in a non-final window, close that worker window |
 | `set_label` | set the human label (use empty string to clear) |

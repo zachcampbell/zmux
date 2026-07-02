@@ -88,6 +88,19 @@ impl Session {
         self.pane.scrollback_text(viewport, true)
     }
 
+    /// Cell-level counterpart to `snapshot_visible_lines`: identical
+    /// composition and empty-grid fallback, but the cells keep their
+    /// SGR style so MCP `read_pane`'s `strip_ansi=false` path can
+    /// re-serialize real ANSI instead of returning already-plain text.
+    pub fn snapshot_visible_cells(&self) -> Vec<Vec<crate::style::Cell>> {
+        let rendered = self.ingest.render_visible_cells(&self.pane);
+        if !rendered.is_empty() {
+            return rendered;
+        }
+        let viewport = self.pane.viewport_height().max(1);
+        self.pane.scrollback_cells(viewport)
+    }
+
     /// Non-mutating snapshot of `lines` most-recent rows, spanning
     /// scrollback and the live primary grid. The grid contributes its
     /// cell-rows directly (oldest first); any remaining capacity is
@@ -113,6 +126,26 @@ impl Session {
         let want_history = lines - total_grid;
         let mut history = self.pane.scrollback_text(want_history, true);
         history.extend(grid_text);
+        history
+    }
+
+    /// Cell-level counterpart to `snapshot_scrollback_lines`: same
+    /// history-plus-grid composition, but returning styled cells.
+    /// Scrollback and the live grid both already store `Cell`s, so
+    /// this needs no raw-byte plumbing — see MCP `read_pane`'s
+    /// `strip_ansi=false` path.
+    pub fn snapshot_scrollback_cells(&self, lines: usize) -> Vec<Vec<crate::style::Cell>> {
+        let grid_cells = self.ingest.primary_grid_cells();
+        let total_grid = grid_cells.len();
+        if lines == 0 {
+            return Vec::new();
+        }
+        if total_grid >= lines {
+            return grid_cells[total_grid - lines..].to_vec();
+        }
+        let want_history = lines - total_grid;
+        let mut history = self.pane.scrollback_cells(want_history);
+        history.extend(grid_cells);
         history
     }
 

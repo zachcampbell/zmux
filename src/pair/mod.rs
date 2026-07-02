@@ -300,8 +300,26 @@ fn inject_pane_id(target: u32, args_json: &str) -> serde_json::Value {
     v
 }
 
+/// The `read_pane` tool schema handed to the model (`model::tool_schemas`)
+/// advertises `strip_ansi: true` as its default — this chat loop feeds
+/// the tool result straight back to a text-only Ollama model as message
+/// content, which has no business seeing raw SGR bytes. But that default
+/// is just a hint in the schema; function-calling models routinely omit
+/// default-valued arguments, and the real MCP `read_pane` tool's own
+/// default is `false` (styled output, as of the read_pane ANSI fix). So
+/// a model that (correctly, per its schema) omits `strip_ansi` would
+/// silently get ANSI escapes injected into the conversation. Pin the
+/// default explicitly here rather than relying on the model to state it.
+fn inject_read_pane_defaults(name: &str, mut args: serde_json::Value) -> serde_json::Value {
+    if name == "read_pane" && args.get("strip_ansi").is_none() {
+        args["strip_ansi"] = serde_json::json!(true);
+    }
+    args
+}
+
 fn dispatch_tool(session: &str, target: u32, call: &ToolCall) -> String {
     let args = inject_pane_id(target, &call.function.arguments);
+    let args = inject_read_pane_defaults(&call.function.name, args);
     let snap = match Client::connect(session).and_then(|c| c.initialize().map(|_| c)) {
         Ok(c) => c,
         Err(err) => return format!("{{\"error\":\"connect: {err}\"}}"),
@@ -707,5 +725,28 @@ mod tests {
     fn inject_pane_id_recovers_from_invalid_json() {
         let v = super::inject_pane_id(1, "not json");
         assert_eq!(v["pane_id"], 1);
+    }
+
+    #[test]
+    fn inject_read_pane_defaults_fills_in_strip_ansi_when_omitted() {
+        // The model's own tool schema says strip_ansi defaults to
+        // true, but the real MCP tool defaults to false (styled). A
+        // model that omits the field per its schema must still get
+        // plain text back, not raw ANSI mixed into its chat context.
+        let v = super::inject_read_pane_defaults("read_pane", serde_json::json!({"lines": 40}));
+        assert_eq!(v["strip_ansi"], true);
+    }
+
+    #[test]
+    fn inject_read_pane_defaults_respects_explicit_value() {
+        let v =
+            super::inject_read_pane_defaults("read_pane", serde_json::json!({"strip_ansi": false}));
+        assert_eq!(v["strip_ansi"], false);
+    }
+
+    #[test]
+    fn inject_read_pane_defaults_leaves_other_tools_untouched() {
+        let v = super::inject_read_pane_defaults("send_keys", serde_json::json!({"keys": "hi"}));
+        assert!(v.get("strip_ansi").is_none());
     }
 }
