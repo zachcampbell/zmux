@@ -1,6 +1,7 @@
 // Copyright 2026 Zach Campbell
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::HashSet;
 use std::mem;
 
 use crate::mouse::{MouseTrackingMode, ScreenMode};
@@ -122,6 +123,31 @@ pub struct TerminalIngest {
     primary_wrap_pending: bool,
     primary_auto_wrap: bool,
     alternate: AlternateScreen,
+    // Tab-stop table for HT (0x09), HTS (`ESC H`), TBC (`CSI g`), CHT
+    // (`CSI I`) and CBT (`CSI Z`). One table, not one per screen: tab
+    // stops are a property of the terminal's column geometry, which the
+    // primary and alternate screens share (`alternate.cols`) — xterm
+    // does not give the alt screen its own stops either.
+    //
+    // `None` means "no HTS/TBC has ever run" and stops follow the plain
+    // default rule (every 8th column). This is the common case and
+    // costs nothing — no allocation, no per-resize bookkeeping, since
+    // `is_tab_stop` just computes `col % 8 == 0` against whatever width
+    // is current.
+    //
+    // `Some(set)` means the table has been customized and IS the whole
+    // truth from then on, not "defaults plus these extras": HTS
+    // materializes it by seeding the default stops for the current
+    // width and adding the new one, TBC-at-cursor removes a single
+    // entry, and `CSI 3 g` empties the set outright — leaving genuinely
+    // *no* stops, matching xterm rather than reverting to the default
+    // rule. See `is_tab_stop` / `set_tab_stop` / `clear_all_tab_stops`.
+    //
+    // On resize, entries that fall outside the new width are dropped
+    // (a stop past the right edge is meaningless) but everything else —
+    // including the emptied-by-`3g` case — survives, matching "xterm
+    // keeps custom stops" rather than recomputing from scratch.
+    tab_stops: Option<HashSet<usize>>,
     // DECTCEM (`CSI ?25 h/l`): whether the application wants its text
     // cursor shown. One global flag, not per-screen — xterm treats it
     // as a mode, and DECSC/1049 do not save or restore it. The attached
@@ -260,6 +286,7 @@ impl TerminalIngest {
             primary_wrap_pending: false,
             primary_auto_wrap: true,
             alternate: AlternateScreen::new(size.rows as usize, size.cols as usize),
+            tab_stops: None,
             cursor_visible: true,
             alt_saved_pen: Style::DEFAULT,
             current_style: Style::DEFAULT,
@@ -312,6 +339,15 @@ impl TerminalIngest {
             if row.len() > col_cap {
                 row.truncate(col_cap);
             }
+        }
+        // Drop any customized stop that no longer fits — a column past
+        // the new right edge can't be tabbed to. If the table was never
+        // customized (`None`, still on the default-every-8 rule) there's
+        // nothing to do: that rule reads the live width on every lookup,
+        // so it adapts to the resize for free.
+        if let Some(stops) = self.tab_stops.as_mut() {
+            let last_col = col_cap.saturating_sub(1);
+            stops.retain(|&col| col <= last_col);
         }
         let max_row = self.primary_grid.len().saturating_sub(1);
         self.primary_cursor_row = self.primary_cursor_row.min(max_row);
@@ -788,6 +824,16 @@ impl TerminalIngest {
                 }
                 ParseState::Ground
             }
+            b'H' => {
+                // HTS: plant a tab stop at the cursor's current column
+                // on whichever screen is active — see `set_tab_stop`.
+                let col = match pane.screen_mode() {
+                    ScreenMode::Primary => self.primary_cursor_col,
+                    ScreenMode::Alternate => self.alternate.cursor_col,
+                };
+                self.set_tab_stop(col);
+                ParseState::Ground
+            }
             b'c' => {
                 self.hard_reset(pane);
                 ParseState::Ground
@@ -1156,6 +1202,39 @@ impl TerminalIngest {
                 let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
                 self.primary_erase_chars(count);
             }
+            b'I' if prefix.is_none() => {
+                // CHT — Cursor Forward Tabulation. HT repeated N times
+                // (default 1); see `advance_tab_stops`.
+                let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
+                self.advance_tab_stops(pane, count);
+            }
+            b'Z' if prefix.is_none() => {
+                // CBT — Cursor Backward Tabulation. The mirror of CHT,
+                // default 1; see `retreat_tab_stops`.
+                let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
+                self.retreat_tab_stops(pane, count);
+            }
+            b'g' if prefix.is_none() => {
+                // TBC — Tab Clear. Ps 0 (default, no param) clears the
+                // stop at the cursor's current column; Ps 3 empties the
+                // whole table (see `clear_all_tab_stops`). Other Ps
+                // values (1/2/4/5 — DEC's line-tabs variants) don't
+                // apply here since zmux doesn't model per-line tab
+                // stops, so they're silently ignored like every other
+                // unrecognized parameter in this parser.
+                let mode = params.first().and_then(|value| *value).unwrap_or(0);
+                match mode {
+                    0 => {
+                        let col = match pane.screen_mode() {
+                            ScreenMode::Primary => self.primary_cursor_col,
+                            ScreenMode::Alternate => self.alternate.cursor_col,
+                        };
+                        self.clear_tab_stop(col);
+                    }
+                    3 => self.clear_all_tab_stops(),
+                    _ => {}
+                }
+            }
             b'r' => {
                 let top = params.first().and_then(|value| *value).unwrap_or(1);
                 let bottom = params
@@ -1365,6 +1444,10 @@ impl TerminalIngest {
         self.alt_saved_charset = CharsetState::default();
         self.alternate.set_auto_wrap(true);
         self.reset_primary_modes(true);
+        // RIS restores the power-up default tab stops (every 8th
+        // column). Unlike DECSTR below, hard reset is documented to put
+        // *everything* back to its initial state, tabs included.
+        self.tab_stops = None;
         self.cursor_shape = CursorShape::Default;
         self.cursor_visible = true;
         self.last_graphic = None;
@@ -1395,6 +1478,10 @@ impl TerminalIngest {
         // DECSTR also reinvokes the default character sets (G0/G1 ->
         // ASCII, GL -> G0), same as RIS.
         self.charset = CharsetState::default();
+        // Deliberately NOT touched: `tab_stops`. DEC's documented DECSTR
+        // reset list (cursor visibility, insert/replace mode, origin
+        // mode, autowrap, margins, character sets, SGR, saved cursor)
+        // does not include tab stops — only RIS does, in `hard_reset`.
     }
 
     fn reset_primary_modes(&mut self, clear_screen: bool) {
@@ -1851,20 +1938,128 @@ impl TerminalIngest {
         }
     }
 
+    // HT (0x09): move the cursor to the next tab stop, or the last
+    // column if there isn't one ahead. NON-destructive — real HT is a
+    // cursor move, not a fill: it must not write cells (an in-place
+    // redraw over tab-indented text would otherwise blow away whatever
+    // was already there) and must not touch the SGR pen (a tab between
+    // two differently-styled fragments must not repaint the gap).
+    // CHT (`CSI I`) is the same move repeated N times; see
+    // `advance_tab_stops`.
     fn handle_tab(&mut self, pane: &mut Pane) {
-        let spaces = 4;
-        match pane.screen_mode() {
-            ScreenMode::Primary => {
-                for _ in 0..spaces {
-                    self.primary_put_char(pane, ' ');
+        self.advance_tab_stops(pane, 1);
+    }
+
+    // Shared by HT (count=1) and CHT (count=N, `CSI I`): hop the cursor
+    // forward one tab stop at a time. Hopping one-at-a-time (rather than
+    // computing the Nth stop directly) means a stop table with uneven
+    // gaps still lands correctly, and running out of stops before using
+    // up `count` just parks the cursor at the last column (each further
+    // hop is then a no-op — `next_tab_stop` saturates there) instead of
+    // panicking or overshooting.
+    fn advance_tab_stops(&mut self, pane: &mut Pane, count: usize) {
+        let last_col = self.alternate.cols.saturating_sub(1);
+        for _ in 0..count.max(1) {
+            match pane.screen_mode() {
+                ScreenMode::Primary => {
+                    let next = self.next_tab_stop(self.primary_cursor_col, last_col);
+                    self.primary_wrap_pending = false;
+                    self.primary_cursor_col = next;
                 }
-            }
-            ScreenMode::Alternate => {
-                for _ in 0..spaces {
-                    self.alternate.put_char(' ', self.current_style.clone());
+                ScreenMode::Alternate => {
+                    let next = self.next_tab_stop(self.alternate.cursor_col, last_col);
+                    self.alternate.horizontal_absolute(next);
                 }
             }
         }
+    }
+
+    // CBT (`CSI Z`, count=N): the backward mirror of `advance_tab_stops`.
+    // No control code drives this with count=1 (there's no "bare CBT"
+    // control character), only the CSI form, but the loop shape matches
+    // for the same reasons — hop one stop at a time, saturate at column 0.
+    fn retreat_tab_stops(&mut self, pane: &mut Pane, count: usize) {
+        for _ in 0..count.max(1) {
+            match pane.screen_mode() {
+                ScreenMode::Primary => {
+                    let prev = self.previous_tab_stop(self.primary_cursor_col);
+                    self.primary_wrap_pending = false;
+                    self.primary_cursor_col = prev;
+                }
+                ScreenMode::Alternate => {
+                    let prev = self.previous_tab_stop(self.alternate.cursor_col);
+                    self.alternate.horizontal_absolute(prev);
+                }
+            }
+        }
+    }
+
+    // True if `col` is a tab stop. Customized tables (`Some`) answer
+    // directly from the explicit set; the uncustomized default table
+    // (`None`) has a stop at every 8th column (8, 16, 24, ...) — column
+    // 0 is deliberately excluded since both search directions
+    // (`next_tab_stop` / `previous_tab_stop`) only ever look strictly
+    // past the cursor, so a "stop" sitting exactly on it would never be
+    // reachable anyway.
+    fn is_tab_stop(&self, col: usize) -> bool {
+        match &self.tab_stops {
+            Some(stops) => stops.contains(&col),
+            None => col > 0 && col % 8 == 0,
+        }
+    }
+
+    // HT / CHT target: the smallest tab stop strictly right of `col`,
+    // or `last_col` if the table has nothing further out. Matches
+    // xterm, which drives the cursor to the right edge rather than
+    // leaving it in place once it runs out of stops.
+    fn next_tab_stop(&self, col: usize, last_col: usize) -> usize {
+        ((col + 1)..=last_col)
+            .find(|&candidate| self.is_tab_stop(candidate))
+            .unwrap_or(last_col)
+    }
+
+    // CBT target: the largest tab stop strictly left of `col`, or
+    // column 0 if there isn't one — the mirror image of `next_tab_stop`.
+    fn previous_tab_stop(&self, col: usize) -> usize {
+        (0..col)
+            .rev()
+            .find(|&candidate| self.is_tab_stop(candidate))
+            .unwrap_or(0)
+    }
+
+    // The default rule (every 8th column) materialized into a concrete
+    // set, for the moment a customization (HTS/TBC) needs one to build
+    // on. `last_col` is `cols - 1`; stops run 8, 16, 24, ... up to it.
+    fn default_tab_stops(last_col: usize) -> HashSet<usize> {
+        (8..=last_col).step_by(8).collect()
+    }
+
+    // HTS (`ESC H`): add a stop at `col`. First call materializes the
+    // explicit table (see the `tab_stops` field comment) seeded with the
+    // current defaults, so the new stop joins the ones already implied
+    // rather than replacing them.
+    fn set_tab_stop(&mut self, col: usize) {
+        let last_col = self.alternate.cols.saturating_sub(1);
+        self.tab_stops
+            .get_or_insert_with(|| Self::default_tab_stops(last_col))
+            .insert(col);
+    }
+
+    // TBC `CSI 0 g` (default): clear the stop at `col`. Same
+    // materialize-on-first-use behavior as `set_tab_stop`.
+    fn clear_tab_stop(&mut self, col: usize) {
+        let last_col = self.alternate.cols.saturating_sub(1);
+        self.tab_stops
+            .get_or_insert_with(|| Self::default_tab_stops(last_col))
+            .remove(&col);
+    }
+
+    // TBC `CSI 3 g`: empty the table outright. xterm does not fall back
+    // to the default rule after this — there are genuinely no stops
+    // left, so HT/CHT run all the way to the last column until a new
+    // HTS puts one back. See the `tab_stops` field comment.
+    fn clear_all_tab_stops(&mut self) {
+        self.tab_stops = Some(HashSet::new());
     }
 
     fn handle_printable(&mut self, pane: &mut Pane, ch: char) {
@@ -4869,6 +5064,197 @@ mod tests {
         assert_eq!(
             cells[0][0].ch, 'x',
             "RI above the region top clamps at row 0",
+        );
+    }
+
+    #[test]
+    fn ht_advances_to_the_next_8_column_stop() {
+        // The bug this fixes: `printf 'A\tB\tC\n'` used to render B at
+        // column 5 (write 4 spaces after 'A' at col 0) instead of
+        // xterm's real behavior — a stop every 8 columns.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 32));
+
+        ingest.ingest_bytes(&mut pane, b"A\tB\tC");
+
+        let cells = ingest.render_cells(&pane);
+        assert_eq!(cells[0][0].ch, 'A');
+        assert_eq!(cells[0][8].ch, 'B', "B must land on column 8, not 5");
+        assert_eq!(cells[0][16].ch, 'C', "C must land on column 16, not 10");
+    }
+
+    #[test]
+    fn ht_does_not_erase_or_restyle_the_cells_it_jumps_over() {
+        // Real HT is a cursor move, not a fill. Write red "XY", jump
+        // back to col 0, switch the pen to green, then tab over "XY" —
+        // the cells must survive completely untouched: same chars, same
+        // (red) style, and the row must not even grow (HT writes
+        // nothing, not even blanks, into the cells it skips).
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 32));
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[31mXY\x1b[0m\x1b[1G\x1b[32m\t");
+
+        let cells = ingest.render_cells(&pane);
+        assert_eq!(
+            cells[0].len(),
+            2,
+            "HT must not materialize blank cells under the skipped span"
+        );
+        assert_eq!(cells[0][0].ch, 'X');
+        assert_eq!(cells[0][1].ch, 'Y');
+        assert_eq!(
+            cells[0][0].style.fg,
+            Color::Indexed(1),
+            "the pen active when 'X' was written must survive the tab"
+        );
+        assert_eq!(cells[0][1].style.fg, Color::Indexed(1));
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((0, 8)),
+            "cursor still lands on the tab stop past the untouched text"
+        );
+    }
+
+    #[test]
+    fn hts_plants_a_custom_stop() {
+        // `ESC H` at column 5 adds a stop there; a tab from column 0
+        // must stop at 5 instead of sailing past it to the default
+        // column-8 stop.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 32));
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[6G\x1bH\x1b[1G\t");
+
+        assert_eq!(ingest.screen_cursor(&pane), Some((0, 5)));
+
+        // HTS adds to the defaults rather than replacing them — the
+        // stop at column 8 is still there afterward.
+        ingest.ingest_bytes(&mut pane, b"\t");
+        assert_eq!(ingest.screen_cursor(&pane), Some((0, 8)));
+    }
+
+    #[test]
+    fn tbc_clears_a_default_stop_and_tab_clear_all_leaves_none() {
+        // `CSI g` (Ps 0) clears the stop under the cursor — even an
+        // implicit default one, not just an HTS-added custom one; that
+        // first clear also materializes the explicit table (see
+        // `clear_tab_stop`). `CSI 3 g` then empties it completely:
+        // xterm's documented behavior is that after a clear-all there
+        // are NO stops left at all (not even the defaults), so HT runs
+        // all the way to the last column.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 32));
+
+        // Clear the default stop at column 8, then tab from column 0:
+        // the next surviving default stop is column 16.
+        ingest.ingest_bytes(&mut pane, b"\x1b[9G\x1b[g\x1b[1G\t");
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((0, 16)),
+            "clearing the column-8 stop must not disturb column 16"
+        );
+
+        // Clear-all: from column 0, HT now has nothing to aim for but
+        // the last column (31 in a 32-column terminal).
+        ingest.ingest_bytes(&mut pane, b"\x1b[1G\x1b[3g\t");
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((0, 31)),
+            "CSI 3 g leaves no stops at all, so HT goes to the last column"
+        );
+    }
+
+    #[test]
+    fn cbt_moves_backward_to_the_previous_stop() {
+        // CBT (`CSI Z`) from column 20 must land on column 16, the
+        // nearest default stop strictly to its left.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 40));
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[21G\x1b[Z");
+
+        assert_eq!(ingest.screen_cursor(&pane), Some((0, 16)));
+    }
+
+    #[test]
+    fn tab_stops_work_on_the_alternate_screen() {
+        // HT/HTS use a cursor model entirely separate from the primary
+        // screen's (`alternate.cursor_col` vs. `primary_cursor_col`);
+        // this exercises the same HTS-then-HT round trip as
+        // `hts_plants_a_custom_stop` but with the alt screen active to
+        // make sure both paths are wired up.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 32));
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b[6G\x1bH\x1b[1G\t");
+        assert_eq!(pane.screen_mode(), ScreenMode::Alternate);
+        assert_eq!(ingest.screen_cursor(&pane), Some((0, 5)));
+
+        // The HTS-added stop augments the defaults; the next HT lands
+        // on the still-present column-8 default stop.
+        ingest.ingest_bytes(&mut pane, b"\t");
+        assert_eq!(ingest.screen_cursor(&pane), Some((0, 8)));
+    }
+
+    #[test]
+    fn ht_at_the_last_column_clamps_without_wrapping() {
+        // HT with nowhere left to go must park at the last column and
+        // leave the pending-wrap flag clear — same contract as CUF/CHA
+        // at the right edge. A print right after should land ON that
+        // column, not wrap to a fresh row (which would mean HT left
+        // stale wrap-pending state behind).
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 10));
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[10G\tZ");
+
+        // render_visible_cells trims the trailing blank viewport rows
+        // that render_cells pads in — real wrapping would have produced
+        // a second row with actual content, which trimming wouldn't
+        // remove.
+        let cells = ingest.render_visible_cells(&pane);
+        assert_eq!(
+            cells.len(),
+            1,
+            "HT then print at the last column must not wrap to a new row"
+        );
+        assert_eq!(cells[0][9].ch, 'Z');
+    }
+
+    #[test]
+    fn resize_drops_custom_tab_stops_that_no_longer_fit() {
+        // "xterm keeps custom stops" across a resize, but a stop past
+        // the new right edge is meaningless and must not resurrect if
+        // the terminal widens again later.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 40));
+
+        // HTS at column 5 and column 30. The first HTS call materializes
+        // the explicit table by seeding it with the (then-current)
+        // 40-column defaults — 8, 16, 24, 32 — plus 5; the second adds
+        // 30. So going into the resize the full set is
+        // {5, 8, 16, 24, 30, 32}.
+        ingest.ingest_bytes(&mut pane, b"\x1b[6G\x1bH\x1b[31G\x1bH\x1b[1G");
+
+        ingest.resize(PtySize::new(4, 10));
+
+        // Columns 5 and 8 both fit inside the shrunk 10-column width and
+        // survive; 16/24/30/32 don't. Three tabs from column 0: land on
+        // 5, then 8, then (nothing left) the last column, 9.
+        ingest.ingest_bytes(&mut pane, b"\t");
+        assert_eq!(ingest.screen_cursor(&pane), Some((0, 5)));
+        ingest.ingest_bytes(&mut pane, b"\t");
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((0, 8)),
+            "the default stop at column 8 also survives the shrink"
+        );
+        ingest.ingest_bytes(&mut pane, b"\t");
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((0, 9)),
+            "columns 16/24/30/32 fell outside the shrunk width and must not survive"
         );
     }
 }
