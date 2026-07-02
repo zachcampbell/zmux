@@ -1022,6 +1022,12 @@ impl TerminalIngest {
                             }
                             pane.set_screen_mode(ScreenMode::Alternate);
                             self.alternate.reset();
+                            // reset() just baselined fill to the default
+                            // pen, but erases in the freshly-entered alt
+                            // screen must blank with the CURRENTLY
+                            // RUNNING pen (BCE), not a neutral default —
+                            // resync it now that reset() is done clearing.
+                            self.alternate.set_fill_style(self.current_style.clone());
                             self.alt_saved_pen = Style::DEFAULT;
                         }
                         7 => {
@@ -1142,7 +1148,10 @@ impl TerminalIngest {
         pane.set_screen_mode(ScreenMode::Primary);
         pane.set_mouse_tracking_mode(MouseTrackingMode::Off);
         self.current_style = Style::DEFAULT;
-        self.alternate.set_fill_style(Style::DEFAULT);
+        // No explicit set_fill_style() needed here: reset() itself now
+        // baselines fill to Cell::BLANK (the default pen), which is
+        // exactly what a hard reset wants since current_style is being
+        // reset to default in this same call.
         self.alternate.reset();
         self.alt_saved_pen = Style::DEFAULT;
         self.alternate.set_auto_wrap(true);
@@ -1976,6 +1985,14 @@ impl AlternateScreen {
     }
 
     fn reset(&mut self) {
+        // Baseline `fill` to the default pen before clearing so the
+        // struct is self-consistently "default" after a reset, same as
+        // every other field below. This struct has no access to
+        // current_style, so it can't know the pen actually running when
+        // reset() is called (e.g. on alt-screen entry, mid-session);
+        // callers that need `fill` to reflect the live pen must resync
+        // it with set_fill_style() themselves right after calling this.
+        self.fill = Cell::BLANK;
         self.clear_all();
         self.scroll_top = 0;
         self.scroll_bottom = self.rows.saturating_sub(1);
@@ -3879,6 +3896,78 @@ mod tests {
             !cell.style.attrs.underline,
             "DECRC must restore the saved pen across CSI 2J; CSI 2J must not drop the saved cursor/pen",
         );
+    }
+
+    #[test]
+    fn alt_screen_reentry_does_not_leak_previous_session_fill_color() {
+        // AlternateScreen::fill mirrors the running SGR pen (see its own
+        // doc comment: "Updated by the ingest whenever current_style
+        // changes") so erase/scroll/insert/delete ops paint blanks with
+        // the active background (BCE). But AlternateScreen::reset() —
+        // run on every 47/1047/1049 mode-entry — used to leave `fill`
+        // untouched, so a background color left over from whatever last
+        // touched it (e.g. a red status bar a PRIOR alt-screen occupant
+        // painted) bled into the blanks the NEXT occupant paints, even
+        // before that occupant ever touches SGR itself.
+        //
+        // Reproducing that divergence with CSI bytes alone is not
+        // possible in this codebase: every other place current_style
+        // changes (the SGR handler, hard_reset, soft_reset, and
+        // restore_cursor_state's unconditional trailing resync) already
+        // keeps `fill` in lockstep with it, which is exactly why the
+        // mode-entry call site was the one gap worth fixing. So this
+        // test pokes `alternate`'s private fields directly to stand in
+        // for "whatever state a previous occupant left the alt screen
+        // in" — the same state reset() sees when it runs — and then
+        // drives mode entry, erase, and the assertion through the
+        // normal ingest_bytes/render_cells path.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        // Simulate a previous alt-screen occupant leaving `fill` red
+        // while the pen actually running in this session (current_style)
+        // is, and always has been, default — i.e. app #2 hasn't touched
+        // SGR at all yet.
+        ingest.alternate.set_fill_style(crate::style::Style {
+            bg: crate::style::Color::Indexed(1),
+            ..crate::style::Style::DEFAULT
+        });
+
+        // App #2 enters the alt screen and erases before emitting any
+        // SGR of its own.
+        ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b[2J");
+
+        let cells = ingest.render_cells(&pane);
+        for cell in &cells[0] {
+            assert_eq!(
+                cell.style.bg,
+                crate::style::Color::Default,
+                "blank cells must carry the current (default) pen's background, not a previous occupant's leftover red"
+            );
+        }
+
+        // BCE-correct case: leave, then simulate a green pen already
+        // running at the moment of re-entry (again poked directly, since
+        // the SGR handler's own resync would otherwise mask the
+        // mode-entry gap) and erase. Blanks must pick up the CURRENTLY
+        // ACTIVE pen, not whatever neutral baseline reset() leaves fill
+        // at.
+        ingest.ingest_bytes(&mut pane, b"\x1b[?1049l");
+        ingest.current_style = crate::style::Style {
+            bg: crate::style::Color::Indexed(2),
+            ..crate::style::Style::DEFAULT
+        };
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b[2J");
+
+        let cells = ingest.render_cells(&pane);
+        for cell in &cells[0] {
+            assert_eq!(
+                cell.style.bg,
+                crate::style::Color::Indexed(2),
+                "blank cells must carry the currently active green background"
+            );
+        }
     }
 
     #[test]
