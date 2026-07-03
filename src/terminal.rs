@@ -215,7 +215,7 @@ pub struct TerminalIngest {
 // Holding state for a Synchronized Output region. `bytes` accumulates
 // every byte received between BSU and ESU; `scan_from` is the index at
 // which the next ESU search should begin. After each feed without a
-// hit, `scan_from` advances to `bytes.len() - (ESU_BYTES.len() - 1)`,
+// hit, `scan_from` advances to `bytes.len() - (MAX_ESU_LEN - 1)`,
 // keeping a small overlap so an ESU split across a feed boundary still
 // gets caught.
 #[derive(Debug)]
@@ -403,21 +403,22 @@ impl TerminalIngest {
                 // `scan_start` (saturating into the overlap window) so
                 // we never miss a sequence that began before this feed.
                 let scan_window = scan_start.min(sync.bytes.len());
-                if let Some(rel) = find_subslice(&sync.bytes[scan_window..], ESU_BYTES) {
-                    let esu_at = scan_window + rel;
+                if let Some((rel_start, rel_end)) = find_esu(&sync.bytes[scan_window..]) {
+                    let esu_at = scan_window + rel_start;
                     let collected = std::mem::take(&mut sync.bytes);
                     self.synchronized_buffer = None;
                     let body = &collected[..esu_at];
-                    let after_esu_start = esu_at + ESU_BYTES.len();
+                    let after_esu_start = scan_window + rel_end;
                     self.dispatch_bytes(pane, body, &mut replies);
                     pending = collected[after_esu_start..].to_vec();
                     continue;
                 }
 
                 // No ESU yet. Advance the cursor past everything we've
-                // scanned, keeping an `ESU_BYTES.len() - 1` overlap so
-                // an ESU split across feeds is still caught.
-                let overlap = ESU_BYTES.len().saturating_sub(1);
+                // scanned, keeping a `MAX_ESU_LEN - 1` overlap so an ESU
+                // split across feeds — including a combined-parameter one
+                // longer than the bare form — is still caught.
+                let overlap = MAX_ESU_LEN.saturating_sub(1);
                 sync.scan_from = sync.bytes.len().saturating_sub(overlap);
 
                 // Hard cap: degrade to non-atomic flush rather than
@@ -2757,11 +2758,15 @@ fn dec_special_graphics(ch: char) -> char {
 const CSI_BUFFER_MAX: usize = 1 << 10;
 const OSC_BUFFER_MAX: usize = 1 << 20;
 
-// The literal byte sequence that closes a Synchronized Output region
-// (DECRST 2026). Detected by `ingest_bytes` while the sync buffer is
-// active; we don't route it through the CSI parser because the buffer
-// has already diverted those bytes.
-const ESU_BYTES: &[u8] = b"\x1b[?2026l";
+// Longest ESU we reassemble across a feed boundary. The bare form is
+// `ESC [ ? 2 0 2 6 l` (9 bytes), but a host may close the region with a
+// combined-parameter reset that names 2026 alongside other DEC modes
+// (e.g. `ESC[?2026;25l`, resetting sync and cursor visibility at once).
+// Keeping a `MAX_ESU_LEN - 1` overlap between feeds means such an ESU
+// split across two `ingest_bytes` calls is still caught. Only a reset
+// whose parameter list runs past this bound AND lands exactly on a feed
+// boundary would be missed — no real terminal emits one.
+const MAX_ESU_LEN: usize = 32;
 
 // Hard cap on the synchronized-output buffer. We trust well-behaved
 // hosts; a normal sync update is a few KB. Misbehaving ones (BSU
@@ -2770,18 +2775,43 @@ const ESU_BYTES: &[u8] = b"\x1b[?2026l";
 // memory exhaustion.
 const SYNCHRONIZED_BUFFER_MAX: usize = 1 << 20;
 
-// Locate `needle` inside `haystack` and return the start index, or None
-// if absent. We don't need substring partial-match recovery for sync
-// output — `find_subslice` is called on each feed, and any leading
-// partial-ESU bytes simply remain in the buffer until the rest arrives
-// in a subsequent feed.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
+// Find the first End-of-Synchronized-Update reset in `haystack` and
+// return its `(start, end)` byte range, or None if absent. An ESU is a
+// DEC-private mode reset `ESC [ ? <params> l` whose parameter list
+// includes `2026`. Matching by parameter — rather than against the
+// literal `ESC[?2026l` — is what lets us recognize the combined-
+// parameter forms a real terminal emits (`ESC[?2026;25l`,
+// `ESC[?25;2026l`, …); the bare-literal scan this replaced froze the
+// whole buffered frame until some later standalone ESU happened to
+// arrive. A `?h` (set) or a reset without 2026 (e.g. a stray `ESC[?25l`
+// hiding the cursor) is deliberately not treated as an ESU.
+//
+// Called on each feed; a partial ESU at the tail (no final byte yet)
+// simply doesn't match and stays buffered for the next feed — see the
+// `MAX_ESU_LEN` overlap the caller keeps.
+fn find_esu(haystack: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i + 2 < haystack.len() {
+        if &haystack[i..i + 3] != b"\x1b[?" {
+            i += 1;
+            continue;
+        }
+        // Consume the parameter bytes (digits and `;`) up to the final.
+        let mut j = i + 3;
+        while j < haystack.len() && (haystack[j].is_ascii_digit() || haystack[j] == b';') {
+            j += 1;
+        }
+        if j < haystack.len()
+            && haystack[j] == b'l'
+            && haystack[i + 3..j]
+                .split(|&b| b == b';')
+                .any(|token| token == b"2026")
+        {
+            return Some((i, j + 1));
+        }
+        i += 1;
     }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    None
 }
 
 // Which terminator the host used to close the OSC sequence. We mirror
@@ -3696,6 +3726,77 @@ mod tests {
             lines.iter().any(|l| l == "NORMAL"),
             "post-cap text should reach the screen; got {lines:?}",
         );
+    }
+
+    #[test]
+    fn synchronized_output_closes_on_combined_parameter_esu() {
+        // A host may end the region with a DEC-private reset that names
+        // 2026 alongside other modes — e.g. `ESC[?2026;25l` (sync +
+        // cursor visibility) — rather than the bare `ESC[?2026l`. The
+        // old literal scan missed these and froze the buffered frame
+        // until some later standalone ESU landed; the parameter-aware
+        // scan must release it immediately.
+        for esu in [
+            &b"\x1b[?2026;25l"[..],
+            &b"\x1b[?25;2026l"[..],
+            &b"\x1b[?1;2026;12l"[..],
+        ] {
+            let mut pane = Pane::new("shell", 16, 4);
+            let mut ingest = TerminalIngest::default();
+
+            ingest.ingest_bytes(&mut pane, b"\x1b[?2026h");
+            ingest.ingest_bytes(&mut pane, b"FRAME");
+            assert!(
+                pane.visible_text().iter().all(|l| l.is_empty()),
+                "content must stay buffered until the ESU",
+            );
+            ingest.ingest_bytes(&mut pane, esu);
+            ingest.flush_incomplete_line(&mut pane);
+            assert_eq!(
+                pane.visible_text()[0],
+                "FRAME",
+                "combined-parameter ESU {esu:?} must release the buffered frame",
+            );
+        }
+    }
+
+    #[test]
+    fn synchronized_output_ignores_non_2026_private_reset() {
+        // A `?l` reset that does NOT name 2026 (a bare cursor-hide, say)
+        // is ordinary buffered content, not an ESU — it must not close
+        // the region early.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[?2026h");
+        ingest.ingest_bytes(&mut pane, b"AAA\x1b[?25lBBB");
+        assert!(
+            pane.visible_text().iter().all(|l| l.is_empty()),
+            "an unrelated ?25l reset must not be mistaken for the ESU",
+        );
+        // The real ESU still closes it, and the buffered ?25l applied.
+        ingest.ingest_bytes(&mut pane, b"\x1b[?2026l");
+        ingest.flush_incomplete_line(&mut pane);
+        assert_eq!(pane.visible_text()[0], "AAABBB");
+    }
+
+    #[test]
+    fn synchronized_output_finds_combined_esu_split_across_feeds() {
+        // The combined form is longer than the bare `ESC[?2026l`, so the
+        // cross-feed overlap has to be wide enough (MAX_ESU_LEN) to
+        // rejoin it when it straddles a feed boundary.
+        let mut pane = Pane::new("shell", 16, 4);
+        let mut ingest = TerminalIngest::default();
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[?2026h");
+        for &b in b"payload" {
+            ingest.ingest_bytes(&mut pane, &[b]);
+        }
+        for &b in b"\x1b[?2026;25l" {
+            ingest.ingest_bytes(&mut pane, &[b]);
+        }
+        ingest.flush_incomplete_line(&mut pane);
+        assert_eq!(pane.visible_text()[0], "payload");
     }
 
     #[test]
