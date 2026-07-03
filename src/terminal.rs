@@ -457,6 +457,14 @@ impl TerminalIngest {
             }
         }
 
+        // Keep the scrollback's combined-timeline math (see
+        // `ScrollbackBuffer::set_live_tail`) up to date with however
+        // large the live grid ended up after this feed. This is the
+        // primary sync point — it covers every code path above,
+        // including bytes that never touched `primary_index` (e.g. a
+        // feed that only moved the cursor).
+        self.sync_live_tail(pane);
+
         replies
     }
 
@@ -557,6 +565,10 @@ impl TerminalIngest {
         self.primary_saved_cursor = None;
         self.primary_wrap_pending = false;
         self.primary_flushed_to_scrollback = appended;
+        // The grid was just drained to nothing (see the `mem::take`
+        // above) — the live tail is now 0, and every row that used to
+        // count toward it is now a committed scrollback line instead.
+        self.sync_live_tail(pane);
     }
 
     // Plain-text snapshot of the live primary grid, oldest row first.
@@ -663,7 +675,11 @@ impl TerminalIngest {
 
     fn render_primary_cells(&self, pane: &Pane) -> Vec<Vec<Cell>> {
         if !pane.follow_output() {
-            return pane.visible_lines();
+            // Scrolled back: the addressable timeline is scrollback
+            // plus whatever's still live in the grid (they're never
+            // spliced together anywhere else — this is the one place
+            // that needs the union). See `render_scrolled_primary_view`.
+            return self.render_scrolled_primary_view(pane);
         }
 
         if self.primary_grid.is_empty() && self.primary_flushed_to_scrollback {
@@ -683,6 +699,50 @@ impl TerminalIngest {
         let mut rows = self.primary_grid.clone();
         rows.resize_with(viewport, Vec::new);
         rows
+    }
+
+    // Non-destructive combined-timeline render for the scrolled-back
+    // (non-follow) case. The live grid is never flushed to produce this
+    // — flushing resets the cursor and, worse, makes the *next* bit of
+    // follow-mode output render top-aligned with blank rows below it
+    // instead of growing naturally from the bottom (that's why this
+    // fix doesn't use `flush_incomplete_line` to solve the wheel-jump
+    // bug). Instead we address into "scrollback lines, then live grid
+    // rows" as one continuous space: `pane.viewport_top()` /
+    // `pane.total_lines()` are already combined-timeline-aware via
+    // `ScrollbackBuffer`'s `live_tail` (see `sync_live_tail`), so this
+    // just has to pick the right side of the split for each row.
+    fn render_scrolled_primary_view(&self, pane: &Pane) -> Vec<Vec<Cell>> {
+        let scrollback_len = pane.total_lines();
+        let top = pane.viewport_top();
+        let height = pane.viewport_height();
+        (top..top + height)
+            .map(|combined_index| {
+                if combined_index < scrollback_len {
+                    pane.scrollback_line_cells(combined_index)
+                } else {
+                    // Past the end of committed scrollback: read
+                    // straight from the live grid. `.get(...)` returns
+                    // `None` (rendered blank) once `combined_index`
+                    // runs past the live grid's own length too — e.g.
+                    // the tail of the viewport when the grid hasn't
+                    // filled the screen yet.
+                    self.primary_grid
+                        .get(combined_index - scrollback_len)
+                        .cloned()
+                        .unwrap_or_default()
+                }
+            })
+            .collect()
+    }
+
+    // Tell the pane's scrollback buffer how many rows the live primary
+    // grid currently holds, so its viewport math can treat "scrollback
+    // ++ live grid" as one continuous timeline (see
+    // `ScrollbackBuffer::set_live_tail`). Cheap — `Vec::len()` — so it's
+    // called liberally rather than only where it's strictly load-bearing.
+    fn sync_live_tail(&self, pane: &mut Pane) {
+        pane.set_scrollback_live_tail(self.primary_grid.len());
     }
 
     fn handle_ground(&mut self, pane: &mut Pane, byte: u8) {
@@ -2132,6 +2192,17 @@ impl TerminalIngest {
         if self.primary_cursor_row == self.primary_scroll_bottom {
             if self.primary_scroll_top == 0 && self.primary_scroll_bottom == max_rows - 1 {
                 let evicted = self.primary_grid.remove(0);
+                // Sync before handing the row to scrollback: `append_
+                // output_line` clamps the pane's viewport_top against
+                // `max_viewport_top()` as part of appending, and that
+                // clamp needs to see the grid's current size, not
+                // whatever `live_tail` was left at by the last full
+                // sync (which can be stale-low right after a flush or
+                // a burst that grew the grid without evicting yet).
+                // Without this, a scrolled-back viewport can get
+                // wrongly pulled down mid-burst before `ingest_bytes`'
+                // end-of-call sync ever runs — see `sync_live_tail`.
+                self.sync_live_tail(pane);
                 pane.append_output_line(evicted);
                 self.primary_grid.push(Vec::new());
                 self.primary_cursor_row = max_rows - 1;
@@ -2147,6 +2218,8 @@ impl TerminalIngest {
         }
 
         let evicted = self.primary_grid.remove(0);
+        // See the comment on the sibling eviction branch above.
+        self.sync_live_tail(pane);
         pane.append_output_line(evicted);
         self.primary_grid.push(Vec::new());
         self.primary_cursor_row = max_rows - 1;
@@ -5357,5 +5430,131 @@ mod tests {
             Some((0, 9)),
             "columns 16/24/30/32 fell outside the shrunk width and must not survive"
         );
+    }
+
+    // --- Mouse-wheel scroll-jump fix -----------------------------------
+    //
+    // Regression coverage for the combined-timeline scroll fix. Before
+    // this fix, `render_primary_cells`'s non-follow branch rendered
+    // `pane.visible_lines()` — scrollback only — while follow-mode
+    // viewport bookkeeping only ever accounted for committed scrollback
+    // lines, never the live grid sitting past the end of it. The first
+    // wheel-up notch out of follow mode therefore always landed a whole
+    // grid's worth of lines above where the user was actually looking,
+    // even though every subsequent notch (already scrolled away from
+    // follow, no live grid involved) scrolled smoothly. These tests
+    // drive content through the real ingest path — never hand-appended
+    // scrollback — because that's exactly the code path the bug lived
+    // in.
+    //
+    // All four tests share one setup: a 4-row PTY / 4-row viewport pane
+    // fed ten single-character-wider lines ("L1".."L10") with no
+    // trailing newline. By the end, six lines have evicted to
+    // scrollback (L1..L6) and the live grid holds the last four
+    // (L7..L10) — a full screen still live, exactly the shape that
+    // exposes the bug.
+
+    fn wheel_jump_fixture() -> (Pane, TerminalIngest) {
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 80));
+        ingest.ingest_bytes(&mut pane, b"L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10");
+        (pane, ingest)
+    }
+
+    #[test]
+    fn wheel_up_from_follow_scrolls_by_the_requested_amount_not_a_full_screen() {
+        let (mut pane, ingest) = wheel_jump_fixture();
+
+        // Sanity: following shows the live grid's bottom four rows.
+        assert!(pane.follow_output());
+        assert_eq!(ingest.render_lines(&pane), vec!["L7", "L8", "L9", "L10"]);
+
+        // One wheel notch (3 lines, the routing default) must move the
+        // top visible row up by exactly 3 lines — from L7 to L4 — not
+        // by a whole grid's worth (would land on L1) and not by zero
+        // (the pre-fix scrollback-only ceiling could also produce this
+        // if it happened to already sit at its own bottom).
+        pane.wheel_up(3);
+        assert!(!pane.follow_output());
+        assert_eq!(
+            ingest.render_lines(&pane),
+            vec!["L4", "L5", "L6", "L7"],
+            "a single wheel-up notch must scroll by 3 lines, not jump a full screen"
+        );
+
+        // Subsequent notches keep scrolling smoothly by the same
+        // amount — the "later notches are fine" half of the bug
+        // report, confirmed unchanged by the fix.
+        pane.wheel_up(3);
+        assert_eq!(ingest.render_lines(&pane), vec!["L1", "L2", "L3", "L4"]);
+    }
+
+    #[test]
+    fn wheel_down_back_to_bottom_reenables_follow_and_shows_live_grid_seamlessly() {
+        let (mut pane, ingest) = wheel_jump_fixture();
+
+        pane.wheel_up(6);
+        assert!(!pane.follow_output());
+
+        // Scroll all the way back down. No further ingest happens in
+        // between — the grid is untouched, so this must land exactly
+        // back on the live grid's tail with no top-alignment glitch
+        // (the kind `flush_incomplete_line` would cause by resetting
+        // the cursor and leaving follow-mode render starting from a
+        // blank top row instead of the live bottom).
+        pane.wheel_down(100);
+        assert!(pane.follow_output());
+        assert_eq!(ingest.render_lines(&pane), vec!["L7", "L8", "L9", "L10"]);
+    }
+
+    #[test]
+    fn new_output_while_scrolled_back_does_not_move_the_viewport() {
+        // This is the mid-burst clamp hazard the extra `sync_live_tail`
+        // calls inside `primary_index`'s eviction branches guard
+        // against: without them, a single `ingest_bytes` call that
+        // evicts several grid rows while the user is scrolled back can
+        // clamp `viewport_top` down using a stale (too-small)
+        // `live_tail`, visibly dragging the view toward the bottom mid-
+        // burst.
+        let (mut pane, mut ingest) = wheel_jump_fixture();
+
+        pane.wheel_up(3);
+        assert!(!pane.follow_output());
+        let before = ingest.render_lines(&pane);
+        assert_eq!(before, vec!["L4", "L5", "L6", "L7"]);
+
+        // Two more lines arrive, evicting L7 and L8 out of the grid and
+        // into scrollback behind the scenes.
+        ingest.ingest_bytes(&mut pane, b"\nL11\nL12");
+
+        assert!(
+            !pane.follow_output(),
+            "new output must not silently re-enable follow while scrolled back"
+        );
+        assert_eq!(
+            ingest.render_lines(&pane),
+            before,
+            "the scrolled-back view must not shift when new output arrives"
+        );
+    }
+
+    #[test]
+    fn clear_then_fresh_output_still_renders_top_aligned_in_follow_mode() {
+        // Regression guard: this fix only replaces the non-follow
+        // branch of `render_primary_cells`. The follow-mode branch
+        // (small/growing grid, blank rows padded below) must render
+        // exactly as it did before — content starting at the top, not
+        // spliced with (now-cleared) scrollback and not bottom-aligned.
+        let mut pane = Pane::new("shell", 64, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 80));
+
+        ingest.ingest_bytes(&mut pane, b"old1\nold2\nold3\nold4");
+        ingest.ingest_bytes(&mut pane, b"\x1b[H\x1b[2J\x1b[3J");
+        assert_eq!(pane.total_lines(), 0);
+
+        ingest.ingest_bytes(&mut pane, b"fresh");
+
+        assert!(pane.follow_output());
+        assert_eq!(ingest.render_lines(&pane), vec!["fresh"]);
     }
 }

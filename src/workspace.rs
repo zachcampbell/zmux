@@ -2038,7 +2038,7 @@ impl Workspace {
                 // without that, an earlier AwaitingInput is sticky
                 // (`note_output` only flips Idle→Working) and a build
                 // streaming output would still look like it needed input.
-                let last_line = session.session.pane_mut().visible_last_line();
+                let last_line = session.session.visible_last_line();
                 let new_state = if last_line
                     .as_deref()
                     .is_some_and(|line| session.prompt.is_prompt(line))
@@ -2139,11 +2139,7 @@ impl Workspace {
                 && now.saturating_duration_since(session.last_output_emit_at)
                     >= PANE_OUTPUT_TIME_THRESHOLD
             {
-                let preview = session
-                    .session
-                    .pane_mut()
-                    .visible_last_line()
-                    .unwrap_or_default();
+                let preview = session.session.visible_last_line().unwrap_or_default();
                 events.push(Event::PaneOutput {
                     pane_id: session.id as u32,
                     bytes_delta: session.bytes_since_emit,

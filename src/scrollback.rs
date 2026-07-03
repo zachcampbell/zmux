@@ -14,6 +14,16 @@ pub struct ScrollbackBuffer {
     lines: VecDeque<ScrollbackLine>,
     viewport_top: usize,
     follow_output: bool,
+    // Rows currently held live in the ingester's on-screen grid, past
+    // the end of `lines`. The grid isn't stored here — it lives in
+    // `TerminalIngest` — but the scroll math needs its length to treat
+    // "scrollback ++ live grid" as one continuous addressable timeline.
+    // Without this, `max_viewport_top` only sees committed scrollback
+    // lines, which sit `live_tail` rows behind the true live bottom;
+    // the first wheel-up notch out of follow mode would then jump the
+    // viewport up by a whole grid's worth instead of a few lines. See
+    // `set_live_tail` for how the ingester keeps this current.
+    live_tail: usize,
 }
 
 impl ScrollbackBuffer {
@@ -29,6 +39,7 @@ impl ScrollbackBuffer {
             lines: VecDeque::with_capacity(capacity),
             viewport_top: 0,
             follow_output: true,
+            live_tail: 0,
         }
     }
 
@@ -106,6 +117,23 @@ impl ScrollbackBuffer {
         // Clamped for the same reason as `new`: resize paths can
         // legitimately compute a 0-row pane on a tiny terminal.
         self.viewport_height = viewport_height.max(1);
+        self.viewport_top = self.viewport_top.min(self.max_viewport_top());
+        if self.follow_output {
+            self.scroll_to_bottom();
+        } else {
+            self.follow_output = self.viewport_top == self.max_viewport_top();
+        }
+    }
+
+    // Told by the ingester how many rows of its live grid currently sit
+    // past the end of committed scrollback (see the `live_tail` field
+    // comment). Follows the same clamp/re-follow idiom as
+    // `set_viewport_height` and `append_line`: shrinking the combined
+    // timeline can push a scrolled-back viewport_top past the new
+    // ceiling, so it's re-clamped, and follow mode (if active) snaps
+    // back to the new bottom rather than drifting.
+    pub fn set_live_tail(&mut self, live_tail: usize) {
+        self.live_tail = live_tail;
         self.viewport_top = self.viewport_top.min(self.max_viewport_top());
         if self.follow_output {
             self.scroll_to_bottom();
@@ -251,8 +279,16 @@ impl ScrollbackBuffer {
         self.follow_output
     }
 
+    // The addressable timeline is committed scrollback lines followed
+    // by whatever's still live in the ingester's grid (`live_tail`).
+    // Every caller of this — `append_line`, `scroll_up`/`scroll_down`,
+    // `set_viewport_height`, `set_live_tail`, `center_viewport_on`,
+    // `ensure_line_visible` — already treats it as "the largest legal
+    // viewport_top," so folding `live_tail` in here is enough to make
+    // all of them combined-timeline-aware without touching their
+    // bodies.
     fn max_viewport_top(&self) -> usize {
-        self.lines.len().saturating_sub(self.viewport_height)
+        (self.lines.len() + self.live_tail).saturating_sub(self.viewport_height)
     }
 }
 
@@ -395,5 +431,74 @@ mod tests {
             plain(&buffer.visible_lines()),
             vec!["line 2", "line 3", "line 4"]
         );
+    }
+
+    #[test]
+    fn set_live_tail_extends_the_combined_timeline_ceiling() {
+        // Two committed scrollback lines plus a full 4-row live grid:
+        // the combined timeline is 6 lines deep, so the true bottom
+        // (max_viewport_top) is 2 — not 0, which is what the
+        // scrollback-only formula would say before `live_tail` is
+        // folded in.
+        let mut buffer = ScrollbackBuffer::new(16, 4);
+        buffer.append_line(line("line 1"));
+        buffer.append_line(line("line 2"));
+
+        buffer.set_live_tail(4);
+
+        assert!(buffer.follow_output());
+        assert_eq!(buffer.viewport_top(), 2);
+    }
+
+    #[test]
+    fn scroll_up_from_full_live_grid_moves_by_the_requested_line_count() {
+        // This is the arithmetic behind the mouse-wheel-jump bug: with
+        // 8 committed scrollback lines sitting under a full 4-row live
+        // grid, the combined bottom is at combined index 8. A single
+        // wheel-up notch (3 lines) must move the top by exactly 3 —
+        // not by a whole grid's worth (4) and not by nothing, which is
+        // what happens when `max_viewport_top` ignores the live tail.
+        let mut buffer = ScrollbackBuffer::new(32, 4);
+        for index in 1..=8 {
+            buffer.append_line(line(&format!("line {index}")));
+        }
+        buffer.set_live_tail(4);
+        assert_eq!(buffer.viewport_top(), 8);
+
+        assert_eq!(buffer.scroll_up(3), 3);
+        assert_eq!(buffer.viewport_top(), 5);
+        assert!(!buffer.follow_output());
+
+        // The next notch keeps scrolling smoothly by the same amount —
+        // this is the "subsequent notches scroll fine" half of the bug
+        // report, confirmed still true under the fix.
+        assert_eq!(buffer.scroll_up(3), 3);
+        assert_eq!(buffer.viewport_top(), 2);
+    }
+
+    #[test]
+    fn set_live_tail_reclamps_a_scrolled_back_viewport_when_the_grid_shrinks() {
+        // A scrolled-back viewport sitting near the (old) bottom can be
+        // stranded above the new ceiling if the live tail shrinks out
+        // from under it (e.g. the grid emptied). `set_live_tail` must
+        // re-clamp `viewport_top`, mirroring the same pattern
+        // `set_viewport_height` and `append_line` already use for
+        // their own ceiling-affecting changes.
+        let mut buffer = ScrollbackBuffer::new(32, 4);
+        for index in 1..=10 {
+            buffer.append_line(line(&format!("line {index}")));
+        }
+        buffer.set_live_tail(4);
+        assert_eq!(buffer.viewport_top(), 10);
+
+        assert_eq!(buffer.scroll_up(1), 1);
+        assert_eq!(buffer.viewport_top(), 9);
+        assert!(!buffer.follow_output());
+
+        // The grid empties out (combined ceiling drops from 10 to 6):
+        // viewport_top must be pulled back down to the new max rather
+        // than pointing past the end of the now-shorter timeline.
+        buffer.set_live_tail(0);
+        assert_eq!(buffer.viewport_top(), 6);
     }
 }

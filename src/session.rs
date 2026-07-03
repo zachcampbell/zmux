@@ -300,6 +300,27 @@ impl Session {
         self.ingest.render_cells(&self.pane)
     }
 
+    /// Plain-text last non-empty line of what the renderer would draw
+    /// right now — composed from scrollback + the live primary grid,
+    /// same as `snapshot_visible_lines`. Used by the agent-state prompt
+    /// detector.
+    ///
+    /// This intentionally does NOT delegate to `Pane::visible_last_line`:
+    /// that method only ever sees committed scrollback (`Pane::
+    /// visible_text` -> `ScrollbackBuffer::visible_lines`), so while the
+    /// pane is following live output it always reports the line that
+    /// was on screen `grid_rows` writes ago instead of the line that's
+    /// actually on screen now — the same staleness this fix's combined
+    /// timeline addresses for scrolling. Prompt detection needs "what's
+    /// on screen right now," so it goes through the same composed
+    /// render as `snapshot_visible_lines` instead.
+    pub fn visible_last_line(&self) -> Option<String> {
+        self.snapshot_visible_lines()
+            .into_iter()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+    }
+
     pub fn handle_mouse_event(&mut self, mouse: MouseEvent) -> io::Result<bool> {
         if let Some(lines) = mouse.wheel_lines() {
             let outcome = if mouse.is_scroll_up() {

@@ -421,6 +421,17 @@ impl Pane {
         self.scrollback.set_viewport_height(viewport_height);
     }
 
+    // Called by the VT ingester every time the live primary-screen grid
+    // changes size, so the scrollback's viewport math can treat
+    // "scrollback ++ live grid" as one continuous timeline instead of
+    // scrollback alone. See `ScrollbackBuffer::set_live_tail` for the
+    // full rationale (this is the fix for the mouse-wheel-up jump: the
+    // first notch out of follow mode was landing a whole grid's worth
+    // of lines above where the user was actually looking).
+    pub fn set_scrollback_live_tail(&mut self, live_tail: usize) {
+        self.scrollback.set_live_tail(live_tail);
+    }
+
     pub fn follow_output(&self) -> bool {
         self.scrollback.follow_output()
     }
