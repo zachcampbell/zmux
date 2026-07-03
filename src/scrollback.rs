@@ -7,6 +7,71 @@ use crate::style::Cell;
 
 pub type ScrollbackLine = Vec<Cell>;
 
+// Shared per-line helpers used by both `ScrollbackBuffer` (committed
+// history) and `Session`'s combined-timeline accessors (`terminal.rs` /
+// `session.rs`), which stitch scrollback and the live primary grid into
+// one addressable index space. Keeping the trimming and matching rules
+// in one place means a combined-timeline read behaves identically to a
+// scrollback-only read for the same line, regardless of which side of
+// the scrollback/grid boundary that line currently lives on.
+
+// Trim a single line's cells the same way `ScrollbackBuffer::
+// extract_lines` does: drop trailing blanks, then drop the wide-char
+// continuation sentinel (`\0`, see `style::char_width`) from what's
+// left so a copied CJK/emoji line reads as plain text instead of
+// embedding NUL bytes in the clipboard. The trailing-blank scan walks
+// the raw cells first (a `\0` is `!= ' '`, so it correctly keeps a
+// wide glyph that sits at the end of the line) — only the final push
+// loop skips it.
+pub(crate) fn trimmed_line_text(cells: &[Cell]) -> String {
+    let trailing = cells
+        .iter()
+        .rposition(|cell| cell.ch != ' ')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mut out = String::new();
+    for cell in &cells[..trailing] {
+        if cell.ch != '\0' {
+            out.push(cell.ch);
+        }
+    }
+    out
+}
+
+// Case-insensitive substring search over an arbitrary sequence of
+// lines, returning the 0-based indices (in iteration order) of every
+// line whose plain char content contains `needle`. Empty needles
+// return no matches so a caller who accidentally commits an empty
+// prompt doesn't get "every line matches." Shared by `ScrollbackBuffer
+// ::search` and `Session::combined_search` so a search over the
+// combined timeline finds the same matches a scrollback-only search
+// would once those lines are flushed.
+pub(crate) fn search_line_indices<'a, I>(lines: I, needle: &str) -> Vec<usize>
+where
+    I: IntoIterator<Item = &'a ScrollbackLine>,
+{
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let lower = needle.to_lowercase();
+    lines
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, cells)| {
+            let text: String = cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+                .to_lowercase();
+            if text.contains(&lower) {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct ScrollbackBuffer {
     capacity: usize,
@@ -164,26 +229,7 @@ impl ScrollbackBuffer {
     // "every line matches." The match is performed on the plain char
     // content of each cell — styling is ignored.
     pub fn search(&self, needle: &str) -> Vec<usize> {
-        if needle.is_empty() {
-            return Vec::new();
-        }
-        let lower = needle.to_lowercase();
-        self.lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, cells)| {
-                let text: String = cells
-                    .iter()
-                    .map(|cell| cell.ch)
-                    .collect::<String>()
-                    .to_lowercase();
-                if text.contains(&lower) {
-                    Some(index)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        search_line_indices(self.lines.iter(), needle)
     }
 
     // Join the text of buffer lines `start..=end` (inclusive) into a
@@ -212,16 +258,7 @@ impl ScrollbackBuffer {
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                let trailing = cells
-                    .iter()
-                    .rposition(|cell| cell.ch != ' ')
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                for cell in &cells[..trailing] {
-                    if cell.ch != '\0' {
-                        out.push(cell.ch);
-                    }
-                }
+                out.push_str(&trimmed_line_text(cells));
             }
         }
         out

@@ -57,6 +57,21 @@ impl Session {
     /// explicit flush, those readers see stale scrollback and miss the
     /// content the user is actually looking at on screen. No-op while
     /// the alt screen is active.
+    ///
+    /// DESTRUCTIVE — this empties the live primary grid and resets the
+    /// cursor. It must never be called from an interactive input path
+    /// (mouse selection, search, keyboard scrolling, etc.). Doing so
+    /// caused a real regression: a bare click in a shell pane (mouse
+    /// press+release, no drag) flushed the grid, and the *next* bit of
+    /// follow-mode output then rendered top-aligned on an otherwise
+    /// blank viewport instead of appending under existing content,
+    /// because `render_primary_cells`'s follow-mode branch pads a
+    /// near-empty grid with blank rows *below* it — correct after a
+    /// real `clear`, wrong here. Interactive code that needs to read
+    /// scrollback-plus-live-grid state should use the non-destructive
+    /// `combined_*` accessors below instead, which address scrollback
+    /// and the live grid as one continuous index space without
+    /// touching either.
     pub fn flush_grid_to_scrollback(&mut self) {
         self.ingest.flush_incomplete_line(&mut self.pane);
     }
@@ -229,6 +244,34 @@ impl Session {
     // slicing.
     pub fn scrollback_line_cells(&self, index: usize) -> crate::scrollback::ScrollbackLine {
         self.pane.scrollback_line_cells(index)
+    }
+
+    // Combined-timeline read accessors: committed scrollback plus the
+    // live primary grid, addressed as one continuous index space, with
+    // no flush and no mutation. These exist so interactive code
+    // (mouse selection, `/` search) can look up arbitrary lines —
+    // including lines still sitting unflushed in the live grid, or a
+    // range that spans the scrollback/live-grid boundary — without
+    // calling `flush_grid_to_scrollback`. See that method's doc
+    // comment for the regression this replaces it for. Combined
+    // indices are stable across grid→scrollback eviction: when a row
+    // evicts, scrollback's length grows by exactly the amount the
+    // grid's contribution to the index space shrinks, so a captured
+    // index still names the same line before and after.
+    pub fn combined_line_cells(&self, index: usize) -> crate::scrollback::ScrollbackLine {
+        self.ingest.combined_line_cells(&self.pane, index)
+    }
+
+    pub fn combined_total_lines(&self) -> usize {
+        self.ingest.combined_total_lines(&self.pane)
+    }
+
+    pub fn combined_extract_lines(&self, start: usize, end: usize) -> String {
+        self.ingest.combined_extract_lines(&self.pane, start, end)
+    }
+
+    pub fn combined_search(&self, needle: &str) -> Vec<usize> {
+        self.ingest.combined_search(&self.pane, needle)
     }
 
     pub fn output_byte_cursor(&self) -> u64 {

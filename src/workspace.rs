@@ -991,15 +991,17 @@ impl Workspace {
         let Some(active) = self.session_for_mut(self.active) else {
             return true;
         };
-        // Drain the live primary grid into scrollback before searching
-        // it. `search_scrollback` only scans committed scrollback
-        // lines; in follow-output mode the rendered viewport can be
-        // entirely the ingester's live grid (rows that haven't reached
+        // `search_scrollback` only scans committed scrollback lines; in
+        // follow-output mode the rendered viewport can be entirely the
+        // ingester's live grid (rows that haven't reached
         // `pane.scrollback` yet — see `TerminalIngest::
-        // render_primary_cells`), so without this a query matching text
-        // that's plainly on screen comes back with zero hits.
-        active.session.flush_grid_to_scrollback();
-        let matches = active.session.search_scrollback(&query);
+        // render_primary_cells`), so a plain scrollback search would
+        // miss a query matching text that's plainly on screen. Use the
+        // combined-timeline search instead of draining the grid first —
+        // draining is destructive (see `Session::flush_grid_to_
+        // scrollback`'s doc comment) and unnecessary now that the
+        // combined accessors can address live-grid rows directly.
+        let matches = active.session.combined_search(&query);
         if matches.is_empty() {
             self.search_results = Some(SearchResults {
                 query,
@@ -1077,21 +1079,17 @@ impl Workspace {
     // and cursor both start at the top-left of the visible viewport
     // so the user can extend down/right to grow the range.
     pub fn begin_selection(&mut self, mode: SelectionMode) -> bool {
-        // Same drain the mouse press path needs (see `handle_mouse`):
-        // `scrollback_viewport_top` below is read against committed
-        // scrollback only, but in follow-output mode what's actually
-        // on screen can be entirely the ingester's live grid. Without
-        // draining first, the anchor this computes doesn't name the
-        // line the user is looking at, and every later `y` inherits
-        // the wrong line — the keyboard-copy-mode twin of the mouse
-        // drag-copy bug.
-        if let Some(session) = self.session_for_mut(self.active) {
-            session.session.flush_grid_to_scrollback();
-        }
         let Some(session) = self.session_for(self.active) else {
             return false;
         };
-        let total = session.session.total_lines();
+        // `scrollback_viewport_top` is already combined-timeline aware
+        // (`TerminalIngest::ingest_bytes` keeps `ScrollbackBuffer::
+        // live_tail` in sync on every feed — see `sync_live_tail`), so
+        // it names the line the user is looking at whether or not
+        // that line has reached committed scrollback yet. `total` must
+        // use the same combined space so the anchor never clamps to a
+        // scrollback-only length shorter than what's really on screen.
+        let total = session.session.combined_total_lines();
         let anchor_line = if total == 0 {
             0
         } else {
@@ -1149,7 +1147,7 @@ impl Workspace {
             return false;
         };
         let total = match self.session_for(self.active) {
-            Some(session) => session.session.total_lines(),
+            Some(session) => session.session.combined_total_lines(),
             None => return false,
         };
         let new_cursor = compute(selection.cursor_line, total);
@@ -1186,19 +1184,18 @@ impl Workspace {
     // multi-line selections. Clears the selection on success.
     pub fn yank_selection(&mut self) -> Option<String> {
         let selection = self.selection.take()?;
-        // Drain before extracting, not just at selection-start: new
-        // output may have streamed into the live grid between
-        // `begin_selection`/the mouse press and this yank, and
-        // `extract_scrollback_lines`/`scrollback_line_cells` only see
-        // committed scrollback.
-        if let Some(active) = self.session_for_mut(self.active) {
-            active.session.flush_grid_to_scrollback();
-        }
+        // New output may have streamed into the live grid between
+        // `begin_selection`/the mouse press and this yank. The
+        // combined-timeline accessors below read scrollback and the
+        // live grid together, so that content resolves correctly
+        // without draining the grid first (see `Session::flush_grid_
+        // to_scrollback`'s doc comment for why draining here is
+        // exactly the bug this replaces).
         let active = self.session_for(self.active)?;
         let text = match selection.mode {
             SelectionMode::Line => {
                 let (low, high) = selection.line_range();
-                active.session.extract_scrollback_lines(low, high)
+                active.session.combined_extract_lines(low, high)
             }
             SelectionMode::Char => extract_char_stream(active, selection),
             SelectionMode::Rect => extract_rect_stream(active, selection),
@@ -2661,9 +2658,14 @@ impl Workspace {
             let selection_tag = self
                 .selection
                 .map(|sel| {
+                    // Combined-space total, not scrollback-only: a
+                    // selection can span lines still sitting in the
+                    // live grid, and clamping against a shorter
+                    // scrollback-only count would under-report the
+                    // line count in the status bar.
                     let total = self
                         .session_for(self.active)
-                        .map(|s| s.session.total_lines())
+                        .map(|s| s.session.combined_total_lines())
                         .unwrap_or(0);
                     match sel.mode {
                         SelectionMode::Line => {
@@ -2878,30 +2880,6 @@ impl Workspace {
             // screen (vim, less, etc.) is left alone; those apps enable
             // their own mouse tracking and we just forward to them.
             if is_primary {
-                if mouse.is_left_press() || (mouse.is_left_drag_motion() && self.mouse_drag_active)
-                {
-                    // Drain the live primary grid into scrollback
-                    // before turning this screen coordinate into a
-                    // scrollback-line index. In follow-output mode the
-                    // rendered viewport can be entirely the ingester's
-                    // live grid (`TerminalIngest::render_primary_cells`)
-                    // whose rows haven't reached `pane.scrollback` yet;
-                    // without this, `viewport_top` below is computed
-                    // against a shorter, stale timeline and
-                    // `viewport_top + local_row` names the wrong
-                    // scrollback line — the highlight tracks the mouse
-                    // correctly (it's drawn from the same live grid the
-                    // renderer uses) but the eventual yank resolves to
-                    // whatever stale content happens to sit at that
-                    // index. Draining on every press/drag tick (not
-                    // just once) keeps this correct even if output kept
-                    // streaming in mid-drag; `primary_flushed_to_
-                    // scrollback` makes a drain with nothing new to
-                    // move a cheap no-op.
-                    if let Some(managed) = self.session_for_mut(pane_id) {
-                        managed.session.flush_grid_to_scrollback();
-                    }
-                }
                 let viewport_top = match self.session_for(pane_id) {
                     Some(managed) => managed.session.scrollback_viewport_top(),
                     None => return Ok(active_changed),
@@ -2937,13 +2915,12 @@ impl Workspace {
                             // stray [SEL char] tag.
                             self.selection = None;
                         } else {
-                            // Drain once more immediately before
-                            // extraction: output may have streamed in
-                            // since the last press/drag drain above,
-                            // and extraction reads scrollback directly.
-                            if let Some(managed) = self.session_for_mut(pane_id) {
-                                managed.session.flush_grid_to_scrollback();
-                            }
+                            // `extract_char_stream` reads through the
+                            // combined-timeline accessors, so output
+                            // that streamed in mid-drag (moving some of
+                            // the highlighted rows from the live grid
+                            // into scrollback) still resolves to the
+                            // same content — no drain needed here.
                             if let Some(active) = self.session_for(self.active) {
                                 // Auto-yank the drag selection so the
                                 // user gets the desktop-terminal UX:
@@ -3146,29 +3123,29 @@ fn extract_char_stream(active: &ManagedSession, sel: Selection) -> String {
     let mut out = String::new();
     // One-line case: just the substring.
     if start.0 == end.0 {
-        let cells = active.session.scrollback_line_cells(start.0);
+        let cells = active.session.combined_line_cells(start.0);
         let lo = start.1.min(cells.len());
         let hi = slice_end(end.1, cells.len());
         push_cell_range(&mut out, &cells, lo, hi);
         return out;
     }
     // Multi-line: partial first line.
-    let first_cells = active.session.scrollback_line_cells(start.0);
+    let first_cells = active.session.combined_line_cells(start.0);
     let lo = start.1.min(first_cells.len());
     push_cell_range(&mut out, &first_cells, lo, first_cells.len());
     out.push('\n');
     // Middle lines, if any. These are taken whole (no column slicing),
     // so the trimmed-string accessor is fine here — it already skips
-    // `\0` on output (see `ScrollbackBuffer::extract_lines`).
+    // `\0` on output (see `scrollback::trimmed_line_text`).
     if end.0 > start.0 + 1 {
         let middle = active
             .session
-            .extract_scrollback_lines(start.0 + 1, end.0 - 1);
+            .combined_extract_lines(start.0 + 1, end.0 - 1);
         out.push_str(&middle);
         out.push('\n');
     }
     // Partial last line.
-    let last_cells = active.session.scrollback_line_cells(end.0);
+    let last_cells = active.session.combined_line_cells(end.0);
     let hi = slice_end(end.1, last_cells.len());
     push_cell_range(&mut out, &last_cells, 0, hi);
     out
@@ -3192,9 +3169,9 @@ fn handle_mouse_test_input(col: u16, row: u16, button: u16, final_byte: u8) -> M
 // selections are for aligned table-style output where trimming would
 // destroy the alignment.
 //
-// Column lookup happens against the raw cells (`scrollback_line_cells`,
+// Column lookup happens against the raw cells (`combined_line_cells`,
 // which keeps `\0` continuation sentinels in place), not the trimmed,
-// already-`\0`-filtered string `extract_scrollback_lines` returns —
+// already-`\0`-filtered string `combined_extract_lines` returns —
 // filtering first would shift every column after a wide glyph one
 // index left of where the rectangle's edges actually are. A `\0` cell
 // inside the rectangle contributes nothing to the output (it's the
@@ -3210,7 +3187,7 @@ fn extract_rect_stream(active: &ManagedSession, sel: Selection) -> String {
         if row > row_lo {
             out.push('\n');
         }
-        let cells = active.session.scrollback_line_cells(row);
+        let cells = active.session.combined_line_cells(row);
         for offset in 0..width {
             let col = col_lo + offset;
             match cells.get(col) {
@@ -3976,6 +3953,76 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_click_does_not_top_align_the_next_follow_mode_output() {
+        use super::handle_mouse_test_input as press;
+
+        // The click-glitch regression: a bare click (mouse press+release
+        // on the same cell, no drag — collapses to no selection) used
+        // to call `flush_grid_to_scrollback` unconditionally on the
+        // press. That drains and empties the live primary grid and
+        // resets the cursor. The *next* bit of follow-mode output then
+        // lands in a freshly-sparse grid, and `TerminalIngest::
+        // render_primary_cells`'s follow-mode branch pads a
+        // shorter-than-viewport grid with blank rows *below* it —
+        // correct after a real `clear`, wrong here: the screen visibly
+        // "clears," with new output top-aligned over an otherwise
+        // blank pane instead of appending under the content that was
+        // already there. This test fills the screen, clicks once
+        // without dragging, feeds a little more real output through
+        // `ingest_bytes`, and asserts the viewport is still packed
+        // (bottom-anchored), not mostly blank.
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(11, 60)).expect("spawn workspace");
+        let pane_id = workspace.active_pane_id() as u32;
+        wait_for_shell_ready(&mut workspace, pane_id);
+
+        // Fill well past the 10-content-row viewport (11-row frame minus
+        // the 1-row pane header) so follow mode is rendering a fully
+        // packed screen before the click.
+        workspace
+            .handle_input(InputAction::Forward(b"seq 1 30\r".to_vec()))
+            .expect("forward seq");
+        let lines = wait_for_visible_line(&mut workspace, pane_id, "30");
+        let blank_before = lines.iter().filter(|l| l.trim().is_empty()).count();
+        assert_eq!(
+            blank_before, 0,
+            "fixture must start fully packed (no blank rows) before the click: {lines:?}"
+        );
+
+        // Collapsed click: press and release on the exact same cell —
+        // no drag, so the mouse-drag-copy path never runs, but the
+        // stray press still used to trigger the destructive flush.
+        workspace
+            .handle_input(InputAction::Mouse(press(3, 5, 0, b'M')))
+            .expect("press");
+        workspace
+            .handle_input(InputAction::Mouse(press(3, 5, 0, b'm')))
+            .expect("release");
+        assert!(
+            !workspace.has_selection(),
+            "collapsed click must not leave a selection"
+        );
+
+        // A little more real output through the real ingest path —
+        // fewer lines than the viewport height, so a wrongly-emptied
+        // grid would land in `render_primary_cells`'s sparse-grid
+        // pad-below branch and reproduce the glitch.
+        workspace
+            .handle_input(InputAction::Forward(b"echo GLITCHMARKER\r".to_vec()))
+            .expect("forward echo");
+        let lines = wait_for_visible_line(&mut workspace, pane_id, "GLITCHMARKER");
+        let blank_after = lines.iter().filter(|l| l.trim().is_empty()).count();
+        assert!(
+            blank_after <= 1,
+            "regression: a collapsed click must not clear the live grid — the screen \
+             should stay packed and bottom-anchored, not go top-aligned with blank rows \
+             below the new output; got {blank_after} blank rows out of {}: {:?}",
+            lines.len(),
+            lines
+        );
+    }
+
+    #[test]
     fn mouse_drag_over_live_grid_content_copies_the_highlighted_line() {
         use super::handle_mouse_test_input as press;
 
@@ -4027,6 +4074,168 @@ mod tests {
             yanked.trim(),
             "115",
             "highlighted line must match the copied line, not stale/shifted scrollback"
+        );
+    }
+
+    #[test]
+    fn mouse_drag_does_not_mutate_the_live_grid_or_scrollback() {
+        use super::handle_mouse_test_input as press;
+
+        // The old press/drag/release path called `flush_grid_to_
+        // scrollback` on every tick, which is destructive (drains
+        // `primary_grid`, resets the cursor). The combined-timeline
+        // accessors read the same content without touching either
+        // side of the scrollback/grid split. Prove that: snapshot the
+        // pane's raw rendering and scrollback line count before and
+        // after a full press/drag/release cycle and require them to
+        // be pixel-for-pixel identical — `Session::render_cells`
+        // never includes selection highlighting (that's stamped on
+        // top in `render_frame`), so an identical result here isn't
+        // just "looks the same with the highlight painted over it."
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(21, 80)).expect("spawn workspace");
+        let pane_id = workspace.active_pane_id() as u32;
+        let active = workspace.active;
+        wait_for_shell_ready(&mut workspace, pane_id);
+
+        workspace
+            .handle_input(InputAction::Forward(b"seq 100 129\r".to_vec()))
+            .expect("forward seq");
+        let lines = wait_for_visible_line(&mut workspace, pane_id, "129");
+        let target_row = lines
+            .iter()
+            .position(|line| line.trim() == "115")
+            .expect("115 must still be visible in a 20-row viewport after seq 100..129");
+        let screen_row = (target_row + 1) as u16;
+
+        let total_before = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .total_lines();
+        let cells_before = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .render_cells();
+
+        workspace
+            .handle_input(InputAction::Mouse(press(0, screen_row, 0, b'M')))
+            .expect("press");
+        workspace
+            .handle_input(InputAction::Mouse(press(2, screen_row, 32, b'M')))
+            .expect("drag");
+        workspace
+            .handle_input(InputAction::Mouse(press(2, screen_row, 0, b'm')))
+            .expect("release");
+        assert!(
+            workspace.take_pending_clipboard().is_some(),
+            "drag must still auto-yank"
+        );
+
+        let total_after = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .total_lines();
+        let cells_after = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .render_cells();
+
+        assert_eq!(
+            total_before, total_after,
+            "a drag-select must not move any rows from the live grid into scrollback"
+        );
+        assert_eq!(
+            cells_before, cells_after,
+            "a drag-select must not mutate the rendered grid content"
+        );
+    }
+
+    #[test]
+    fn mouse_drag_survives_grid_eviction_between_press_and_release() {
+        use super::handle_mouse_test_input as press;
+
+        // Combined-timeline indices must be stable across grid ->
+        // scrollback eviction: a row's combined index doesn't change
+        // when it evicts, because scrollback grows by exactly the
+        // amount the grid's contribution to the index space shrinks.
+        // This drives that through the real input handlers: press and
+        // extend a selection over a line that's still only in the
+        // live grid, then feed enough further output through
+        // `ingest_bytes` that ordinary terminal scrolling evicts that
+        // line into committed scrollback *before* the mouse is
+        // released. The auto-yank on release must still resolve to
+        // the originally-highlighted text.
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(21, 80)).expect("spawn workspace");
+        let pane_id = workspace.active_pane_id() as u32;
+        let active = workspace.active;
+        wait_for_shell_ready(&mut workspace, pane_id);
+
+        workspace
+            .handle_input(InputAction::Forward(b"printf 'TARGETLINE\\n'\r".to_vec()))
+            .expect("forward printf");
+        let lines = wait_for_visible_line(&mut workspace, pane_id, "TARGETLINE");
+        let content_row = lines
+            .iter()
+            .position(|line| line.trim() == "TARGETLINE")
+            .expect("printf output must be visible") as u16;
+        let screen_row = content_row + 1;
+
+        // Press on "TARGETLINE" and extend across all 10 of its
+        // columns — still a live-grid-only line at this point, nothing
+        // evicted yet.
+        workspace
+            .handle_input(InputAction::Mouse(press(0, screen_row, 0, b'M')))
+            .expect("press");
+        workspace
+            .handle_input(InputAction::Mouse(press(9, screen_row, 32, b'M')))
+            .expect("drag");
+        let sel = workspace.selection.expect("still selecting");
+        assert_eq!(sel.anchor_col, 0);
+        assert_eq!(sel.cursor_col, 9);
+
+        // Feed enough further output that ordinary terminal scrolling
+        // evicts "TARGETLINE"'s row out of the live grid and into
+        // committed scrollback — a 21-row grid cap can't hold the
+        // prompt + "TARGETLINE" + 40 more numbered lines + a new
+        // prompt without evicting the earliest rows.
+        workspace
+            .handle_input(InputAction::Forward(b"seq 1 40\r".to_vec()))
+            .expect("forward seq");
+        let lines = wait_for_visible_line(&mut workspace, pane_id, "40");
+        assert!(
+            !lines.iter().any(|line| line.trim() == "TARGETLINE"),
+            "fixture must actually evict TARGETLINE out of the visible/live grid \
+             before release, or this test isn't exercising eviction: {lines:?}"
+        );
+        let scrollback_len = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .total_lines();
+        assert!(
+            scrollback_len > 0,
+            "TARGETLINE's row must have evicted into committed scrollback by now"
+        );
+
+        // Release without moving the mouse further: the selection's
+        // stored combined indices (captured at press/drag time) must
+        // still resolve to "TARGETLINE", now read out of scrollback
+        // instead of the live grid.
+        workspace
+            .handle_input(InputAction::Mouse(press(9, screen_row, 0, b'm')))
+            .expect("release");
+        let yanked = workspace
+            .take_pending_clipboard()
+            .expect("auto-yank must produce text");
+        assert_eq!(
+            yanked, "TARGETLINE",
+            "combined-index selection must survive the row evicting from the live grid \
+             into scrollback between press and release"
         );
     }
 
@@ -4085,13 +4294,14 @@ mod tests {
 
     #[test]
     fn search_finds_a_query_that_is_still_only_in_the_live_grid() {
-        // `/` search (`commit_search` -> `search_scrollback`) only
-        // scanned committed scrollback. In follow-output mode the
-        // rendered viewport can be entirely the ingester's live grid —
-        // rows that plainly exist on screen but haven't reached
-        // `pane.scrollback` yet. A small pane with only a couple of
-        // lines of output never triggers grid eviction, so this content
-        // is guaranteed to still be live-grid-only when we search.
+        // `/` search (`commit_search` -> `combined_search`) has to see
+        // the live grid, not just committed scrollback. In
+        // follow-output mode the rendered viewport can be entirely the
+        // ingester's live grid — rows that plainly exist on screen but
+        // haven't reached `pane.scrollback` yet. A small pane with only
+        // a couple of lines of output never triggers grid eviction, so
+        // this content is guaranteed to still be live-grid-only when we
+        // search.
         let mut workspace =
             Workspace::spawn_single("/bin/sh", PtySize::new(24, 80)).expect("spawn workspace");
         let pane_id = workspace.active_pane_id() as u32;
@@ -4117,6 +4327,82 @@ mod tests {
             !results.matches.is_empty(),
             "search must find a query that's plainly visible on screen, even though \
              it hasn't been drained into committed scrollback yet",
+        );
+    }
+
+    #[test]
+    fn search_jump_to_a_live_grid_match_renders_via_the_scrolled_composed_view() {
+        // Extends the previous test: not just "search finds a live-grid
+        // match without flushing," but "jumping to that match renders
+        // correctly too." `commit_search` -> `center_viewport_on` can
+        // scroll the pane away from the bottom (`follow_output` flips
+        // false), which switches rendering over to `TerminalIngest::
+        // render_scrolled_primary_view` — the combined-timeline
+        // composed view. That path must be able to resolve a still-live
+        // (unflushed) grid row exactly like `render_primary_cells`'s
+        // follow-mode branch does.
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(21, 80)).expect("spawn workspace");
+        let pane_id = workspace.active_pane_id() as u32;
+        let active = workspace.active;
+        wait_for_shell_ready(&mut workspace, pane_id);
+
+        // More than one screen's worth of output, so scrollback holds
+        // the early lines and the live grid holds only the most recent
+        // ~21 rows (the grid's row cap, tied to the PTY's row count).
+        workspace
+            .handle_input(InputAction::Forward(b"seq 1 100\r".to_vec()))
+            .expect("forward seq");
+        let _ = wait_for_visible_line(&mut workspace, pane_id, "100");
+
+        let scrollback_len_before = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .total_lines();
+        assert!(
+            scrollback_len_before > 0,
+            "fixture must have already evicted early lines into scrollback"
+        );
+
+        // "90" sits with a comfortable margin (numbers 91-100 plus a
+        // fresh prompt) below it, so it's well within the live grid's
+        // most recent rows but not the literal bottom-most line —
+        // centering on it must scroll the viewport away from the
+        // bottom, not leave it parked in follow mode.
+        assert!(
+            workspace.begin_search(),
+            "begin_search should open the prompt"
+        );
+        workspace.search_input_bytes(b"90");
+        assert!(workspace.commit_search(), "commit_search should run");
+
+        let results = workspace
+            .search_results
+            .as_ref()
+            .expect("commit must populate results");
+        assert!(!results.matches.is_empty(), "search must find \"90\"");
+
+        let session = &workspace.session_for(active).expect("active pane").session;
+        assert_eq!(
+            session.total_lines(),
+            scrollback_len_before,
+            "commit_search/center_viewport_on must not flush the live grid into scrollback"
+        );
+        assert!(
+            !session.follow_output(),
+            "centering on a match away from the bottom must leave follow mode, so the \
+             composed scrolled view (not the plain follow-mode grid slice) does the \
+             rendering"
+        );
+
+        let rendered = workspace
+            .snapshot_visible_lines(pane_id)
+            .expect("pane must still render after the search jump");
+        assert!(
+            rendered.iter().any(|line| line.trim() == "90"),
+            "the scrolled composed view must surface a match that's still only in the \
+             live (unflushed) grid: {rendered:?}"
         );
     }
 

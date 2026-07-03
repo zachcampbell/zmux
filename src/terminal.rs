@@ -7,6 +7,7 @@ use std::mem;
 use crate::mouse::{MouseTrackingMode, ScreenMode};
 use crate::pane::Pane;
 use crate::pty::PtySize;
+use crate::scrollback::{ScrollbackLine, search_line_indices, trimmed_line_text};
 use crate::style::{Cell, Style};
 
 // Cursor shape requested via DECSCUSR (`CSI Ps SP q`). Cosmetic but
@@ -713,27 +714,99 @@ impl TerminalIngest {
     // `ScrollbackBuffer`'s `live_tail` (see `sync_live_tail`), so this
     // just has to pick the right side of the split for each row.
     fn render_scrolled_primary_view(&self, pane: &Pane) -> Vec<Vec<Cell>> {
-        let scrollback_len = pane.total_lines();
         let top = pane.viewport_top();
         let height = pane.viewport_height();
         (top..top + height)
-            .map(|combined_index| {
-                if combined_index < scrollback_len {
-                    pane.scrollback_line_cells(combined_index)
-                } else {
-                    // Past the end of committed scrollback: read
-                    // straight from the live grid. `.get(...)` returns
-                    // `None` (rendered blank) once `combined_index`
-                    // runs past the live grid's own length too — e.g.
-                    // the tail of the viewport when the grid hasn't
-                    // filled the screen yet.
-                    self.primary_grid
-                        .get(combined_index - scrollback_len)
-                        .cloned()
-                        .unwrap_or_default()
-                }
-            })
+            .map(|combined_index| self.combined_line_cells(pane, combined_index))
             .collect()
+    }
+
+    // Non-destructive combined-timeline read of a single line's raw
+    // cells: committed scrollback first, then whatever's still live in
+    // the grid, addressed as one continuous index space. This is the
+    // same split `render_scrolled_primary_view` used to do inline
+    // before selection/search code needed the same lookup — factored
+    // out so `Session::combined_line_cells` (and everything built on
+    // it below) can address an arbitrary combined index without
+    // flushing the grid. See that function's comment for why flushing
+    // is off the table here.
+    //
+    // Wide-char continuation sentinels (`\0`) are kept, matching
+    // `ScrollbackBuffer::line_cells` — callers that need visual-column
+    // indexing (mouse selections) want the raw cells; callers that
+    // want plain text should go through `combined_extract_lines`.
+    pub fn combined_line_cells(&self, pane: &Pane, index: usize) -> ScrollbackLine {
+        let scrollback_len = pane.total_lines();
+        if index < scrollback_len {
+            pane.scrollback_line_cells(index)
+        } else {
+            // Past the end of committed scrollback: read straight from
+            // the live grid. `.get(...)` returns `None` (empty vec)
+            // once `index` runs past the live grid's own length too —
+            // e.g. a caller probing past the end of the timeline.
+            self.primary_grid
+                .get(index - scrollback_len)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    // Total addressable lines across scrollback plus the live primary
+    // grid — i.e. what `pane.total_lines()` would read immediately
+    // after a `flush_incomplete_line`, without paying for the flush's
+    // side effects (draining the grid, resetting the cursor). Used by
+    // selection code that used to call `flush_grid_to_scrollback()`
+    // purely to get an accurate line count.
+    pub fn combined_total_lines(&self, pane: &Pane) -> usize {
+        pane.total_lines() + self.primary_grid.len()
+    }
+
+    // Combined-timeline counterpart to `ScrollbackBuffer::extract_lines`:
+    // same inclusive-range / order-normalized / trailing-blank-trimmed
+    // text semantics (via the shared `trimmed_line_text` helper), but
+    // addressed through `combined_line_cells` so a selection that spans
+    // the scrollback/live-grid boundary — or that was made entirely
+    // against rows still sitting in the live grid — reads correctly
+    // without flushing. Out-of-range indices are silently skipped, same
+    // as the scrollback-only version.
+    pub fn combined_extract_lines(&self, pane: &Pane, start: usize, end: usize) -> String {
+        let (low, high) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let total = self.combined_total_lines(pane);
+        let mut out = String::new();
+        for index in low..=high {
+            if index >= total {
+                continue;
+            }
+            let cells = self.combined_line_cells(pane, index);
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&trimmed_line_text(&cells));
+        }
+        out
+    }
+
+    // Combined-timeline counterpart to `ScrollbackBuffer::search`.
+    // Scans committed scrollback first, then the live grid, and
+    // returns indices in the same combined address space
+    // `combined_line_cells` reads — so a match found in an
+    // as-yet-unflushed grid row still resolves correctly through
+    // `Session::combined_line_cells`/`combined_extract_lines` when the
+    // caller jumps to it, even after that row later evicts into
+    // scrollback (combined indices are stable across eviction: a row's
+    // index doesn't change when it moves from grid to scrollback,
+    // because scrollback grows by exactly the amount the grid's
+    // implicit offset shrinks).
+    pub fn combined_search(&self, pane: &Pane, needle: &str) -> Vec<usize> {
+        let mut matches = pane.search_scrollback(needle);
+        let scrollback_len = pane.total_lines();
+        let grid_matches = search_line_indices(self.primary_grid.iter(), needle);
+        matches.extend(grid_matches.into_iter().map(|index| index + scrollback_len));
+        matches
     }
 
     // Tell the pane's scrollback buffer how many rows the live primary
