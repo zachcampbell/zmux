@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 pub fn state_dir() -> PathBuf {
     if let Ok(path) = env::var("ZMUX_STATE_DIR")
@@ -21,6 +24,16 @@ pub fn state_dir() -> PathBuf {
         return PathBuf::from(home).join(".local/state/zmux");
     }
     env::temp_dir().join("zmux-state")
+}
+
+/// Create a directory tree for sensitive zmux state and ensure the final
+/// directory is private even when it already existed with permissive modes.
+pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 pub fn safe_component(input: &str) -> String {

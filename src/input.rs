@@ -18,8 +18,6 @@ pub struct MouseEvent {
 }
 
 impl MouseEvent {
-    pub const WHEEL_LINES: usize = 3;
-
     pub fn is_scroll_up(self) -> bool {
         self.button & 64 != 0 && (self.button & 0b11) == 0
     }
@@ -28,12 +26,16 @@ impl MouseEvent {
         self.button & 64 != 0 && (self.button & 0b11) == 1
     }
 
-    pub fn wheel_lines(self) -> Option<usize> {
+    pub fn wheel_lines(self, lines_per_event: usize) -> Option<usize> {
         if self.is_scroll_up() || self.is_scroll_down() {
-            Some(Self::WHEEL_LINES)
+            Some(lines_per_event.max(1))
         } else {
             None
         }
+    }
+
+    pub fn shift_held(self) -> bool {
+        self.button & 4 != 0
     }
 
     pub fn is_left_press(self) -> bool {
@@ -287,6 +289,19 @@ mod tests {
                 })
             ]
         );
+    }
+
+    #[test]
+    fn wheel_event_uses_the_configured_line_count() {
+        let wheel = MouseEvent {
+            button: 64,
+            col: 0,
+            row: 0,
+            final_byte: b'M',
+        };
+
+        assert_eq!(wheel.wheel_lines(1), Some(1));
+        assert_eq!(wheel.wheel_lines(5), Some(5));
     }
 
     #[test]

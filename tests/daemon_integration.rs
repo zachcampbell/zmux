@@ -4,6 +4,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -435,6 +436,64 @@ fn daemon_exits_when_socket_is_removed_externally() {
 
     let status = session.wait_for_exit(CONNECT_TIMEOUT);
     assert!(status.success(), "orphaned daemon exited with {status}");
+}
+
+#[test]
+fn capture_of_missing_pane_does_not_create_or_truncate_output() {
+    let name = support::unique_name("it-capture-missing");
+    let path = support::client_socket_path(&name);
+    let _session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
+
+    let output = std::env::temp_dir().join(format!("{name}-sentinel.bin"));
+    std::fs::write(&output, b"do-not-truncate").unwrap();
+    let mut client = connect(&path);
+    send(
+        &mut client,
+        &ClientMessage::Capture {
+            pane_id: u32::MAX,
+            path: output.to_string_lossy().into_owned(),
+        },
+    );
+    thread::sleep(Duration::from_millis(100));
+
+    assert_eq!(std::fs::read(&output).unwrap(), b"do-not-truncate");
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
+fn duplicate_serve_refuses_to_replace_a_live_session() {
+    let name = support::unique_name("it-duplicate-serve");
+    let path = support::client_socket_path(&name);
+    let _session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
+
+    let mut duplicate = Command::new(env!("CARGO_BIN_EXE_zmux"))
+        .arg("serve")
+        .arg(&name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn duplicate serve");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let status = loop {
+        if let Some(status) = duplicate.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = duplicate.kill();
+            let _ = duplicate.wait();
+            panic!("duplicate serve stayed alive and replaced the existing session");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    assert!(!status.success(), "duplicate serve must be rejected");
+    assert!(
+        UnixStream::connect(&path).is_ok(),
+        "the original session must remain reachable"
+    );
 }
 
 fn read_frame_with(stream: &mut UnixStream, needle: &str) -> Vec<String> {

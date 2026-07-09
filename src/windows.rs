@@ -44,6 +44,7 @@ pub struct WindowSet {
     session_name: String,
     scrollback_lines: usize,
     status_bar_hints: bool,
+    wheel_scroll_lines: usize,
     status_label_override: Option<String>,
 }
 
@@ -57,6 +58,7 @@ impl WindowSet {
         status_label_override: Option<String>,
     ) -> Self {
         let session_event_bus = Arc::new(Mutex::new(EventBus::default()));
+        let wheel_scroll_lines = first.wheel_scroll_lines();
         first.set_session_event_bus(session_event_bus.clone());
         let mut set = Self {
             windows: vec![first],
@@ -69,6 +71,7 @@ impl WindowSet {
             session_name,
             scrollback_lines,
             status_bar_hints,
+            wheel_scroll_lines,
             status_label_override,
         };
         set.sync_window_indicator();
@@ -416,6 +419,7 @@ impl WindowSet {
             self.status_bar_hints,
             pane_id,
         )?;
+        workspace.set_wheel_scroll_lines(self.wheel_scroll_lines);
         workspace.set_session_event_bus(self.session_event_bus.clone());
         // Carry the status_label_override onto the new window so the
         // left label stays consistent across windows.
@@ -445,6 +449,7 @@ impl WindowSet {
             self.status_bar_hints,
             pane_id,
         )?;
+        workspace.set_wheel_scroll_lines(self.wheel_scroll_lines);
         workspace.set_session_event_bus(self.session_event_bus.clone());
         workspace.set_status_label_override(self.status_label_override.clone());
         self.windows.push(workspace);
@@ -729,6 +734,31 @@ mod tests {
         assert_eq!(created, 1);
         assert_eq!(set.window_count(), 2);
         assert_eq!(set.active_index(), 1);
+    }
+
+    #[test]
+    fn new_windows_inherit_wheel_scroll_configuration() {
+        let mut workspace = Workspace::spawn_single_named_with_options(
+            "/bin/sh",
+            PtySize::new(24, 80),
+            "test",
+            DEFAULT_SCROLLBACK_LINES,
+            DEFAULT_STATUS_BAR_HINTS,
+        )
+        .expect("spawn initial workspace");
+        workspace.set_wheel_scroll_lines(7);
+        let mut set = WindowSet::new(
+            workspace,
+            "/bin/sh".to_string(),
+            "test".to_string(),
+            DEFAULT_SCROLLBACK_LINES,
+            DEFAULT_STATUS_BAR_HINTS,
+            None,
+        );
+
+        set.new_window().expect("new window");
+
+        assert_eq!(set.active().wheel_scroll_lines(), 7);
     }
 
     #[test]

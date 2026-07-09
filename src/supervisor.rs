@@ -4,6 +4,7 @@
 //! Ctrl-a A overlay: live dashboard of every pane in the session.
 
 use crate::events::Event;
+use crate::style::{display_width, truncate_to_width};
 
 /// Output of `render_supervisor`. Plain ASCII/UTF-8 lines plus the
 /// (col, row) anchor where the workspace renderer should stamp the
@@ -508,8 +509,8 @@ pub fn render_supervisor(state: &SupervisorState, cols: u16, rows: u16) -> Super
 fn top_border(inner_width: usize, title: &str, count_label: &str) -> String {
     // ┌─ title …count ─┐. Title sits left, count sits right; dashes
     // fill the middle so the box always reaches inner_width.
-    let title_chars = title.chars().count();
-    let count_chars = count_label.chars().count();
+    let title_chars = display_width(title);
+    let count_chars = display_width(count_label);
     // Leading dash + title + middle dashes + count + trailing dash
     // must equal `inner_width`.
     let consumed = 1 + title_chars + count_chars + 1;
@@ -531,7 +532,7 @@ fn bottom_border(inner_width: usize, footer: &str) -> String {
     let mut s = String::new();
     s.push('\u{2514}'); // └
     s.push('\u{2500}');
-    let footer_chars = footer.chars().count();
+    let footer_chars = display_width(footer);
     let dashes = inner_width.saturating_sub(footer_chars + 1);
     for _ in 0..dashes {
         s.push('\u{2500}');
@@ -544,14 +545,9 @@ fn bottom_border(inner_width: usize, footer: &str) -> String {
 fn format_body_line(inner_width: usize, content: &str) -> String {
     let mut s = String::new();
     s.push('\u{2502}'); // │
-    let mut count = 0;
-    for ch in content.chars() {
-        if count >= inner_width {
-            break;
-        }
-        s.push(ch);
-        count += 1;
-    }
+    let content = truncate_to_width(content, inner_width);
+    let mut count = display_width(&content);
+    s.push_str(&content);
     while count < inner_width {
         s.push(' ');
         count += 1;
@@ -597,12 +593,11 @@ fn format_row(inner_width: usize, row: &SupervisorRow) -> String {
 }
 
 fn pad_or_trim(s: &str, width: usize) -> String {
-    let count = s.chars().count();
+    let count = display_width(s);
     if count == width {
         s.to_string()
     } else if count > width {
-        // Trim, keeping leading chars.
-        s.chars().take(width).collect()
+        truncate_to_width(s, width)
     } else {
         let mut out = s.to_string();
         for _ in count..width {
@@ -615,6 +610,13 @@ fn pad_or_trim(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pad_or_trim_uses_terminal_display_width() {
+        assert_eq!(pad_or_trim("你a", 3), "你a");
+        assert_eq!(pad_or_trim("你ab", 3), "你a");
+        assert_eq!(pad_or_trim("e\u{0301}", 2), "e\u{0301} ");
+    }
 
     #[test]
     fn spawn_then_state_change_updates_row() {

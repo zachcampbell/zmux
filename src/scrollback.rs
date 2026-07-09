@@ -26,14 +26,12 @@ pub type ScrollbackLine = Vec<Cell>;
 pub(crate) fn trimmed_line_text(cells: &[Cell]) -> String {
     let trailing = cells
         .iter()
-        .rposition(|cell| cell.ch != ' ')
+        .rposition(|cell| *cell != Cell::BLANK)
         .map(|i| i + 1)
         .unwrap_or(0);
     let mut out = String::new();
     for cell in &cells[..trailing] {
-        if cell.ch != '\0' {
-            out.push(cell.ch);
-        }
+        cell.push_text(&mut out);
     }
     out
 }
@@ -58,11 +56,11 @@ where
         .into_iter()
         .enumerate()
         .filter_map(|(index, cells)| {
-            let text: String = cells
-                .iter()
-                .map(|cell| cell.ch)
-                .collect::<String>()
-                .to_lowercase();
+            let mut text = String::new();
+            for cell in cells {
+                cell.push_text(&mut text);
+            }
+            let text = text.to_lowercase();
             if text.contains(&lower) {
                 Some(index)
             } else {
@@ -492,7 +490,7 @@ mod tests {
         // This is the arithmetic behind the mouse-wheel-jump bug: with
         // 8 committed scrollback lines sitting under a full 4-row live
         // grid, the combined bottom is at combined index 8. A single
-        // wheel-up notch (3 lines) must move the top by exactly 3 —
+        // explicit three-line scroll request must move the top by exactly 3 —
         // not by a whole grid's worth (4) and not by nothing, which is
         // what happens when `max_viewport_top` ignores the live tail.
         let mut buffer = ScrollbackBuffer::new(32, 4);
@@ -506,7 +504,7 @@ mod tests {
         assert_eq!(buffer.viewport_top(), 5);
         assert!(!buffer.follow_output());
 
-        // The next notch keeps scrolling smoothly by the same amount —
+        // The next request keeps scrolling smoothly by the same amount —
         // this is the "subsequent notches scroll fine" half of the bug
         // report, confirmed still true under the fix.
         assert_eq!(buffer.scroll_up(3), 3);

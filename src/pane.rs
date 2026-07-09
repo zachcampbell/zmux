@@ -193,11 +193,11 @@ impl Pane {
             .tail_lines(lines)
             .into_iter()
             .map(|cells| {
-                cells
-                    .iter()
-                    .filter(|c| c.ch != '\0')
-                    .map(|c| c.ch)
-                    .collect()
+                let mut text = String::new();
+                for cell in &cells {
+                    cell.push_text(&mut text);
+                }
+                text
             })
             .collect();
         if !strip_ansi {
@@ -380,11 +380,11 @@ impl Pane {
             .visible_lines()
             .into_iter()
             .map(|cells| {
-                cells
-                    .iter()
-                    .filter(|c| c.ch != '\0')
-                    .map(|c| c.ch)
-                    .collect()
+                let mut text = String::new();
+                for cell in &cells {
+                    cell.push_text(&mut text);
+                }
+                text
             })
             .collect()
     }

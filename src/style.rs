@@ -206,6 +206,31 @@ pub fn char_width(ch: char) -> usize {
     if c < 0x7F {
         return 1;
     }
+    // Non-spacing marks and emoji sequence components attach to the
+    // preceding base cell. This intentionally covers the modern combining
+    // blocks, variation selectors, emoji skin-tone modifiers, and ZWJ.
+    if matches!(c,
+        0x0300..=0x036F
+            | 0x0483..=0x0489
+            | 0x0591..=0x05BD
+            | 0x05BF
+            | 0x05C1..=0x05C2
+            | 0x05C4..=0x05C5
+            | 0x0610..=0x061A
+            | 0x064B..=0x065F
+            | 0x0670
+            | 0x06D6..=0x06ED
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x200D
+            | 0x20D0..=0x20FF
+            | 0xFE00..=0xFE0F
+            | 0xFE20..=0xFE2F
+            | 0x1F3FB..=0x1F3FF
+            | 0xE0100..=0xE01EF
+    ) {
+        return 0;
+    }
     // Sparse emoji-presentation Dingbats (U+2700..U+27BF). Most chars in
     // this block are single-cell symbols, but a handful render as
     // double-width emoji (✅, ❌, ✔ when in emoji form, …). Listing the
@@ -287,6 +312,65 @@ pub fn char_width(ch: char) -> usize {
     1
 }
 
+/// Terminal-cell width of a Unicode string. Zero-width marks attach to the
+/// preceding cell, and the base character following a ZWJ remains part of
+/// the same rendered grapheme rather than consuming another cell.
+pub fn display_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut join_next = false;
+    for ch in text.chars() {
+        if ch == '\u{200d}' {
+            join_next = true;
+            continue;
+        }
+        let ch_width = char_width(ch);
+        if ch_width == 0 {
+            continue;
+        }
+        if join_next {
+            join_next = false;
+        } else {
+            width += ch_width;
+        }
+    }
+    width
+}
+
+/// Keep the longest Unicode prefix that fits in `width` terminal cells,
+/// preserving combining/ZWJ components belonging to the accepted prefix.
+pub fn truncate_to_width(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    let mut join_next = false;
+    for ch in text.chars() {
+        if ch == '\u{200d}' {
+            if !out.is_empty() {
+                out.push(ch);
+                join_next = true;
+            }
+            continue;
+        }
+        let ch_width = char_width(ch);
+        if ch_width == 0 {
+            if !out.is_empty() {
+                out.push(ch);
+            }
+            continue;
+        }
+        if join_next {
+            out.push(ch);
+            join_next = false;
+            continue;
+        }
+        if used + ch_width > width {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out
+}
+
 // Approximate RGB triple for any 256-color palette index. Returns None
 // for the first 16 entries, which belong to the user's terminal theme
 // rather than a fixed RGB — callers that need an RGB answer for those
@@ -341,23 +425,52 @@ pub fn rgb_from_256(n: u8) -> Option<(u8, u8, u8)> {
 pub struct Cell {
     pub ch: char,
     pub style: Style,
+    suffix: Option<Arc<str>>,
 }
 
 impl Cell {
     pub const BLANK: Cell = Cell {
         ch: ' ',
         style: Style::DEFAULT,
+        suffix: None,
     };
 
     pub fn new(ch: char) -> Self {
         Self {
             ch,
             style: Style::DEFAULT,
+            suffix: None,
         }
     }
 
     pub fn styled(ch: char, style: Style) -> Self {
-        Self { ch, style }
+        Self {
+            ch,
+            style,
+            suffix: None,
+        }
+    }
+
+    pub(crate) fn append_suffix(&mut self, ch: char) {
+        let mut suffix = self.suffix.as_deref().unwrap_or_default().to_string();
+        suffix.push(ch);
+        self.suffix = Some(Arc::from(suffix));
+    }
+
+    pub(crate) fn suffix_ends_with_joiner(&self) -> bool {
+        self.suffix
+            .as_deref()
+            .is_some_and(|suffix| suffix.ends_with('\u{200d}'))
+    }
+
+    pub(crate) fn push_text(&self, output: &mut String) {
+        if self.ch == '\0' {
+            return;
+        }
+        output.push(self.ch);
+        if let Some(suffix) = &self.suffix {
+            output.push_str(suffix);
+        }
     }
 }
 
@@ -391,7 +504,7 @@ pub fn serialize_row(cells: &[Cell]) -> String {
             active = cell.style.clone();
             first = false;
         }
-        buffer.push(cell.ch);
+        cell.push_text(&mut buffer);
     }
 
     if active_link.is_some() {
@@ -662,6 +775,15 @@ mod tests {
         assert_eq!(char_width('🚀'), 2);
         // Latin-1 supplemental is still width-1.
         assert_eq!(char_width('é'), 1);
+    }
+
+    #[test]
+    fn combining_and_emoji_sequence_components_have_zero_cell_width() {
+        use super::char_width;
+
+        for ch in ['\u{0301}', '\u{fe0f}', '\u{1f3fd}', '\u{200d}'] {
+            assert_eq!(char_width(ch), 0, "{ch:?} must attach to a base cell");
+        }
     }
 
     #[test]

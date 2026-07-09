@@ -34,8 +34,8 @@ pub mod workspace_render;
 
 pub use config::Config;
 pub use daemon::{
-    AttachOutcome, PruneReport, SessionEntry, attach_session, create_session, default_session_name,
-    kill_session, list_sessions, list_sessions_verbose, print_session_list,
+    AttachOutcome, PruneReport, SessionEntry, attach_session, create_session, daemon_log_path,
+    default_session_name, kill_session, list_sessions, list_sessions_verbose, print_session_list,
     print_session_list_verbose, prune_stale_sessions, run_server, send_admin_message,
 };
 pub use input::{InputAction, InputParser, MouseEvent};

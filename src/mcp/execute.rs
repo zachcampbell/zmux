@@ -719,23 +719,25 @@ fn execute_send_keys(
     // keystrokes before the submit, not as paste content.
     let deadline = Instant::now() + std::time::Duration::from_millis(75);
     if wait_for_idle {
-        return Outcome::Defer(
-            pane_settled_pending(
+        let mut pending = pane_settled_pending(
+            pane_id,
+            max_wait_ms,
+            WaitCondition::PaneSettledAfterOutput {
                 pane_id,
-                max_wait_ms,
-                WaitCondition::PaneSettledAfterOutput {
-                    pane_id,
-                    since: wait_start,
-                    deferred_enter_at: Some(deadline),
-                    expect_text: expect_text.clone(),
-                    wait_lines,
-                },
-                true,
-                expect_text,
+                since: wait_start,
+                deferred_enter_at: Some(deadline),
+                expect_text: expect_text.clone(),
                 wait_lines,
-            ),
+            },
             true,
+            expect_text,
+            wait_lines,
         );
+        // Enter is deliberately delayed so terminal UIs do not interpret
+        // the text and CR as one paste. A caller's shorter settle budget
+        // must not expire before that required input has actually been sent.
+        pending.deadline = pending.deadline.max(deadline);
+        return Outcome::Defer(pending, true);
     }
     Outcome::Defer(
         Pending {

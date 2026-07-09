@@ -6,7 +6,7 @@
 //! no `Workspace` state.
 
 use crate::layout::PaneLayout;
-use crate::style::{Cell, Style};
+use crate::style::{Cell, Style, char_width};
 
 pub(crate) fn stamp_text(
     frame: &mut [Vec<Cell>],
@@ -28,16 +28,11 @@ pub(crate) fn stamp_text(
     );
 }
 
-// Explicit counter beats `.zip(start..)` here because we need to
-// short-circuit on two independent bounds (row.len() and end) per
-// iteration; the .zip form would require an awkward take_while.
-#[allow(clippy::explicit_counter_loop)]
 pub(crate) fn stamp_row_text(row: &mut [Cell], start: usize, end: usize, text: &str, style: Style) {
     let mut cursor = start;
+    let limit = end.min(row.len());
+    let mut last_base: Option<usize> = None;
     for ch in text.chars() {
-        if cursor >= row.len() || cursor >= end {
-            break;
-        }
         // Defense in depth: every real pane's PTY output is parsed by
         // the VT100 state machine in terminal.rs before it ever becomes
         // a Cell, which strips control chars out of the printable
@@ -53,8 +48,28 @@ pub(crate) fn stamp_row_text(row: &mut [Cell], start: usize, end: usize, text: &
         // text source reaching this shared choke point can inject
         // escape sequences into another client's screen.
         let safe_ch = if ch.is_control() { ' ' } else { ch };
+        let width = char_width(safe_ch);
+        if width == 0 {
+            if let Some(index) = last_base {
+                row[index].append_suffix(safe_ch);
+            }
+            continue;
+        }
+        if last_base.is_some_and(|index| row[index].suffix_ends_with_joiner()) {
+            if let Some(index) = last_base {
+                row[index].append_suffix(safe_ch);
+            }
+            continue;
+        }
+        if cursor >= limit || cursor.saturating_add(width) > limit {
+            break;
+        }
         row[cursor] = Cell::styled(safe_ch, style.clone());
-        cursor += 1;
+        last_base = Some(cursor);
+        if width == 2 {
+            row[cursor + 1] = Cell::styled('\0', style.clone());
+        }
+        cursor += width;
     }
 }
 
@@ -194,5 +209,23 @@ pub(crate) fn draw_big_digits(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stamp_row_text;
+    use crate::style::{Cell, Style, serialize_row};
+
+    #[test]
+    fn stamped_chrome_uses_terminal_cell_width() {
+        let mut row = vec![Cell::BLANK; 4];
+        stamp_row_text(&mut row, 0, 4, "A你B", Style::DEFAULT);
+
+        assert_eq!(serialize_row(&row), "A你B");
+        assert_eq!(row[0].ch, 'A');
+        assert_eq!(row[1].ch, '你');
+        assert_eq!(row[2].ch, '\0');
+        assert_eq!(row[3].ch, 'B');
     }
 }

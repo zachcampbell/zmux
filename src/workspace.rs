@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::agent::{AgentState, IdleDetector, PromptDetector};
-use crate::config::{DEFAULT_SCROLLBACK_LINES, DEFAULT_STATUS_BAR_HINTS};
+use crate::config::{
+    DEFAULT_SCROLLBACK_LINES, DEFAULT_STATUS_BAR_HINTS, DEFAULT_WHEEL_SCROLL_LINES,
+};
 use crate::events::{Event, EventBus};
 use crate::input::{InputAction, MouseEvent};
 use crate::layout::{
@@ -19,7 +21,7 @@ use crate::layout::{
 use crate::mouse::{MouseTrackingMode, ScreenMode};
 use crate::pty::PtySize;
 use crate::session::Session;
-use crate::style::{Attrs, Cell, Color, Style, serialize_row};
+use crate::style::{Attrs, Cell, Color, Style, display_width, serialize_row};
 use crate::supervisor::{
     BroadcastFilter, BroadcastState, SupervisorRow, SupervisorState, render_supervisor,
 };
@@ -35,6 +37,11 @@ const DEFAULT_IDLE_THRESHOLD: Duration = Duration::from_millis(750);
 // status updates).
 const PANE_OUTPUT_BYTE_THRESHOLD: u64 = 64;
 const PANE_OUTPUT_TIME_THRESHOLD: Duration = Duration::from_millis(100);
+// SGR mouse reporting does not identify whether a drag came from a mouse or
+// touchscreen. Wait for a small, predominantly vertical movement before
+// treating an unmodified drag as natural touch scrolling; horizontal drags
+// keep the existing selection behavior, and Shift always forces selection.
+const TOUCH_DRAG_SCROLL_THRESHOLD_ROWS: u16 = 2;
 
 // Minimal subset of the POSIX `struct tm` fields, used to format local
 // wall-clock time for the status bar. Order matches glibc/musl layout on
@@ -150,6 +157,7 @@ pub struct Workspace {
     // selection when they belong to an in-progress drag, not when the
     // terminal happens to emit stray motion for another reason.
     mouse_drag_active: bool,
+    mouse_drag_gesture: Option<MouseDragGesture>,
     // Set when the user grabbed a pane border with the mouse. Holds
     // the two neighbor panes on either side of the separator plus the
     // last pointer position we applied weight adjustments at, so each
@@ -182,6 +190,9 @@ pub struct Workspace {
     // How many rows of scrollback every new pane's Session buffers.
     // Flows through to Session::spawn_command's retain/scrollback arg.
     scrollback_lines: usize,
+    // Rows moved for each host-terminal wheel event. Touch drag deltas are
+    // already expressed in rows and do not use this multiplier.
+    wheel_scroll_lines: usize,
     // When false, the status bar omits the Ctrl-a hint strip so the
     // middle section is empty. Useful for users who already know the
     // bindings.
@@ -256,6 +267,15 @@ struct MouseResize {
     right_or_bottom_pane: PaneId,
     last_col: u16,
     last_row: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MouseDragGesture {
+    origin_col: u16,
+    origin_row: u16,
+    last_row: u16,
+    scroll_active: bool,
+    force_selection: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -479,6 +499,7 @@ impl Workspace {
             rename_input: None,
             sync_panes: false,
             mouse_drag_active: false,
+            mouse_drag_gesture: None,
             mouse_resize: None,
             // Start at Quadrants so the first Ctrl-a Space cycles to
             // TwoColumns — the least-destructive default of the three.
@@ -487,6 +508,7 @@ impl Workspace {
             paste_buffer: None,
             command_input: None,
             scrollback_lines,
+            wheel_scroll_lines: DEFAULT_WHEEL_SCROLL_LINES,
             status_bar_hints,
             prompt_error: None,
             // Genesis pane (id 1) predates any possible subscriber
@@ -577,12 +599,14 @@ impl Workspace {
             rename_input: None,
             sync_panes: false,
             mouse_drag_active: false,
+            mouse_drag_gesture: None,
             mouse_resize: None,
             last_preset: LayoutPreset::Quadrants,
             pending_clipboard: None,
             paste_buffer: None,
             command_input: None,
             scrollback_lines,
+            wheel_scroll_lines: DEFAULT_WHEEL_SCROLL_LINES,
             status_bar_hints,
             prompt_error: None,
             event_bus: EventBus::default(),
@@ -678,7 +702,6 @@ impl Workspace {
             return Ok(false);
         }
 
-        self.unzoom();
         let active = self.active;
         self.split_pane_with_id(active, orientation)?;
         Ok(true)
@@ -690,18 +713,14 @@ impl Workspace {
         orientation: SplitOrientation,
     ) -> io::Result<()> {
         let new_id = self.next_pane_id;
-        self.next_pane_id += 1;
-
-        if !self.tree.split_at(target, new_id, orientation) {
+        let mut next_tree = self.tree.clone();
+        if !next_tree.split_at(target, new_id, orientation) {
             return Err(io::Error::other(format!(
                 "pane id {target} not found in layout tree",
             )));
         }
-
-        self.layout = self.compute_layout();
-
-        let pane_frame = self
-            .layout
+        let next_layout = next_tree.compute(self.size);
+        let pane_frame = next_layout
             .pane_frame(new_id)
             .expect("split_at must leave the new pane in the tree");
         let title = format!("pane-{new_id}");
@@ -722,6 +741,14 @@ impl Workspace {
             bytes_since_emit: 0,
             last_output_emit_at: Instant::now(),
         };
+
+        // PTY construction is the fallible part. Commit structural state only
+        // after it succeeds so an invalid shell cannot leave a phantom pane,
+        // consume an id, or unexpectedly clear zoom.
+        self.next_pane_id = new_id.saturating_add(1);
+        self.zoomed = None;
+        self.tree = next_tree;
+        self.layout = next_layout;
         self.sessions.push(session);
 
         self.apply_layout_to_panes()?;
@@ -935,7 +962,7 @@ impl Workspace {
                 .map(|i| i + 1)
                 .unwrap_or(0);
             for cell in &row[..end] {
-                out.push(cell.ch);
+                cell.push_text(&mut out);
             }
         }
         self.paste_buffer = Some(out.clone());
@@ -1041,7 +1068,10 @@ impl Workspace {
         let b = self.clear_selection();
         let c = self.cancel_rename();
         let d = self.cancel_command_prompt();
-        a || b || c || d
+        let e = self.mouse_drag_active || self.mouse_drag_gesture.is_some();
+        self.mouse_drag_active = false;
+        self.mouse_drag_gesture = None;
+        a || b || c || d || e
     }
 
     pub fn search_next(&mut self) -> bool {
@@ -1724,7 +1754,6 @@ impl Workspace {
         {
             return Ok(false);
         }
-        self.unzoom();
         self.split_pane_with_command(self.active, orientation, command)?;
         Ok(true)
     }
@@ -1736,18 +1765,14 @@ impl Workspace {
         command: &str,
     ) -> io::Result<()> {
         let new_id = self.next_pane_id;
-        self.next_pane_id += 1;
-
-        if !self.tree.split_at(target, new_id, orientation) {
+        let mut next_tree = self.tree.clone();
+        if !next_tree.split_at(target, new_id, orientation) {
             return Err(io::Error::other(format!(
                 "pane id {target} not found in layout tree",
             )));
         }
-
-        self.layout = self.compute_layout();
-
-        let pane_frame = self
-            .layout
+        let next_layout = next_tree.compute(self.size);
+        let pane_frame = next_layout
             .pane_frame(new_id)
             .expect("split_at must leave the new pane in the tree");
         // Pane header defaults to a shortened form of the command so the
@@ -1771,6 +1796,11 @@ impl Workspace {
             bytes_since_emit: 0,
             last_output_emit_at: Instant::now(),
         };
+
+        self.next_pane_id = new_id.saturating_add(1);
+        self.zoomed = None;
+        self.tree = next_tree;
+        self.layout = next_layout;
         self.sessions.push(session);
         // Stash the spawn-time command on the pane so callers (MCP,
         // supervisor overlay) can show what's running in a pane that
@@ -1977,7 +2007,6 @@ impl Workspace {
                 "layout cannot fit another pane in the requested orientation",
             ));
         }
-        self.unzoom();
         // `next_pane_id` is read inside `split_pane_with_command` —
         // capture it before the call so we can return the freshly
         // minted id without re-reading state that may have shifted.
@@ -2386,6 +2415,14 @@ impl Workspace {
         self.size
     }
 
+    pub fn set_wheel_scroll_lines(&mut self, lines: usize) {
+        self.wheel_scroll_lines = lines.max(1);
+    }
+
+    pub(crate) fn wheel_scroll_lines(&self) -> usize {
+        self.wheel_scroll_lines
+    }
+
     pub fn set_status_label_override(&mut self, label: Option<String>) {
         self.status_label_override = label;
     }
@@ -2522,16 +2559,15 @@ impl Workspace {
                             .enumerate()
                             .map(|(col, cell)| {
                                 if sel.contains_cell(buffer_line, col) {
-                                    Cell {
-                                        ch: cell.ch,
-                                        style: Style {
-                                            attrs: Attrs {
-                                                reverse: !cell.style.attrs.reverse,
-                                                ..cell.style.attrs
-                                            },
-                                            ..cell.style.clone()
+                                    let mut selected = cell.clone();
+                                    selected.style = Style {
+                                        attrs: Attrs {
+                                            reverse: !cell.style.attrs.reverse,
+                                            ..cell.style.attrs
                                         },
-                                    }
+                                        ..cell.style.clone()
+                                    };
+                                    selected
                                 } else {
                                     cell.clone()
                                 }
@@ -2592,7 +2628,7 @@ impl Workspace {
                 } else {
                     normal_style.clone()
                 };
-                let line_chars = line.chars().count() as u16;
+                let line_chars = display_width(line).min(u16::MAX as usize) as u16;
                 stamp_text(
                     &mut frame,
                     supervisor_frame.origin_col,
@@ -2633,7 +2669,7 @@ impl Workspace {
             stamp_row_text(row, 0, cols, &label, status_style.clone());
 
             let clock = local_hms();
-            let clock_start = cols.saturating_sub(clock.chars().count());
+            let clock_start = cols.saturating_sub(display_width(&clock));
             stamp_row_text(row, clock_start, cols, &clock, status_style.clone());
 
             let zoom_tag = if self.zoomed.is_some() { " [Z]" } else { "" };
@@ -2732,7 +2768,7 @@ impl Workspace {
                     selection_tag,
                 )
             };
-            let middle_start = label.chars().count();
+            let middle_start = display_width(&label);
             let middle_end = clock_start.saturating_sub(1);
             if middle_end > middle_start {
                 stamp_row_text(row, middle_start, middle_end, &middle, status_style);
@@ -2895,9 +2931,50 @@ impl Workspace {
                         cursor_col: buffer_col,
                     });
                     self.mouse_drag_active = true;
+                    self.mouse_drag_gesture = Some(MouseDragGesture {
+                        origin_col: local_col,
+                        origin_row: local_row,
+                        last_row: local_row,
+                        scroll_active: false,
+                        force_selection: mouse.shift_held(),
+                    });
                     return Ok(true);
                 }
                 if mouse.is_left_drag_motion() && self.mouse_drag_active {
+                    let Some(mut gesture) = self.mouse_drag_gesture else {
+                        return Ok(true);
+                    };
+                    if !gesture.force_selection && !gesture.scroll_active {
+                        let row_distance = local_row.abs_diff(gesture.origin_row);
+                        let col_distance = local_col.abs_diff(gesture.origin_col);
+                        if row_distance >= TOUCH_DRAG_SCROLL_THRESHOLD_ROWS
+                            && row_distance > col_distance
+                        {
+                            gesture.scroll_active = true;
+                            self.selection = None;
+                        }
+                    }
+
+                    if gesture.scroll_active {
+                        let row_delta = local_row as i32 - gesture.last_row as i32;
+                        gesture.last_row = local_row;
+                        self.mouse_drag_gesture = Some(gesture);
+                        if row_delta != 0
+                            && let Some(managed) = self.session_for_mut(pane_id)
+                        {
+                            if row_delta > 0 {
+                                managed.session.pane_mut().wheel_up(row_delta as usize);
+                            } else {
+                                managed
+                                    .session
+                                    .pane_mut()
+                                    .wheel_down(row_delta.unsigned_abs() as usize);
+                            }
+                        }
+                        return Ok(true);
+                    }
+
+                    self.mouse_drag_gesture = Some(gesture);
                     let buffer_line = viewport_top + local_row as usize;
                     let buffer_col = local_col as usize;
                     if let Some(selection) = self.selection.as_mut() {
@@ -2908,6 +2985,11 @@ impl Workspace {
                 }
                 if mouse.is_left_release() && self.mouse_drag_active {
                     self.mouse_drag_active = false;
+                    let gesture = self.mouse_drag_gesture.take();
+                    if gesture.is_some_and(|gesture| gesture.scroll_active) {
+                        self.selection = None;
+                        return Ok(true);
+                    }
                     if let Some(sel) = self.selection {
                         if sel.anchor_line == sel.cursor_line && sel.anchor_col == sel.cursor_col {
                             // Collapsed selection (press and release on
@@ -2938,22 +3020,26 @@ impl Workspace {
                 }
             }
 
+            let wheel_scroll_lines = self.wheel_scroll_lines;
             let Some(managed) = self.session_for_mut(pane_id) else {
                 return Ok(active_changed);
             };
             let local_mouse = mouse
                 .translate(mouse.col - local_col, mouse.row - local_row)
                 .expect("content hit-test must yield in-bounds coordinates");
-            let handled = managed.session.handle_mouse_event(local_mouse)?;
+            let handled = managed
+                .session
+                .handle_mouse_event(local_mouse, wheel_scroll_lines)?;
             return Ok(active_changed || handled || mouse.is_left_press());
         }
 
-        if mouse.wheel_lines().is_some()
+        let wheel_scroll_lines = self.wheel_scroll_lines;
+        if mouse.wheel_lines(wheel_scroll_lines).is_some()
             && let Some(active) = self.session_for_mut(self.active)
             && active.exit_status.is_none()
             && active.session.screen_mode() == ScreenMode::Primary
         {
-            return active.session.handle_mouse_event(mouse);
+            return active.session.handle_mouse_event(mouse, wheel_scroll_lines);
         }
 
         if mouse.is_left_press()
@@ -3107,9 +3193,7 @@ fn push_cell_range(out: &mut String, cells: &[Cell], lo: usize, hi: usize) {
         return;
     }
     for cell in &cells[lo..hi] {
-        if cell.ch != '\0' {
-            out.push(cell.ch);
-        }
+        cell.push_text(out);
     }
 }
 
@@ -3191,7 +3275,7 @@ fn extract_rect_stream(active: &ManagedSession, sel: Selection) -> String {
         for offset in 0..width {
             let col = col_lo + offset;
             match cells.get(col) {
-                Some(cell) if cell.ch != '\0' => out.push(cell.ch),
+                Some(cell) if cell.ch != '\0' => cell.push_text(&mut out),
                 Some(_) => {}
                 None => out.push(' '),
             }
@@ -3762,6 +3846,31 @@ mod tests {
     }
 
     #[test]
+    fn failed_split_spawn_leaves_workspace_state_unchanged() {
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(40, 120)).expect("spawn workspace");
+        workspace.toggle_zoom().expect("zoom in");
+        workspace.shell = "/definitely/not/a/real/shell".into();
+
+        let tree_before = workspace.tree.clone();
+        let layout_before = workspace.layout.clone();
+        let active_before = workspace.active;
+        let next_id_before = workspace.next_pane_id;
+        let pane_count_before = workspace.pane_count();
+
+        assert!(
+            workspace.split_active(SplitOrientation::Columns).is_err(),
+            "invalid shell should fail PTY spawn"
+        );
+        assert_eq!(workspace.tree, tree_before);
+        assert_eq!(workspace.layout, layout_before);
+        assert_eq!(workspace.active, active_before);
+        assert_eq!(workspace.next_pane_id, next_id_before);
+        assert_eq!(workspace.pane_count(), pane_count_before);
+        assert!(workspace.is_zoomed(), "failed split must preserve zoom");
+    }
+
+    #[test]
     fn search_prompt_state_machine_advances_correctly() {
         // Exercises begin → input → backspace → commit → clear without
         // depending on PTY-driven scrollback content. The "no matches"
@@ -3950,6 +4059,87 @@ mod tests {
             "collapsed click must not leave a selection"
         );
         assert!(workspace.take_pending_clipboard().is_none());
+    }
+
+    #[test]
+    fn mostly_vertical_unmodified_drag_scrolls_the_primary_viewport() {
+        use super::handle_mouse_test_input as ev;
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(8, 40)).expect("spawn workspace");
+        let active = workspace.active;
+
+        {
+            let managed = workspace.session_for_mut(active).expect("active pane");
+            for index in 1..=16 {
+                managed
+                    .session
+                    .pane_mut()
+                    .append_plain(&format!("line {index}"));
+            }
+        }
+
+        let pane = workspace.layout.pane_frame(active).expect("pane layout");
+        let col = pane.content.x + 5;
+        let start_row = pane.content.y + 1;
+        let before = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .scrollback_viewport_top();
+
+        workspace
+            .handle_input(InputAction::Mouse(ev(col, start_row, 0, b'M')))
+            .expect("press");
+        workspace
+            .handle_input(InputAction::Mouse(ev(col, start_row + 3, 32, b'M')))
+            .expect("vertical drag");
+
+        let after = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .scrollback_viewport_top();
+        assert_eq!(before.saturating_sub(after), 3);
+
+        workspace
+            .handle_input(InputAction::Mouse(ev(col, start_row + 1, 32, b'M')))
+            .expect("reverse vertical drag");
+        let after_reverse = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .scrollback_viewport_top();
+        assert_eq!(after_reverse.saturating_sub(after), 2);
+        assert!(
+            !workspace.has_selection(),
+            "a recognized touch-style scroll gesture must not leave selection state"
+        );
+
+        workspace
+            .handle_input(InputAction::Mouse(ev(col, start_row + 1, 0, b'm')))
+            .expect("release");
+        assert!(workspace.take_pending_clipboard().is_none());
+    }
+
+    #[test]
+    fn shift_vertical_drag_remains_text_selection() {
+        use super::handle_mouse_test_input as ev;
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(8, 40)).expect("spawn workspace");
+        let active = workspace.active;
+        let pane = workspace.layout.pane_frame(active).expect("pane layout");
+        let col = pane.content.x + 5;
+        let start_row = pane.content.y + 1;
+
+        workspace
+            .handle_input(InputAction::Mouse(ev(col, start_row, 4, b'M')))
+            .expect("shift press");
+        workspace
+            .handle_input(InputAction::Mouse(ev(col, start_row + 3, 36, b'M')))
+            .expect("shift drag");
+
+        assert!(workspace.has_selection());
+        assert!(workspace.mouse_drag_active);
     }
 
     #[test]
@@ -4440,10 +4630,32 @@ mod tests {
             .session
             .scrollback_viewport_top();
         assert!(handled, "out-of-layout wheel should be handled");
-        assert!(
-            after < before,
-            "wheel-up outside the layout should still scroll the active primary pane"
+        assert_eq!(
+            before - after,
+            1,
+            "the default wheel event should move exactly one row"
         );
+
+        workspace
+            .session_for_mut(active)
+            .expect("active pane")
+            .session
+            .scroll_to_bottom();
+        workspace.set_wheel_scroll_lines(4);
+        let configured_before = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .scrollback_viewport_top();
+        workspace
+            .handle_input(InputAction::Mouse(ev(90, 27, 64, b'M')))
+            .expect("configured wheel outside layout");
+        let configured_after = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .scrollback_viewport_top();
+        assert_eq!(configured_before - configured_after, 4);
     }
 
     #[test]

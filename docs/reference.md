@@ -22,7 +22,9 @@ Single-process dev modes: `cargo run --quiet` (bounded PTY demo),
 (two-pane foreground workspace).
 
 Sessions outlive the attached client. The daemon owns PTYs and workspace
-state; clients attach over `$TMPDIR/zmux-$USER/<name>.sock`.
+state; clients attach over `$TMPDIR/zmux-$USER/<name>.sock`. Starting
+`zmux serve` with a name that is already live is refused; it never replaces
+the existing session socket.
 
 ## Prefix bindings (Ctrl-a, while attached)
 
@@ -83,7 +85,14 @@ windows (tagged `w2:` etc.). Status glyphs: `●` working, `○` idle,
 | `v` / `V` / `R` | begin selection: character / line / rectangle |
 
 In selection mode, movement keys extend the selection; `y` yanks via OSC 52
-and exits; `Esc` cancels.
+and exits; `Esc` cancels. Scrollback remains available while an alternate-
+screen program is active: scrolling up reveals the retained primary history,
+and `G` restores the live alternate buffer. If the application enabled mouse
+tracking, wheel events inside its pane are forwarded to the application.
+On the primary screen, a mostly vertical unmodified drag scrolls the viewport.
+This also supports touchscreen swipes when the host terminal reports them as
+mouse drags. Horizontal drags select text; hold Shift to force selection for a
+vertical drag.
 
 ## Command prompt (Ctrl-a :)
 
@@ -102,6 +111,7 @@ Optional config at `~/.config/zmux/config.toml`:
 ```toml
 prefix = "ctrl-a"          # rebind the zmux prefix
 scrollback = 8192          # scrollback lines per pane
+wheel_scroll_lines = 1     # rows per wheel event (positive integer)
 status_hints = true        # show the Ctrl-a hint strip
 status_label = "foo"       # override the left-of-status name@host label
 
@@ -115,9 +125,15 @@ agent_prompts  = ["│ > ", "architect> ", ">>> "]
 
 | Var | Purpose |
 |---|---|
-| `ZMUX_STATE_DIR` | override the state directory (default `$XDG_STATE_HOME/zmux` or `~/.local/state/zmux`). Holds Claude hook event streams, pair-mode locks, and MCP audit logs. |
+| `ZMUX_STATE_DIR` | override the state directory (default `$XDG_STATE_HOME/zmux` or `~/.local/state/zmux`). Holds daemon logs, Claude hook event streams, pair-mode locks, and MCP audit logs. |
 | `ZMUX_PAIR_TIMEOUT_SECS` | Ollama HTTP timeout for `zmux pair` in seconds (default 60). |
 | `ZMUX_PTY_DUMP` | debug only: append every PTY ingest's raw bytes to the given path. Prefer `zmux capture` for bug repros. |
+
+Detached sessions append daemon diagnostics to
+`$ZMUX_STATE_DIR/logs/<session>.log`. State directories are created mode
+`0700`; daemon logs, hook/settings files, and MCP audit logs are mode `0600`.
+Foreground `zmux serve` continues to write diagnostics to its inherited
+stderr.
 
 ## MCP server
 
@@ -261,6 +277,10 @@ Capture the failing pane's raw bytes and replay them:
 zmux capture <session> <pane> /tmp/repro.bin
 cargo run --example replay -- /tmp/repro.bin
 ```
+
+The pane id is validated before the capture path is created, so a typo does
+not create or truncate the requested file. For daemon-side errors from a
+detached session, inspect `$ZMUX_STATE_DIR/logs/<session>.log`.
 
 The VT and layout layers are fuzzed (`tests/vt_fuzz.rs`,
 `tests/layout_props.rs`, `tests/input_fuzz.rs`): hostile byte streams,

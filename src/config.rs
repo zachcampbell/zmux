@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_PREFIX_BYTE: u8 = 0x01; // Ctrl-a
 pub const DEFAULT_SCROLLBACK_LINES: usize = 8_192;
+pub const DEFAULT_WHEEL_SCROLL_LINES: usize = 1;
 pub const DEFAULT_STATUS_BAR_HINTS: bool = true;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +37,7 @@ impl Default for AgentConfig {
 pub struct Config {
     pub prefix_byte: u8,
     pub scrollback_lines: usize,
+    pub wheel_scroll_lines: usize,
     pub status_bar_hints: bool,
     // Overrides the left-of-status label. `None` means fall back to the
     // default `{session_name}@{hostname}`. Loaded from `status_label`
@@ -49,6 +51,7 @@ impl Default for Config {
         Self {
             prefix_byte: DEFAULT_PREFIX_BYTE,
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
+            wheel_scroll_lines: DEFAULT_WHEEL_SCROLL_LINES,
             status_bar_hints: DEFAULT_STATUS_BAR_HINTS,
             status_label: None,
             agent: AgentConfig::default(),
@@ -144,6 +147,10 @@ fn apply_entry(config: &mut Config, key: &str, value: &str, path: Option<&Path>,
         "scrollback" => match value.parse::<usize>() {
             Ok(lines) if lines > 0 => config.scrollback_lines = lines,
             _ => report(path, line, "scrollback must be a positive integer"),
+        },
+        "wheel_scroll_lines" => match value.parse::<usize>() {
+            Ok(lines) if lines > 0 => config.wheel_scroll_lines = lines,
+            _ => report(path, line, "wheel_scroll_lines must be a positive integer"),
         },
         "status_hints" => match value {
             "true" => config.status_bar_hints = true,
@@ -303,6 +310,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.prefix_byte, 0x01);
         assert_eq!(config.scrollback_lines, 8_192);
+        assert_eq!(config.wheel_scroll_lines, 1);
         assert!(config.status_bar_hints);
         assert_eq!(config.agent.idle_threshold_ms, 750);
         assert!(!config.agent.shell_prompts.is_empty());
@@ -329,6 +337,7 @@ mod tests {
             b"# comment line\n\
               prefix = \"ctrl-s\"   # trailing comment\n\
               scrollback = 16384\n\
+              wheel_scroll_lines = 4\n\
               status_hints = false\n\
               unknown_key = \"ignored\"\n",
         )
@@ -351,7 +360,20 @@ mod tests {
 
         assert_eq!(config.prefix_byte, 0x13); // Ctrl-s
         assert_eq!(config.scrollback_lines, 16_384);
+        assert_eq!(config.wheel_scroll_lines, 4);
         assert!(!config.status_bar_hints);
+    }
+
+    #[test]
+    fn wheel_scroll_lines_rejects_zero_and_invalid_values() {
+        assert_eq!(
+            Config::from_str("wheel_scroll_lines = 0").wheel_scroll_lines,
+            1
+        );
+        assert_eq!(
+            Config::from_str("wheel_scroll_lines = nope").wheel_scroll_lines,
+            1
+        );
     }
 
     #[test]

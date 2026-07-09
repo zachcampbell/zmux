@@ -14,6 +14,7 @@
 //! directory.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -861,6 +862,59 @@ fn send_keys_writes_bytes_to_target_pane_pty() {
         "expected `hello` in {}, got {contents:?}",
         outfile.display()
     );
+}
+
+#[test]
+fn send_keys_short_wait_budget_still_delivers_deferred_enter() {
+    let name = unique_name("mcp-keys-short-wait");
+    let _session = spawn_serve(&name);
+    let outfile =
+        std::env::temp_dir().join(format!("zmux-mcp-short-wait-{}", unique_name("enter")));
+    let _ = std::fs::remove_file(&outfile);
+    let command = format!(
+        "IFS= read -r line && printf '%s' \"$line\" > {}",
+        outfile.display()
+    );
+    let spawn = round_trip(
+        &name,
+        json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"spawn_pane","arguments":{"command":command}}
+        }),
+    );
+    let pane_id = spawn["result"]["structuredContent"]["pane_id"]
+        .as_u64()
+        .expect("spawned pane id") as u32;
+    thread::sleep(Duration::from_millis(100));
+
+    let send = round_trip(
+        &name,
+        json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"send_keys","arguments":{
+                "pane_id":pane_id,
+                "keys":"hello",
+                "enter":true,
+                "wait_for_idle":true,
+                "max_wait_ms":1
+            }}
+        }),
+    );
+    assert_eq!(send["result"]["isError"], false, "send_keys: {send}");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let contents = loop {
+        if let Ok(contents) = std::fs::read_to_string(&outfile) {
+            break contents;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "deferred Enter was not delivered before the short wait completed"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let _ = std::fs::remove_file(&outfile);
+    assert_eq!(contents, "hello");
 }
 
 #[test]
@@ -1743,6 +1797,15 @@ fn mutating_tool_calls_land_in_the_audit_log() {
             _ => thread::sleep(Duration::from_millis(20)),
         }
     };
+
+    let audit_dir_mode = std::fs::metadata(audit_path.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let audit_file_mode = std::fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(audit_dir_mode, 0o700, "audit directory must be private");
+    assert_eq!(audit_file_mode, 0o600, "audit log must be private");
 
     let lines: Vec<Value> = contents
         .lines()

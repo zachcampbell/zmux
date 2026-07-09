@@ -46,8 +46,13 @@ The prefix is `Ctrl-a`. The ones you'll actually use:
 | `d` | detach |
 
 The mouse works the way you'd hope: the wheel scrolls the pane under the
-cursor, drag-select copies to your clipboard via OSC 52. Full binding list,
-config format, and CLI reference: [docs/reference.md](docs/reference.md).
+cursor one row at a time by default, including primary history behind a
+full-screen alternate buffer when the app is not capturing mouse input.
+When the host terminal reports a touchscreen swipe as a mouse drag, mostly
+vertical drags scroll naturally; horizontal drags select, and Shift-drag
+always selects. Releasing a selection copies it to your clipboard via OSC 52.
+Full binding list, config format, and CLI reference:
+[docs/reference.md](docs/reference.md).
 
 ## The agent part
 
@@ -139,8 +144,8 @@ connection threads queue requests over a channel, and the render loop drains
 them on the thread that owns the workspace. No `Arc<Mutex>` soup, no async
 in the core. The VT engine is written from scratch and covers what agent
 CLIs and shells actually emit (alt screen, scroll regions, synchronized
-output, bracketed paste, charsets, tab stops, wide chars, the SGR zoo).
-Full xterm parity is a non-goal.
+output, bracketed paste, charsets, tab stops, wide chars, combining marks,
+joined emoji, the SGR zoo). Full xterm parity is a non-goal.
 
 ## Limits
 
@@ -148,7 +153,8 @@ Full xterm parity is a non-goal.
   the smallest client's size. Per-client viewports don't exist yet.
 - The VT and layout layers are fuzzed for robustness, not rendering
   correctness. If something renders wrong, `zmux capture` the pane and file
-  the bytes; there's a replay tool for bisecting.
+  the bytes; there's a replay tool for bisecting. Detached-daemon diagnostics
+  are retained at `$ZMUX_STATE_DIR/logs/<session>.log`.
 - One `watch_events` subscription per MCP connection.
 
 ## License

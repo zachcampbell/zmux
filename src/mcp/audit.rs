@@ -26,13 +26,13 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
-use crate::state_paths::{safe_component, state_dir};
+use crate::state_paths::{ensure_private_dir, safe_component, state_dir};
 
 use super::dispatch::McpCall;
 
@@ -141,13 +141,18 @@ fn audit_path(session: &str) -> PathBuf {
 
 fn open_append_0600(path: &PathBuf) -> Option<File> {
     let dir = path.parent()?;
-    fs::create_dir_all(dir).ok()?;
-    OpenOptions::new()
+    let root = state_dir();
+    ensure_private_dir(&root).ok()?;
+    ensure_private_dir(dir).ok()?;
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(path)
-        .ok()
+        .ok()?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .ok()?;
+    Some(file)
 }
 
 fn truncate(text: &str) -> String {

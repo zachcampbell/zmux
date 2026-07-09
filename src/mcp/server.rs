@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::thread;
+use std::time::Duration;
 
 use super::execute::McpRequest;
 use super::protocol::process_request_line;
@@ -122,6 +123,10 @@ fn handle_connection(stream: UnixStream, tx: Sender<McpRequest>) {
     };
     let mut reader = BufReader::new(read_stream);
     let write_stream = stream;
+    if let Err(err) = write_stream.set_write_timeout(Some(Duration::from_secs(2))) {
+        eprintln!("zmux mcp: cannot configure writer timeout: {err}; dropping connection");
+        return;
+    }
     let (outbound_tx, outbound_rx) = mpsc::sync_channel::<Vec<u8>>(OUTBOUND_QUEUE_BOUND);
     // Spawning the writer can fail under thread/FD exhaustion. Drop
     // just this connection instead of `expect`-panicking the whole
@@ -180,7 +185,7 @@ fn handle_connection(stream: UnixStream, tx: Sender<McpRequest>) {
         if let Some(response) = response {
             let mut bytes = response.to_string().into_bytes();
             bytes.push(b'\n');
-            if !outbound.send(bytes) {
+            if !outbound.send_response(bytes) {
                 break;
             }
         }
@@ -192,9 +197,9 @@ fn handle_connection(stream: UnixStream, tx: Sender<McpRequest>) {
     let _ = writer_handle.join();
 }
 
-/// Per-connection outbound payload sender. `Full` drops the payload
-/// (with a one-time warning); `Disconnected` is reported back so the
-/// caller can hang up cleanly.
+/// Per-connection outbound payload sender. Notifications use a
+/// drop-newest policy under backpressure, but JSON-RPC responses wait
+/// for queue space so a successful tool call cannot silently vanish.
 pub(super) struct OutboundQueue {
     sender: SyncSender<Vec<u8>>,
     full_logged: Arc<AtomicBool>,
@@ -202,9 +207,15 @@ pub(super) struct OutboundQueue {
 }
 
 impl OutboundQueue {
-    /// Returns `false` only when the writer is gone; `Full` is
-    /// silently dropped and reported as success.
-    pub(super) fn send(&self, bytes: Vec<u8>) -> bool {
+    /// Queue a required JSON-RPC response. The writer socket has a bounded
+    /// write timeout, so waiting here cannot strand the connection forever.
+    pub(super) fn send_response(&self, bytes: Vec<u8>) -> bool {
+        self.sender.send(bytes).is_ok()
+    }
+
+    /// Queue a best-effort event notification. A slow subscriber may lose
+    /// events, but required request replies retain their queue capacity.
+    pub(super) fn send_notification(&self, bytes: Vec<u8>) -> bool {
         try_send_outbound(&self.sender, bytes, &self.full_logged)
     }
 

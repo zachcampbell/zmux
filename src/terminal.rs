@@ -27,6 +27,12 @@ pub enum CursorShape {
     SteadyBar,
 }
 
+#[derive(Debug, Default)]
+pub struct ResizeOutcome {
+    pub(crate) evicted_primary_rows: Vec<ScrollbackLine>,
+    pub(crate) live_tail: usize,
+}
+
 // Cursor state captured by DECSC (ESC 7) / CSI s and restored by DECRC
 // (ESC 8) / CSI u. Per xterm, the save covers the SGR pen as well as
 // the position — TUIs bracket styled fragments with save/restore and
@@ -315,7 +321,7 @@ impl TerminalIngest {
         self.focus_events
     }
 
-    pub fn resize(&mut self, size: PtySize) {
+    pub fn resize(&mut self, size: PtySize) -> ResizeOutcome {
         let old_rows = self.alternate.rows.max(1);
         let old_region_was_full = self.primary_scroll_top == 0
             && self.primary_scroll_bottom >= old_rows.saturating_sub(1);
@@ -323,24 +329,15 @@ impl TerminalIngest {
         let new_cols = size.cols as usize;
         self.alternate.resize(new_rows, new_cols);
 
-        // Trim the primary grid to the new geometry. Without this, a
-        // shrink leaves rows whose cell count exceeds new_cols (later
-        // CUF clamps work but cells beyond the right edge are visible
-        // until they evict) and rows beyond new_rows that won't scroll
-        // because the row-cap check uses the new ceiling. We truncate
-        // rows over the cap (oldest first, matching the scroll model)
-        // and trim each row's cells. Cursor is clamped back into bounds.
+        // Rows displaced by a height shrink are real terminal history,
+        // not disposable pixels. Return them to Session so it can append
+        // them to the pane's bounded scrollback. Columns are deliberately
+        // retained off-screen: a later widen can reveal them again, while
+        // rendering clips to the current geometry.
         let row_cap = new_rows.max(1);
-        if self.primary_grid.len() > row_cap {
-            let drop = self.primary_grid.len() - row_cap;
-            self.primary_grid.drain(0..drop);
-        }
+        let drop = self.primary_grid.len().saturating_sub(row_cap);
+        let evicted_primary_rows = self.primary_grid.drain(0..drop).collect();
         let col_cap = new_cols.max(1);
-        for row in self.primary_grid.iter_mut() {
-            if row.len() > col_cap {
-                row.truncate(col_cap);
-            }
-        }
         // Drop any customized stop that no longer fits — a column past
         // the new right edge can't be tabbed to. If the table was never
         // customized (`None`, still on the default-every-8 rule) there's
@@ -351,11 +348,11 @@ impl TerminalIngest {
             stops.retain(|&col| col <= last_col);
         }
         let max_row = self.primary_grid.len().saturating_sub(1);
-        self.primary_cursor_row = self.primary_cursor_row.min(max_row);
+        self.primary_cursor_row = self.primary_cursor_row.saturating_sub(drop).min(max_row);
         self.primary_cursor_col = self.primary_cursor_col.min(col_cap.saturating_sub(1));
         self.primary_wrap_pending = false;
         if let Some(saved) = self.primary_saved_cursor.as_mut() {
-            saved.row = saved.row.min(max_row);
+            saved.row = saved.row.saturating_sub(drop).min(max_row);
             saved.col = saved.col.min(col_cap.saturating_sub(1));
         }
         if old_region_was_full {
@@ -368,6 +365,11 @@ impl TerminalIngest {
                 self.primary_scroll_top = 0;
                 self.primary_scroll_bottom = row_cap.saturating_sub(1);
             }
+        }
+
+        ResizeOutcome {
+            evicted_primary_rows,
+            live_tail: self.primary_grid.len(),
         }
     }
 
@@ -583,7 +585,13 @@ impl TerminalIngest {
     pub fn primary_grid_text(&self) -> Vec<String> {
         self.primary_grid
             .iter()
-            .map(|row| row.iter().filter(|c| c.ch != '\0').map(|c| c.ch).collect())
+            .map(|row| {
+                let mut text = String::new();
+                for cell in clip_row_to_width(row, self.alternate.cols) {
+                    cell.push_text(&mut text);
+                }
+                text
+            })
             .collect()
     }
 
@@ -594,7 +602,10 @@ impl TerminalIngest {
     // sentinels are left in place — `style::serialize_row` already
     // skips them, matching `primary_grid_text`'s filter.
     pub fn primary_grid_cells(&self) -> Vec<Vec<Cell>> {
-        self.primary_grid.clone()
+        self.primary_grid
+            .iter()
+            .map(|row| clip_row_to_width(row, self.alternate.cols))
+            .collect()
     }
 
     // Cells in the cursor's current grid row — NOT the bottom of
@@ -658,7 +669,13 @@ impl TerminalIngest {
         // what a human would see.
         self.render_visible_cells(pane)
             .iter()
-            .map(|row| row.iter().filter(|c| c.ch != '\0').map(|c| c.ch).collect())
+            .map(|row| {
+                let mut text = String::new();
+                for cell in row {
+                    cell.push_text(&mut text);
+                }
+                text
+            })
             .collect()
     }
 
@@ -668,10 +685,21 @@ impl TerminalIngest {
     // primary- and alt-screen rows carry the SGR state that was active
     // when each cell was written.
     pub fn render_cells(&self, pane: &Pane) -> Vec<Vec<Cell>> {
-        match pane.screen_mode() {
+        let rows = match pane.screen_mode() {
             ScreenMode::Primary => self.render_primary_cells(pane),
+            // The alternate buffer itself has no history. When the pane's
+            // viewport is detached, show the retained primary timeline;
+            // returning to the bottom restores the live alternate screen.
+            // This is the same model tmux users expect when scrolling a
+            // full-screen program whose own mouse tracking is disabled.
+            ScreenMode::Alternate if !pane.follow_output() => {
+                self.render_scrolled_primary_view(pane)
+            }
             ScreenMode::Alternate => self.alternate.cells().to_vec(),
-        }
+        };
+        rows.iter()
+            .map(|row| clip_row_to_width(row, self.alternate.cols))
+            .collect()
     }
 
     fn render_primary_cells(&self, pane: &Pane) -> Vec<Vec<Cell>> {
@@ -2280,7 +2308,7 @@ impl TerminalIngest {
                 self.primary_grid.push(Vec::new());
                 self.primary_cursor_row = max_rows - 1;
             } else {
-                self.primary_scroll_up_within_region(1);
+                self.primary_scroll_up_within_region(pane, 1);
             }
             return;
         }
@@ -2327,7 +2355,23 @@ impl TerminalIngest {
     // to the next line when the cursor would advance off the right edge.
     fn primary_put_char(&mut self, pane: &mut Pane, ch: char) {
         let cols = self.alternate.cols.max(1);
-        let width = crate::style::char_width(ch).max(1);
+        let width = crate::style::char_width(ch);
+
+        if width == 0 {
+            if let Some(cell) = self.primary_previous_cell_mut() {
+                cell.append_suffix(ch);
+            }
+            return;
+        }
+        if self
+            .primary_previous_cell_mut()
+            .is_some_and(|cell| cell.suffix_ends_with_joiner())
+        {
+            if let Some(cell) = self.primary_previous_cell_mut() {
+                cell.append_suffix(ch);
+            }
+            return;
+        }
 
         if self.primary_wrap_pending {
             if self.primary_auto_wrap {
@@ -2386,7 +2430,18 @@ impl TerminalIngest {
         }
     }
 
-    fn primary_scroll_up_within_region(&mut self, count: usize) {
+    fn primary_previous_cell_mut(&mut self) -> Option<&mut Cell> {
+        let row = self.primary_grid.get_mut(self.primary_cursor_row)?;
+        let end = if self.primary_wrap_pending {
+            self.primary_cursor_col.saturating_add(1)
+        } else {
+            self.primary_cursor_col
+        }
+        .min(row.len());
+        row[..end].iter_mut().rfind(|cell| cell.ch != '\0')
+    }
+
+    fn primary_scroll_up_within_region(&mut self, pane: &mut Pane, count: usize) {
         let max_row = self.alternate.rows.saturating_sub(1);
         let top = self.primary_scroll_top.min(max_row);
         let bottom = self.primary_scroll_bottom.min(max_row);
@@ -2399,12 +2454,28 @@ impl TerminalIngest {
         }
 
         let count = count.min(bottom.saturating_sub(top) + 1);
+        let scrolled_off = if top == 0 {
+            self.primary_grid[..count].to_vec()
+        } else {
+            Vec::new()
+        };
         let blank = self.primary_blank_row();
         let region = &mut self.primary_grid[top..=bottom];
         region.rotate_left(count);
         let len = region.len();
         for row in region.iter_mut().skip(len.saturating_sub(count)) {
             *row = blank.clone();
+        }
+
+        // xterm commits rows that leave a primary scroll region anchored at
+        // the top edge, even when the bottom margin reserves UI rows. Codex
+        // uses exactly that layout for transcript + composer; dropping these
+        // rows made its completed output impossible to scroll back to.
+        if !scrolled_off.is_empty() {
+            self.sync_live_tail(pane);
+            for row in scrolled_off {
+                pane.append_output_line(row);
+            }
         }
     }
 
@@ -2446,6 +2517,23 @@ impl TerminalIngest {
             row.push(Cell::BLANK);
         }
     }
+}
+
+fn clip_row_to_width(row: &[Cell], width: usize) -> Vec<Cell> {
+    let width = width.max(1);
+    let end = row.len().min(width);
+    let mut clipped = row[..end].to_vec();
+    let Some(last) = clipped.last_mut() else {
+        return clipped;
+    };
+
+    // A double-width base at the right edge is only renderable when its
+    // continuation cell also fits. Hide the orphan for this viewport but
+    // leave the source row untouched so widening can reveal it again.
+    if last.ch != '\0' && crate::style::char_width(last.ch) == 2 {
+        *last = Cell::BLANK;
+    }
+    clipped
 }
 
 #[derive(Debug)]
@@ -2660,7 +2748,22 @@ impl AlternateScreen {
             return;
         }
 
-        let width = crate::style::char_width(ch).max(1);
+        let width = crate::style::char_width(ch);
+        if width == 0 {
+            if let Some(cell) = self.previous_cell_mut() {
+                cell.append_suffix(ch);
+            }
+            return;
+        }
+        if self
+            .previous_cell_mut()
+            .is_some_and(|cell| cell.suffix_ends_with_joiner())
+        {
+            if let Some(cell) = self.previous_cell_mut() {
+                cell.append_suffix(ch);
+            }
+            return;
+        }
 
         if self.wrap_pending {
             if self.auto_wrap {
@@ -2701,6 +2804,17 @@ impl AlternateScreen {
             self.cursor_col += advance;
             self.wrap_pending = false;
         }
+    }
+
+    fn previous_cell_mut(&mut self) -> Option<&mut Cell> {
+        let row = self.cells.get_mut(self.cursor_row)?;
+        let end = if self.wrap_pending {
+            self.cursor_col.saturating_add(1)
+        } else {
+            self.cursor_col
+        }
+        .min(row.len());
+        row[..end].iter_mut().rfind(|cell| cell.ch != '\0')
     }
 
     fn insert_lines(&mut self, count: usize) {
@@ -2998,7 +3112,14 @@ fn build_color_reply(code: &[u8], rgb: &[u8], terminator: OscTerminator) -> Vec<
 //   Some(Some(url)) → OSC 8 open link to url
 fn parse_osc_hyperlink(payload: &str) -> Option<Option<std::sync::Arc<str>>> {
     let rest = payload.strip_prefix("8;")?;
-    let (_params, url) = rest.split_once(';')?;
+    let (params, url) = rest.split_once(';')?;
+    // The URL is serialized back to the client terminal verbatim. Never
+    // retain terminal controls (or accept them in the parameter field),
+    // otherwise a child process could smuggle a fresh escape sequence into
+    // zmux's rendered output through OSC 8.
+    if params.chars().any(char::is_control) || url.chars().any(char::is_control) {
+        return None;
+    }
     if url.is_empty() {
         Some(None)
     } else {
@@ -3092,7 +3213,7 @@ mod tests {
     use crate::style::Color;
     use crate::{Pane, PtySize};
 
-    use super::{CursorShape, TerminalIngest};
+    use super::{CursorShape, TerminalIngest, parse_osc_hyperlink};
 
     #[test]
     fn clear_command_empties_primary_scrollback() {
@@ -3296,6 +3417,38 @@ mod tests {
 
         assert_eq!(pane.screen_mode(), ScreenMode::Primary);
         assert_eq!(ingest.render_lines(&pane), vec!["shell prompt"]);
+    }
+
+    #[test]
+    fn scrolling_while_on_alternate_screen_renders_primary_history() {
+        let mut pane = Pane::new("tui", 32, 3);
+        let mut ingest = TerminalIngest::new(PtySize::new(3, 20));
+        ingest.ingest_bytes(
+            &mut pane,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n\x1b[?1049hALT",
+        );
+        assert!(ingest.render_lines(&pane).iter().any(|line| line == "ALT"));
+
+        let outcome = pane.wheel_up(1);
+        assert!(matches!(
+            outcome,
+            crate::pane::WheelOutcome::ViewportChanged {
+                lines_scrolled: 1,
+                follow_output: false
+            }
+        ));
+        let history = ingest.render_lines(&pane);
+        assert!(
+            history.iter().any(|line| line.contains("four")),
+            "alternate-screen scroll did not reveal primary history: {history:?}"
+        );
+        assert!(
+            history.iter().all(|line| line != "ALT"),
+            "alternate buffer remained visible after entering scrollback: {history:?}"
+        );
+
+        pane.scroll_to_bottom();
+        assert!(ingest.render_lines(&pane).iter().any(|line| line == "ALT"));
     }
 
     #[test]
@@ -3696,6 +3849,35 @@ mod tests {
     }
 
     #[test]
+    fn combining_marks_and_emoji_sequences_do_not_advance_the_cursor() {
+        let mut pane = Pane::new("unicode", 16, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 40));
+        let text = "e\u{0301} ✈\u{fe0f} 👩\u{1f3fd}\u{200d}💻X";
+
+        ingest.ingest_bytes(&mut pane, text.as_bytes());
+
+        assert_eq!(ingest.render_lines(&pane), vec![text]);
+        assert_eq!(
+            ingest.screen_cursor(&pane),
+            Some((0, 8)),
+            "cursor must count composed terminal cells, not Unicode scalars"
+        );
+    }
+
+    #[test]
+    fn alternate_screen_composes_combining_and_zwj_sequences_in_one_cell_run() {
+        let mut pane = Pane::new("unicode-alt", 16, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 40));
+        let text = "e\u{0301} 👩\u{1f3fd}\u{200d}💻X";
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[?1049h");
+        ingest.ingest_bytes(&mut pane, text.as_bytes());
+
+        assert_eq!(ingest.render_lines(&pane), vec![text]);
+        assert_eq!(ingest.screen_cursor(&pane), Some((0, 5)));
+    }
+
+    #[test]
     fn osc_8_hyperlinks_attach_to_subsequent_cells_and_clear_on_empty_url() {
         // The standard form is `ESC ] 8 ; <params> ; <URL> ST` to open a
         // link, and `ESC ] 8 ; ; ST` to close. Text between the two should
@@ -3727,6 +3909,20 @@ mod tests {
         // `after` has the link cleared.
         for cell in &row[12..] {
             assert!(cell.style.hyperlink.is_none(), "link leaked past close");
+        }
+    }
+
+    #[test]
+    fn osc_8_hyperlinks_reject_control_characters() {
+        for payload in [
+            "8;;https://example.com/\u{1b}[31m",
+            "8;id=unsafe\u{1b}[2J;https://example.com",
+            "8;;https://example.com/\nnext",
+        ] {
+            assert!(
+                parse_osc_hyperlink(payload).is_none(),
+                "accepted unsafe hyperlink payload {payload:?}"
+            );
         }
     }
 
@@ -4609,6 +4805,40 @@ mod tests {
         assert_eq!(
             rendered[3], "bottom",
             "row below region changed: {rendered:?}"
+        );
+        assert_eq!(
+            pane.total_lines(),
+            0,
+            "a region below row 0 must remain an in-place TUI operation"
+        );
+    }
+
+    #[test]
+    fn top_anchored_primary_scroll_region_preserves_codex_history() {
+        let mut pane = Pane::new("codex", 32, 6);
+        let mut ingest = TerminalIngest::new(PtySize::new(6, 32));
+
+        ingest.ingest_bytes(&mut pane, b"one\ntwo\nthree\nfour\nfive\nsix");
+        // Codex keeps its composer in the bottom rows and scrolls the
+        // transcript through a top-anchored partial DECSTBM region.
+        ingest.ingest_bytes(&mut pane, b"\x1b[1;4r\x1b[4;1H\n");
+
+        assert_eq!(
+            pane.scrollback_text(8, true),
+            vec!["one"],
+            "the transcript row leaving a top-anchored region was discarded"
+        );
+        assert!(matches!(
+            pane.wheel_up(1),
+            crate::pane::WheelOutcome::ViewportChanged {
+                lines_scrolled: 1,
+                follow_output: false
+            }
+        ));
+        assert_eq!(
+            ingest.render_lines(&pane).first().map(String::as_str),
+            Some("one"),
+            "the preserved Codex transcript must become visible on scroll-up"
         );
     }
 
@@ -5505,6 +5735,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn primary_columns_survive_a_temporary_shrink_without_wide_glyph_artifacts() {
+        let mut pane = Pane::new("shell", 64, 2);
+        let mut ingest = TerminalIngest::new(PtySize::new(2, 4));
+        ingest.ingest_bytes(&mut pane, "a你b".as_bytes());
+
+        ingest.resize(PtySize::new(2, 2));
+        assert_eq!(
+            ingest.render_lines(&pane),
+            vec!["a"],
+            "a clipped wide glyph must not render without its continuation cell"
+        );
+
+        ingest.resize(PtySize::new(2, 4));
+        assert_eq!(
+            ingest.render_lines(&pane),
+            vec!["a你b"],
+            "widening should reveal primary cells preserved beyond the temporary edge"
+        );
+    }
+
     // --- Mouse-wheel scroll-jump fix -----------------------------------
     //
     // Regression coverage for the combined-timeline scroll fix. Before
@@ -5542,7 +5793,7 @@ mod tests {
         assert!(pane.follow_output());
         assert_eq!(ingest.render_lines(&pane), vec!["L7", "L8", "L9", "L10"]);
 
-        // One wheel notch (3 lines, the routing default) must move the
+        // One explicit three-line request must move the
         // top visible row up by exactly 3 lines — from L7 to L4 — not
         // by a whole grid's worth (would land on L1) and not by zero
         // (the pre-fix scrollback-only ceiling could also produce this
@@ -5552,10 +5803,10 @@ mod tests {
         assert_eq!(
             ingest.render_lines(&pane),
             vec!["L4", "L5", "L6", "L7"],
-            "a single wheel-up notch must scroll by 3 lines, not jump a full screen"
+            "a three-line request must scroll by 3 lines, not jump a full screen"
         );
 
-        // Subsequent notches keep scrolling smoothly by the same
+        // Subsequent requests keep scrolling smoothly by the same
         // amount — the "later notches are fine" half of the bug
         // report, confirmed unchanged by the fix.
         pane.wheel_up(3);

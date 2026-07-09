@@ -5,6 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 
 use crate::agent_shim::extract_last_marked_result;
-use crate::state_paths::{safe_component, shell_quote, state_dir};
+use crate::state_paths::{ensure_private_dir, safe_component, shell_quote, state_dir};
 
 // Upper bound on a single un-terminated hook-events line held in the
 // poller's `partial_line` buffer. Real records (a prompt, an
@@ -41,7 +42,12 @@ pub fn prepare_capture(
 ) -> Result<ClaudeHookCapture, String> {
     let user_settings = take_settings_arg(startup_args)?;
     let session_component = safe_component(zmux_session);
-    let root = state_dir().join("claude").join(session_component);
+    let state_root = state_dir();
+    ensure_private_dir(&state_root)
+        .map_err(|err| format!("secure zmux state dir {}: {err}", state_root.display()))?;
+    let root = state_root.join("claude").join(session_component);
+    ensure_private_dir(&root)
+        .map_err(|err| format!("secure Claude state dir {}: {err}", root.display()))?;
     let events_path = root.join("events.jsonl");
     let settings_key = settings_key(user_settings.as_deref());
     let settings_path = root
@@ -49,10 +55,6 @@ pub fn prepare_capture(
         .join(settings_key)
         .join("settings.json");
 
-    if let Some(parent) = events_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("create Claude hook event dir {}: {err}", parent.display()))?;
-    }
     write_settings(&settings_path, &events_path, user_settings.as_deref())?;
     startup_args.push("--settings".into());
     startup_args.push(settings_path.to_string_lossy().into_owned());
@@ -112,8 +114,8 @@ pub fn append_hook_event_from_str(events_path: &Path, input: &str) -> Result<(),
         map.insert("zmux_recorded_at_ms".into(), json!(now_ms()));
     }
     if let Some(parent) = events_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("create hook event dir {}: {err}", parent.display()))?;
+        ensure_private_dir(parent)
+            .map_err(|err| format!("create private hook event dir {}: {err}", parent.display()))?;
     }
     let _lock = HookEventLock::acquire(events_path)?;
     let mut line =
@@ -122,8 +124,11 @@ pub fn append_hook_event_from_str(events_path: &Path, input: &str) -> Result<(),
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(events_path)
         .map_err(|err| format!("open hook event file {}: {err}", events_path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("secure hook event file {}: {err}", events_path.display()))?;
     file.write_all(&line)
         .map_err(|err| format!("write hook event line: {err}"))?;
     file.flush()
@@ -178,7 +183,11 @@ fn event_lock_path(events_path: &Path) -> PathBuf {
 }
 
 fn create_hook_lock_file(path: &Path) -> io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
     writeln!(file, "pid={}", std::process::id())?;
     Ok(())
 }
@@ -388,15 +397,37 @@ fn write_settings(
     let rendered = serde_json::to_string_pretty(&settings)
         .map_err(|err| format!("render generated Claude settings: {err}"))?;
     if fs::read_to_string(settings_path).is_ok_and(|existing| existing == rendered) {
+        fs::set_permissions(settings_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+            format!(
+                "secure generated Claude settings {}: {err}",
+                settings_path.display()
+            )
+        })?;
         return Ok(());
     }
     if let Some(parent) = settings_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("create Claude settings dir {}: {err}", parent.display()))?;
+        ensure_private_dir(parent).map_err(|err| {
+            format!(
+                "create private Claude settings dir {}: {err}",
+                parent.display()
+            )
+        })?;
     }
     let tmp = settings_path.with_extension(format!("json.tmp.{}", std::process::id()));
-    fs::write(&tmp, rendered)
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|err| format!("open generated Claude settings {}: {err}", tmp.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("secure generated Claude settings {}: {err}", tmp.display()))?;
+    file.write_all(rendered.as_bytes())
         .map_err(|err| format!("write generated Claude settings {}: {err}", tmp.display()))?;
+    file.flush()
+        .map_err(|err| format!("flush generated Claude settings {}: {err}", tmp.display()))?;
+    drop(file);
     fs::rename(&tmp, settings_path).map_err(|err| {
         format!(
             "install generated Claude settings {}: {err}",
@@ -465,6 +496,7 @@ fn compact_event(value: &Value) -> String {
 mod tests {
     use super::*;
     use std::env;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
@@ -491,6 +523,36 @@ mod tests {
             }
         }
         out
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn capture_state_is_private_even_with_a_permissive_umask() {
+        let dir = temp_dir("private-modes");
+        // The fixture intentionally starts world-traversable, matching a
+        // common umask-created XDG state directory. prepare_capture must
+        // tighten it rather than assuming the caller already did.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        with_state_dir(&dir, || {
+            let mut args = Vec::new();
+            let capture = prepare_capture("work", &mut args).unwrap();
+            append_hook_event_from_str(
+                &capture.events_path,
+                r#"{"hook_event_name":"UserPromptSubmit","prompt":"secret"}"#,
+            )
+            .unwrap();
+
+            assert_eq!(mode(&dir), 0o700, "state root must not be traversable");
+            assert_eq!(mode(capture.settings_path.parent().unwrap()), 0o700);
+            assert_eq!(mode(&capture.settings_path), 0o600);
+            assert_eq!(mode(capture.events_path.parent().unwrap()), 0o700);
+            assert_eq!(mode(&capture.events_path), 0o600);
+        });
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

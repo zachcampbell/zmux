@@ -8,9 +8,9 @@ use std::process::ExitCode;
 use zmux::mcp::run_stdio_bridge;
 use zmux::{
     AttachOutcome, ClientMessage, PtySize, Session, attach_session, create_session,
-    default_session_name, kill_session, list_sessions, list_sessions_verbose, print_session_list,
-    print_session_list_verbose, prune_stale_sessions, run_mux, run_server, run_shell,
-    send_admin_message,
+    daemon_log_path, default_session_name, kill_session, list_sessions, list_sessions_verbose,
+    print_session_list, print_session_list_verbose, prune_stale_sessions, run_mux, run_server,
+    run_shell, send_admin_message,
 };
 
 fn main() -> ExitCode {
@@ -171,7 +171,9 @@ fn run() -> Result<(), String> {
             // stderr.
             println!(
                 "capture request sent to session `{session}` pane {pane_id}; \
-                 check the daemon's stderr to confirm the sink attached"
+                 check {} (detached daemon) or the server's stderr (foreground) \
+                 to confirm the sink attached",
+                daemon_log_path(session).display()
             );
             Ok(())
         }

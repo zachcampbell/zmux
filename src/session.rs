@@ -198,8 +198,12 @@ impl Session {
 
     pub fn resize(&mut self, size: PtySize, viewport_height: usize) -> io::Result<()> {
         self.pty.resize(size)?;
+        let resize = self.ingest.resize(size);
+        for row in resize.evicted_primary_rows {
+            self.pane.append_output_line(row);
+        }
+        self.pane.set_scrollback_live_tail(resize.live_tail);
         self.pane.set_viewport_height(viewport_height);
-        self.ingest.resize(size);
         Ok(())
     }
 
@@ -364,8 +368,12 @@ impl Session {
             .find(|line| !line.trim().is_empty())
     }
 
-    pub fn handle_mouse_event(&mut self, mouse: MouseEvent) -> io::Result<bool> {
-        if let Some(lines) = mouse.wheel_lines() {
+    pub fn handle_mouse_event(
+        &mut self,
+        mouse: MouseEvent,
+        wheel_scroll_lines: usize,
+    ) -> io::Result<bool> {
+        if let Some(lines) = mouse.wheel_lines(wheel_scroll_lines) {
             let outcome = if mouse.is_scroll_up() {
                 self.pane.wheel_up(lines)
             } else {
@@ -525,12 +533,15 @@ mod tests {
         assert!(session.app_captures_mouse());
 
         session
-            .handle_mouse_event(MouseEvent {
-                button: 64,
-                col: 4,
-                row: 2,
-                final_byte: b'M',
-            })
+            .handle_mouse_event(
+                MouseEvent {
+                    button: 64,
+                    col: 4,
+                    row: 2,
+                    final_byte: b'M',
+                },
+                1,
+            )
             .expect("forward wheel event");
 
         for _ in 0..10 {
@@ -549,5 +560,32 @@ mod tests {
 
         let completed = session.drain_to_completion().expect("drain session");
         assert!(completed.exit_status().success());
+    }
+
+    #[test]
+    fn shrinking_rows_moves_primary_rows_into_scrollback() {
+        let mut session = Session::spawn_command(
+            "resize-history",
+            "/bin/sh",
+            &["-lc", "sleep 5"],
+            PtySize::new(4, 20),
+            32,
+            4,
+        )
+        .expect("spawn session");
+        session
+            .ingest
+            .ingest_bytes(&mut session.pane, b"one\r\ntwo\r\nthree\r\nfour");
+
+        session
+            .resize(PtySize::new(2, 20), 2)
+            .expect("resize session");
+
+        assert_eq!(
+            session.snapshot_scrollback_lines(4),
+            vec!["one", "two", "three", "four"],
+            "rows removed by a terminal shrink must remain in history"
+        );
+        let _ = session.close();
     }
 }

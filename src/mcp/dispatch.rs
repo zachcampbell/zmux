@@ -184,7 +184,7 @@ fn dispatch_watch_events(
                 let notif = event_notification(&event);
                 let mut bytes = notif.to_string().into_bytes();
                 bytes.push(b'\n');
-                if !pump_tx.send(bytes) {
+                if !pump_tx.send_notification(bytes) {
                     return;
                 }
             }
@@ -1120,14 +1120,35 @@ mod tests {
     #[test]
     fn outbound_queue_drops_on_full_and_continues() {
         let (queue, rx) = super::super::server::outbound_for_test_with_bound(2);
-        assert!(queue.send(b"one\n".to_vec()));
-        assert!(queue.send(b"two\n".to_vec()));
-        assert!(queue.send(b"three\n".to_vec()), "drop-on-full returns true");
+        assert!(queue.send_notification(b"one\n".to_vec()));
+        assert!(queue.send_notification(b"two\n".to_vec()));
+        assert!(
+            queue.send_notification(b"three\n".to_vec()),
+            "drop-on-full returns true"
+        );
         let first = rx.recv().expect("first payload");
         assert_eq!(first, b"one\n");
-        assert!(queue.send(b"four\n".to_vec()));
+        assert!(queue.send_notification(b"four\n".to_vec()));
         drop(queue);
         let remaining: Vec<Vec<u8>> = rx.iter().collect();
         assert!(!remaining.is_empty());
+    }
+
+    #[test]
+    fn outbound_tool_response_waits_for_queue_space_instead_of_disappearing() {
+        let (queue, rx) = super::super::server::outbound_for_test_with_bound(1);
+        assert!(queue.send_notification(b"notification\n".to_vec()));
+        let response_queue = queue.clone();
+        let response =
+            std::thread::spawn(move || response_queue.send_response(b"response\n".to_vec()));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !response.is_finished(),
+            "a full notification queue silently discarded a tool response"
+        );
+        assert_eq!(rx.recv().unwrap(), b"notification\n");
+        assert!(response.join().unwrap());
+        assert_eq!(rx.recv().unwrap(), b"response\n");
     }
 }

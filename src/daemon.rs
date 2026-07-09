@@ -5,6 +5,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,8 @@ use crate::protocol::{
     encode_server_message,
 };
 use crate::pty::PtySize;
+use crate::state_paths::{ensure_private_dir, safe_component, state_dir};
+use crate::style::display_width;
 use crate::tty::{TerminalGuard, poll_readable};
 use crate::workspace::{LayoutPreset, PANE_NUMBER_OVERLAY_DURATION, PromptKind, Workspace};
 
@@ -69,6 +72,26 @@ pub fn default_session_name() -> &'static str {
     DEFAULT_SESSION_NAME
 }
 
+pub fn daemon_log_path(name: &str) -> PathBuf {
+    state_dir()
+        .join("logs")
+        .join(format!("{}.log", safe_component(name)))
+}
+
+fn open_daemon_log_at(path: &Path) -> io::Result<std::fs::File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "daemon log has no parent"))?;
+    ensure_private_dir(parent)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
 pub fn create_session(name: &str) -> io::Result<()> {
     validate_session_name(name)?;
     ensure_session_root()?;
@@ -91,7 +114,7 @@ pub fn create_session(name: &str) -> io::Result<()> {
         .open("/dev/null")?;
     let stdin = dev_null.try_clone()?;
     let stdout = dev_null.try_clone()?;
-    let stderr = dev_null;
+    let stderr = open_daemon_log_at(&daemon_log_path(name))?;
 
     let mut command = Command::new(exe);
     command.arg("serve").arg(name);
@@ -666,7 +689,13 @@ pub fn run_server(name: &str) -> io::Result<i32> {
 
     let socket_path = session_socket_path(name);
     if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path);
+        if UnixStream::connect(&socket_path).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("session {name:?} is already running"),
+            ));
+        }
+        fs::remove_file(&socket_path)?;
     }
 
     let listener = UnixListener::bind(&socket_path)?;
@@ -700,6 +729,7 @@ fn run_server_after_bind(
         config.scrollback_lines,
         config.status_bar_hints,
     )?;
+    initial.set_wheel_scroll_lines(config.wheel_scroll_lines);
     // Push agent config into the workspace so the genesis pane's
     // detectors honor user thresholds and prompt patterns from byte 1.
     initial.set_agent_config(
@@ -1206,17 +1236,17 @@ fn run_server_loop(
                         // background-window panes don't silently capture
                         // the active window's pane with the same id; see
                         // `WindowSet::find_pane_mut`.
-                        match std::fs::File::create(&path) {
-                            Ok(file) => {
-                                if let Some(pane) = windows.find_pane_mut(pane_id as usize) {
+                        if let Some(pane) = windows.find_pane_mut(pane_id as usize) {
+                            match std::fs::File::create(&path) {
+                                Ok(file) => {
                                     pane.attach_capture(Box::new(file));
-                                } else {
-                                    eprintln!("zmux capture: no pane {pane_id} in any window");
+                                }
+                                Err(err) => {
+                                    eprintln!("zmux capture: cannot create {path}: {err}");
                                 }
                             }
-                            Err(err) => {
-                                eprintln!("zmux capture: cannot create {path}: {err}");
-                            }
+                        } else {
+                            eprintln!("zmux capture: no pane {pane_id} in any window");
                         }
                     }
                     ClientMessage::ListPanes => {
@@ -1644,7 +1674,11 @@ fn run_session_picker(
         let size = terminal.size()?;
         let message = "no other sessions  (Esc to dismiss)";
         let row = size.rows.saturating_sub(1) / 2 + 1;
-        let col = size.cols.saturating_sub(message.chars().count() as u16) / 2 + 1;
+        let col = size
+            .cols
+            .saturating_sub(display_width(message).min(u16::MAX as usize) as u16)
+            / 2
+            + 1;
         terminal.write_ansi(&format!("\x1b[{row};{col}H\x1b[7m {message} \x1b[0m"))?;
         // Wait for any keypress to dismiss.
         loop {
@@ -1663,7 +1697,7 @@ fn run_session_picker(
     let visible: Vec<&SessionEntry> = entries.iter().take(9).collect();
     let max_name_width = visible
         .iter()
-        .map(|e| e.name.chars().count())
+        .map(|e| display_width(&e.name))
         .max()
         .unwrap_or(0);
     // Box width = " N. <name>  " plus padding; ensure minimum readability.
@@ -1689,7 +1723,7 @@ fn run_session_picker(
 
         // Title row.
         let title = "  Switch session  ";
-        let title_pad = inner_width.saturating_sub(title.chars().count());
+        let title_pad = inner_width.saturating_sub(display_width(title));
         let left = title_pad / 2;
         let right = title_pad - left;
         out.push_str(&format!("\x1b[{};{}H", start_row + 1, start_col));
@@ -1717,7 +1751,7 @@ fn run_session_picker(
             out.push_str(&format!("\x1b[{row};{start_col}H"));
             out.push_str("\x1b[7m|\x1b[0m");
             let line = format!(" {}. {}", index + 1, entry.name);
-            let pad = inner_width.saturating_sub(line.chars().count());
+            let pad = inner_width.saturating_sub(display_width(&line));
             out.push_str(&line);
             for _ in 0..pad {
                 out.push(' ');
@@ -2166,9 +2200,36 @@ mod tests {
     use crate::protocol::{ClientMessage, ServerMessage};
     use crate::pty::PtySize;
     use std::io;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn detached_daemon_log_is_private_and_appendable() {
+        let root =
+            std::env::temp_dir().join(format!("zmux-daemon-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = root.join("logs/work.log");
+
+        let mut log = super::open_daemon_log_at(&path).expect("open daemon log");
+        writeln!(log, "diagnostic").unwrap();
+        drop(log);
+
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "diagnostic\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn ctrl_a_d_detaches() {

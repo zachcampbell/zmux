@@ -12,6 +12,7 @@ use crate::session::Session;
 use crate::tty::TerminalGuard;
 
 pub fn run_shell() -> io::Result<i32> {
+    let config = crate::config::Config::load();
     let mut terminal = TerminalGuard::enter()?;
     let size = terminal.size()?;
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -70,7 +71,7 @@ pub fn run_shell() -> io::Result<i32> {
                 InputAction::Forward(bytes) => session.write_input(&bytes)?,
                 InputAction::Mouse(mouse) => {
                     if mouse.row < content_rows(current_size) as u16
-                        && session.handle_mouse_event(mouse)?
+                        && session.handle_mouse_event(mouse, config.wheel_scroll_lines)?
                     {
                         dirty = true;
                     }
