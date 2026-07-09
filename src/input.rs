@@ -34,10 +34,6 @@ impl MouseEvent {
         }
     }
 
-    pub fn shift_held(self) -> bool {
-        self.button & 4 != 0
-    }
-
     pub fn is_left_press(self) -> bool {
         self.final_byte == b'M'
             && self.button & 64 == 0

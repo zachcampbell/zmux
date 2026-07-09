@@ -37,11 +37,6 @@ const DEFAULT_IDLE_THRESHOLD: Duration = Duration::from_millis(750);
 // status updates).
 const PANE_OUTPUT_BYTE_THRESHOLD: u64 = 64;
 const PANE_OUTPUT_TIME_THRESHOLD: Duration = Duration::from_millis(100);
-// SGR mouse reporting does not identify whether a drag came from a mouse or
-// touchscreen. Wait for a small, predominantly vertical movement before
-// treating an unmodified drag as natural touch scrolling; horizontal drags
-// keep the existing selection behavior, and Shift always forces selection.
-const TOUCH_DRAG_SCROLL_THRESHOLD_ROWS: u16 = 2;
 
 // Minimal subset of the POSIX `struct tm` fields, used to format local
 // wall-clock time for the status bar. Order matches glibc/musl layout on
@@ -157,7 +152,6 @@ pub struct Workspace {
     // selection when they belong to an in-progress drag, not when the
     // terminal happens to emit stray motion for another reason.
     mouse_drag_active: bool,
-    mouse_drag_gesture: Option<MouseDragGesture>,
     // Set when the user grabbed a pane border with the mouse. Holds
     // the two neighbor panes on either side of the separator plus the
     // last pointer position we applied weight adjustments at, so each
@@ -267,15 +261,6 @@ struct MouseResize {
     right_or_bottom_pane: PaneId,
     last_col: u16,
     last_row: u16,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MouseDragGesture {
-    origin_col: u16,
-    origin_row: u16,
-    last_row: u16,
-    scroll_active: bool,
-    force_selection: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -499,7 +484,6 @@ impl Workspace {
             rename_input: None,
             sync_panes: false,
             mouse_drag_active: false,
-            mouse_drag_gesture: None,
             mouse_resize: None,
             // Start at Quadrants so the first Ctrl-a Space cycles to
             // TwoColumns — the least-destructive default of the three.
@@ -599,7 +583,6 @@ impl Workspace {
             rename_input: None,
             sync_panes: false,
             mouse_drag_active: false,
-            mouse_drag_gesture: None,
             mouse_resize: None,
             last_preset: LayoutPreset::Quadrants,
             pending_clipboard: None,
@@ -1068,9 +1051,8 @@ impl Workspace {
         let b = self.clear_selection();
         let c = self.cancel_rename();
         let d = self.cancel_command_prompt();
-        let e = self.mouse_drag_active || self.mouse_drag_gesture.is_some();
+        let e = self.mouse_drag_active;
         self.mouse_drag_active = false;
-        self.mouse_drag_gesture = None;
         a || b || c || d || e
     }
 
@@ -2931,50 +2913,9 @@ impl Workspace {
                         cursor_col: buffer_col,
                     });
                     self.mouse_drag_active = true;
-                    self.mouse_drag_gesture = Some(MouseDragGesture {
-                        origin_col: local_col,
-                        origin_row: local_row,
-                        last_row: local_row,
-                        scroll_active: false,
-                        force_selection: mouse.shift_held(),
-                    });
                     return Ok(true);
                 }
                 if mouse.is_left_drag_motion() && self.mouse_drag_active {
-                    let Some(mut gesture) = self.mouse_drag_gesture else {
-                        return Ok(true);
-                    };
-                    if !gesture.force_selection && !gesture.scroll_active {
-                        let row_distance = local_row.abs_diff(gesture.origin_row);
-                        let col_distance = local_col.abs_diff(gesture.origin_col);
-                        if row_distance >= TOUCH_DRAG_SCROLL_THRESHOLD_ROWS
-                            && row_distance > col_distance
-                        {
-                            gesture.scroll_active = true;
-                            self.selection = None;
-                        }
-                    }
-
-                    if gesture.scroll_active {
-                        let row_delta = local_row as i32 - gesture.last_row as i32;
-                        gesture.last_row = local_row;
-                        self.mouse_drag_gesture = Some(gesture);
-                        if row_delta != 0
-                            && let Some(managed) = self.session_for_mut(pane_id)
-                        {
-                            if row_delta > 0 {
-                                managed.session.pane_mut().wheel_up(row_delta as usize);
-                            } else {
-                                managed
-                                    .session
-                                    .pane_mut()
-                                    .wheel_down(row_delta.unsigned_abs() as usize);
-                            }
-                        }
-                        return Ok(true);
-                    }
-
-                    self.mouse_drag_gesture = Some(gesture);
                     let buffer_line = viewport_top + local_row as usize;
                     let buffer_col = local_col as usize;
                     if let Some(selection) = self.selection.as_mut() {
@@ -2985,11 +2926,6 @@ impl Workspace {
                 }
                 if mouse.is_left_release() && self.mouse_drag_active {
                     self.mouse_drag_active = false;
-                    let gesture = self.mouse_drag_gesture.take();
-                    if gesture.is_some_and(|gesture| gesture.scroll_active) {
-                        self.selection = None;
-                        return Ok(true);
-                    }
                     if let Some(sel) = self.selection {
                         if sel.anchor_line == sel.cursor_line && sel.anchor_col == sel.cursor_col {
                             // Collapsed selection (press and release on
@@ -4062,7 +3998,7 @@ mod tests {
     }
 
     #[test]
-    fn mostly_vertical_unmodified_drag_scrolls_the_primary_viewport() {
+    fn unmodified_vertical_drag_selects_without_scrolling() {
         use super::handle_mouse_test_input as ev;
         let mut workspace =
             Workspace::spawn_single("/bin/sh", PtySize::new(8, 40)).expect("spawn workspace");
@@ -4094,31 +4030,25 @@ mod tests {
             .handle_input(InputAction::Mouse(ev(col, start_row + 3, 32, b'M')))
             .expect("vertical drag");
 
+        assert!(
+            workspace.has_selection(),
+            "vertical click-drag must remain a text selection"
+        );
+
         let after = workspace
             .session_for(active)
             .expect("active pane")
             .session
             .scrollback_viewport_top();
-        assert_eq!(before.saturating_sub(after), 3);
+        assert_eq!(after, before, "selection must not move the viewport");
 
         workspace
-            .handle_input(InputAction::Mouse(ev(col, start_row + 1, 32, b'M')))
-            .expect("reverse vertical drag");
-        let after_reverse = workspace
-            .session_for(active)
-            .expect("active pane")
-            .session
-            .scrollback_viewport_top();
-        assert_eq!(after_reverse.saturating_sub(after), 2);
-        assert!(
-            !workspace.has_selection(),
-            "a recognized touch-style scroll gesture must not leave selection state"
-        );
-
-        workspace
-            .handle_input(InputAction::Mouse(ev(col, start_row + 1, 0, b'm')))
+            .handle_input(InputAction::Mouse(ev(col, start_row + 3, 0, b'm')))
             .expect("release");
-        assert!(workspace.take_pending_clipboard().is_none());
+        let copied = workspace
+            .take_pending_clipboard()
+            .expect("vertical selection must auto-copy on release");
+        assert!(copied.contains('\n'), "vertical selection must span rows");
     }
 
     #[test]

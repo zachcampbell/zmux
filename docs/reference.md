@@ -89,10 +89,8 @@ and exits; `Esc` cancels. Scrollback remains available while an alternate-
 screen program is active: scrolling up reveals the retained primary history,
 and `G` restores the live alternate buffer. If the application enabled mouse
 tracking, wheel events inside its pane are forwarded to the application.
-On the primary screen, a mostly vertical unmodified drag scrolls the viewport.
-This also supports touchscreen swipes when the host terminal reports them as
-mouse drags. Horizontal drags select text; hold Shift to force selection for a
-vertical drag.
+On the primary screen, click-drag selects text in any direction and copies it
+on release.
 
 ## Command prompt (Ctrl-a :)
 

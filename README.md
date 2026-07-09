@@ -48,11 +48,9 @@ The prefix is `Ctrl-a`. The ones you'll actually use:
 The mouse works the way you'd hope: the wheel scrolls the pane under the
 cursor one row at a time by default, including primary history behind a
 full-screen alternate buffer when the app is not capturing mouse input.
-When the host terminal reports a touchscreen swipe as a mouse drag, mostly
-vertical drags scroll naturally; horizontal drags select, and Shift-drag
-always selects. Releasing a selection copies it to your clipboard via OSC 52.
-Full binding list, config format, and CLI reference:
-[docs/reference.md](docs/reference.md).
+Click-drag selects text in any direction, and releasing the selection copies
+it to your clipboard via OSC 52. Full binding list, config format, and CLI
+reference: [docs/reference.md](docs/reference.md).
 
 ## The agent part
 
