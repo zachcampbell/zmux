@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::fmt::Write as _;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
@@ -227,10 +228,48 @@ impl TerminalGuard {
         // recognize the mode silently ignore the sequence.
         buffer.push_str("\x1b[?2026h");
 
+        // A viewport wheel step changes nearly every content row by moving
+        // it one slot. Repainting those rows individually is correct but
+        // expensive (the real Termius trace showed ~10 KiB per notch at
+        // 215x41). When the new frame is predominantly a vertical shift,
+        // let the host terminal move the matching band with SU/SD and only
+        // redraw the newly exposed edge rows plus changed chrome.
+        let same_index_changed: Vec<bool> = if full_repaint {
+            vec![true; expected_rows]
+        } else {
+            self.last_frame
+                .iter()
+                .zip(&target_rows)
+                .map(|(previous, next)| previous != next)
+                .collect()
+        };
+        let changed_row_count = same_index_changed
+            .iter()
+            .filter(|changed| **changed)
+            .count();
+        let vertical_shift = if full_repaint || changed_row_count < 6 {
+            None
+        } else {
+            detect_vertical_shift(&self.last_frame, &target_rows)
+        };
+        let mut shifted_previous = None;
+        if let Some(shift) = vertical_shift {
+            append_vertical_shift(&mut buffer, shift);
+            let mut rows = self.last_frame.clone();
+            apply_vertical_shift_to_cache(&mut rows, shift);
+            shifted_previous = Some(rows);
+        }
+        let previous_rows = shifted_previous.as_deref().unwrap_or(&self.last_frame);
+
         let mut changed_rows: usize = 0;
         for (index, new_row) in target_rows.iter().enumerate() {
-            let previous = self.last_frame.get(index);
-            if !full_repaint && previous.map(|row| row == new_row).unwrap_or(false) {
+            let previous = previous_rows.get(index);
+            let unchanged = if vertical_shift.is_some() {
+                previous.map(|row| row == new_row).unwrap_or(false)
+            } else {
+                !same_index_changed[index]
+            };
+            if !full_repaint && unchanged {
                 continue;
             }
 
@@ -255,7 +294,11 @@ impl TerminalGuard {
 
         // A cursor-only change (position moved or visibility flipped)
         // must still write even when every row diffed clean.
-        if full_repaint || changed_rows > 0 || cursor != self.last_cursor {
+        if full_repaint
+            || vertical_shift.is_some()
+            || changed_rows > 0
+            || cursor != self.last_cursor
+        {
             self.write_escape(&buffer)?;
         }
         self.last_frame = target_rows;
@@ -318,6 +361,133 @@ fn append_row_update(buffer: &mut String, index: usize, row: &str) {
     let _ = write!(buffer, "\x1b[{};1H\x1b[0m\x1b[2K", index + 1);
     buffer.push_str(row);
     buffer.push_str("\x1b[0m");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerticalShiftDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerticalShift {
+    top: usize,
+    bottom: usize,
+    amount: usize,
+    direction: VerticalShiftDirection,
+    matched_rows: usize,
+}
+
+fn detect_vertical_shift(previous: &[String], next: &[String]) -> Option<VerticalShift> {
+    if previous.len() != next.len() || previous.len() < 3 {
+        return None;
+    }
+    // Hash each row once so scanning up to 32 possible deltas remains
+    // linear in frame bytes rather than repeatedly comparing long ANSI-
+    // styled strings (a pathological 512x1024 frame can be tens of MiB).
+    let previous_hashes: Vec<u64> = previous.iter().map(|row| row_fingerprint(row)).collect();
+    let next_hashes: Vec<u64> = next.iter().map(|row| row_fingerprint(row)).collect();
+    let baseline_matches = previous_hashes
+        .iter()
+        .zip(&next_hashes)
+        .filter(|(before, after)| before == after)
+        .count();
+    let mut best: Option<VerticalShift> = None;
+    let max_amount = previous.len().saturating_sub(1).min(32);
+
+    for amount in 1..=max_amount {
+        for direction in [VerticalShiftDirection::Up, VerticalShiftDirection::Down] {
+            let mut run_start = 0;
+            let mut run_len = 0;
+            let mut consider_run = |start: usize, len: usize| {
+                if len < 4 || len <= baseline_matches.saturating_add(2) {
+                    return;
+                }
+                let candidate = VerticalShift {
+                    top: start,
+                    bottom: start + len + amount - 1,
+                    amount,
+                    direction,
+                    matched_rows: len,
+                };
+                if candidate.bottom >= previous.len() {
+                    return;
+                }
+                let replace = best.is_none_or(|current| {
+                    candidate.matched_rows > current.matched_rows
+                        || (candidate.matched_rows == current.matched_rows
+                            && candidate.amount < current.amount)
+                });
+                if replace {
+                    best = Some(candidate);
+                }
+            };
+
+            for index in 0..previous.len() - amount {
+                let matches = match direction {
+                    VerticalShiftDirection::Up => {
+                        next_hashes[index] == previous_hashes[index + amount]
+                            && next[index] == previous[index + amount]
+                    }
+                    VerticalShiftDirection::Down => {
+                        next_hashes[index + amount] == previous_hashes[index]
+                            && next[index + amount] == previous[index]
+                    }
+                };
+                if matches {
+                    if run_len == 0 {
+                        run_start = index;
+                    }
+                    run_len += 1;
+                } else {
+                    consider_run(run_start, run_len);
+                    run_len = 0;
+                }
+            }
+            consider_run(run_start, run_len);
+        }
+    }
+    best
+}
+
+fn row_fingerprint(row: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    row.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn append_vertical_shift(buffer: &mut String, shift: VerticalShift) {
+    let command = match shift.direction {
+        VerticalShiftDirection::Up => 'S',
+        VerticalShiftDirection::Down => 'T',
+    };
+    let _ = write!(
+        buffer,
+        "\x1b[{};{}r\x1b[{}{}\x1b[r",
+        shift.top + 1,
+        shift.bottom + 1,
+        shift.amount,
+        command,
+    );
+}
+
+fn apply_vertical_shift_to_cache(rows: &mut [String], shift: VerticalShift) {
+    let region = &mut rows[shift.top..=shift.bottom];
+    match shift.direction {
+        VerticalShiftDirection::Up => {
+            region.rotate_left(shift.amount);
+            let exposed = region.len().saturating_sub(shift.amount);
+            for row in &mut region[exposed..] {
+                *row = "\0".to_string();
+            }
+        }
+        VerticalShiftDirection::Down => {
+            region.rotate_right(shift.amount);
+            for row in &mut region[..shift.amount] {
+                *row = "\0".to_string();
+            }
+        }
+    }
 }
 
 // The frame's final cursor placement. `cursor` is absolute 1-based
@@ -424,8 +594,9 @@ fn make_raw(mut termios: Termios) -> Termios {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_cursor_tail, append_row_update, mouse_tracking_reset_sequence,
-        mouse_tracking_sequence,
+        VerticalShift, VerticalShiftDirection, append_cursor_tail, append_row_update,
+        append_vertical_shift, apply_vertical_shift_to_cache, detect_vertical_shift,
+        mouse_tracking_reset_sequence, mouse_tracking_sequence,
     };
     use crate::mouse::MouseTrackingMode;
 
@@ -448,6 +619,78 @@ mod tests {
         append_row_update(&mut buffer, 2, "new row");
 
         assert_eq!(buffer, "\x1b[3;1H\x1b[0m\x1b[2Knew row\x1b[0m");
+    }
+
+    #[test]
+    fn detects_and_models_native_viewport_scrolls() {
+        let before: Vec<String> = ["header", "one", "two", "three", "four", "five", "status"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let after: Vec<String> = [
+            "header changed",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "status changed",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        let shift = detect_vertical_shift(&before, &after).expect("vertical shift");
+        assert_eq!(
+            shift,
+            VerticalShift {
+                top: 1,
+                bottom: 5,
+                amount: 1,
+                direction: VerticalShiftDirection::Up,
+                matched_rows: 4,
+            }
+        );
+        let mut sequence = String::new();
+        append_vertical_shift(&mut sequence, shift);
+        assert_eq!(sequence, "\x1b[2;6r\x1b[1S\x1b[r");
+
+        let mut modeled = before;
+        apply_vertical_shift_to_cache(&mut modeled, shift);
+        assert_eq!(&modeled[1..5], &after[1..5]);
+        assert_eq!(modeled[5], "\0", "exposed row must be redrawn");
+
+        let down_after: Vec<String> = [
+            "header changed again",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "status changed again",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let down = detect_vertical_shift(&after, &down_after).expect("downward shift");
+        assert_eq!(down.direction, VerticalShiftDirection::Down);
+        assert_eq!((down.top, down.bottom, down.amount), (1, 5, 1));
+        let mut modeled_down = after;
+        apply_vertical_shift_to_cache(&mut modeled_down, down);
+        assert_eq!(&modeled_down[2..6], &down_after[2..6]);
+        assert_eq!(modeled_down[1], "\0", "top exposed row must redraw");
+    }
+
+    #[test]
+    fn ordinary_sparse_row_change_is_not_misclassified_as_scroll() {
+        let before: Vec<String> = ["a", "b", "c", "d", "e", "f", "g"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut after = before.clone();
+        after[3] = "changed".to_string();
+
+        assert_eq!(detect_vertical_shift(&before, &after), None);
     }
 
     #[test]

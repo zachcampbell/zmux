@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::command::FormatContext;
 use crate::command::parse as parse_command;
 use crate::dispatch::{ClientId, CommandContext, CommandRegistry, SideEffect, register_tier1};
-use crate::input::InputParser;
+use crate::input::{InputAction, InputParser, MouseEvent};
 use crate::layout::{ResizeDirection, SplitOrientation};
 use crate::mcp;
 use crate::mouse::MouseTrackingMode;
@@ -233,6 +233,12 @@ pub fn attach_session(name: &str) -> io::Result<AttachOutcome> {
         let fresh_size = terminal.size()?;
         if fresh_size != current_size {
             current_size = fresh_size;
+            // Host resize/reflow invalidates what is physically painted even
+            // when another attached client keeps the daemon workspace at the
+            // same minimum size. Clear and invalidate locally; the Resize
+            // message forces a fresh per-client logical frame below.
+            terminal.invalidate_frame_cache();
+            terminal.write_ansi("\x1b[?2026h\x1b[0m\x1b[2J\x1b[H\x1b[?2026l")?;
             send_client_message(&mut stream, &ClientMessage::Resize { size: current_size })?;
         }
 
@@ -270,6 +276,12 @@ pub fn attach_session(name: &str) -> io::Result<AttachOutcome> {
                         // tearing down the session.
                     }
                     ServerMessage::TraceStatus { active, .. } => {
+                        if active && !trace_active {
+                            // The daemon forces a logical checkpoint at
+                            // trace start. Invalidate the final renderer too
+                            // so it emits a complete exact-ANSI checkpoint.
+                            terminal.invalidate_frame_cache();
+                        }
                         trace_active = active;
                         terminal.set_write_capture(active);
                     }
@@ -967,6 +979,11 @@ fn run_server_loop(
     // multi-client traces unambiguous.
     let mut next_client_id: u64 = 1;
     let mut trace_was_active = trace.status().active;
+    // A press/motion/release sequence must stay with the attached client
+    // and window where it began. Without ownership, a second mirrored
+    // client can extend or release somebody else's selection and receive
+    // the resulting clipboard contents.
+    let mut mouse_gesture_owner: Option<MouseGestureOwner> = None;
     loop {
         // If our socket was removed out from under us (e.g. a user manually
         // cleaning /tmp, or a stale-cleanup race), shut down rather than
@@ -1076,6 +1093,7 @@ fn run_server_loop(
                     ClientMessage::Attach { size } => {
                         clients[index].attached = true;
                         clients[index].size = size;
+                        clients[index].last_frame = None;
                         if trace.is_active() {
                             let _ = trace.record_json(
                                 TraceKind::ClientAttach,
@@ -1088,12 +1106,21 @@ fn run_server_loop(
                             trace_status_replies.push((index, server_trace_status(snapshot)));
                         }
                         let new_size = min_client_size(clients);
+                        if windows.size() != new_size {
+                            windows.cancel_all_mouse_gestures();
+                            mouse_gesture_owner = None;
+                        }
                         windows.resize(new_size)?;
                         dirty = true;
                     }
                     ClientMessage::Resize { size } => {
                         clients[index].size = size;
+                        clients[index].last_frame = None;
                         let new_size = min_client_size(clients);
+                        if windows.size() != new_size {
+                            windows.cancel_all_mouse_gestures();
+                            mouse_gesture_owner = None;
+                        }
                         windows.resize(new_size)?;
                         dirty = true;
                     }
@@ -1110,9 +1137,88 @@ fn run_server_loop(
                             }
                             continue;
                         }
-                        let client = &mut clients[index];
-                        for action in client.input_parser.push_bytes(&bytes) {
-                            dirty |= windows.active_mut().handle_input(action)?;
+                        let client_id = clients[index].id;
+                        let actions = clients[index].input_parser.push_bytes(&bytes);
+                        for action in actions {
+                            if let InputAction::Mouse(mouse) = action {
+                                let window_id = windows.active_trace_window_id();
+                                if mouse_gesture_owner
+                                    .is_some_and(|owner| owner.window_id != window_id)
+                                {
+                                    dirty |= windows.cancel_all_mouse_gestures();
+                                    mouse_gesture_owner = None;
+                                }
+                                let candidate = MouseGestureOwner {
+                                    client_id,
+                                    window_id,
+                                };
+                                let allowed =
+                                    mouse_event_allowed(mouse_gesture_owner, candidate, mouse);
+                                if allowed
+                                    && mouse.is_left_press()
+                                    && mouse_gesture_owner == Some(candidate)
+                                {
+                                    // Recover from a missing release from
+                                    // this same client before starting its
+                                    // next gesture.
+                                    dirty |= windows.cancel_all_mouse_gestures();
+                                }
+                                let before_pane = windows.active().active_pane_id() as u32;
+                                let (before_top, before_follow) =
+                                    windows.active().active_viewport_state();
+                                let action_dirty = if allowed {
+                                    windows
+                                        .active_mut()
+                                        .handle_input(InputAction::Mouse(mouse))?
+                                } else {
+                                    false
+                                };
+                                dirty |= action_dirty;
+                                if allowed && mouse.is_left_press() {
+                                    mouse_gesture_owner = Some(candidate);
+                                }
+                                if allowed && mouse.is_left_release() {
+                                    mouse_gesture_owner = None;
+                                }
+                                if trace.is_active() {
+                                    let after_pane = windows.active().active_pane_id() as u32;
+                                    let (after_top, after_follow) =
+                                        windows.active().active_viewport_state();
+                                    let _ = trace.record_json(
+                                        TraceKind::State,
+                                        TraceContext {
+                                            pane_id: Some(after_pane),
+                                            ..trace_context
+                                        },
+                                        &serde_json::json!({
+                                            "event": "mouse_action",
+                                            "action": if allowed {
+                                                mouse_action_name(mouse)
+                                            } else {
+                                                "foreign_ignored"
+                                            },
+                                            "raw_action": mouse_action_name(mouse),
+                                            "owner_client_id": mouse_gesture_owner
+                                                .map(|owner| owner.client_id),
+                                            "owner_window_id": mouse_gesture_owner
+                                                .map(|owner| owner.window_id),
+                                            "button": mouse.button,
+                                            "col": mouse.col,
+                                            "row": mouse.row,
+                                            "final_byte": char::from(mouse.final_byte).to_string(),
+                                            "dirty": action_dirty,
+                                            "pane_before": before_pane,
+                                            "pane_after": after_pane,
+                                            "viewport_top_before": before_top,
+                                            "viewport_top_after": after_top,
+                                            "follow_before": before_follow,
+                                            "follow_after": after_follow,
+                                        }),
+                                    );
+                                }
+                            } else {
+                                dirty |= windows.active_mut().handle_input(action)?;
+                            }
                         }
                         // Mouse-drag release can leave auto-yanked text
                         // queued in the workspace; drain it here and
@@ -1519,6 +1625,13 @@ fn run_server_loop(
                             }
                             let snapshot = trace.status();
                             trace_was_active = snapshot.active;
+                            // Force one logical frame checkpoint into the
+                            // newly-started trace even when the workspace is
+                            // visually identical to the last pre-trace frame.
+                            for client in clients.iter_mut().filter(|client| client.attached) {
+                                client.last_frame = None;
+                            }
+                            dirty = true;
                             for (target, client) in clients.iter().enumerate() {
                                 if target == index || client.attached {
                                     trace_status_replies
@@ -1604,6 +1717,10 @@ fn run_server_loop(
             to_remove.sort_unstable();
             to_remove.dedup();
             for index in to_remove.into_iter().rev() {
+                if mouse_gesture_owner.is_some_and(|owner| owner.client_id == clients[index].id) {
+                    dirty |= windows.cancel_all_mouse_gestures();
+                    mouse_gesture_owner = None;
+                }
                 let context = TraceContext {
                     client_id: Some(clients[index].id),
                     window_id: Some(windows.active_trace_window_id()),
@@ -1621,6 +1738,8 @@ fn run_server_loop(
             if clients.iter().any(|client| client.attached) {
                 let new_size = min_client_size(clients);
                 if windows.size() != new_size {
+                    windows.cancel_all_mouse_gestures();
+                    mouse_gesture_owner = None;
                     windows.resize(new_size)?;
                     dirty = true;
                 }
@@ -1647,6 +1766,18 @@ fn run_server_loop(
         // supervisor sees the whole session.
         let now = std::time::Instant::now();
         windows.tick_agents(now);
+        if mouse_gesture_owner
+            .is_some_and(|owner| owner.window_id != windows.active_trace_window_id())
+        {
+            dirty |= windows.cancel_all_mouse_gestures();
+            mouse_gesture_owner = None;
+        }
+        if mouse_gesture_owner.is_some()
+            && windows.active_mouse_gesture()
+            && windows.tick_mouse_drag_autoscroll(now)
+        {
+            dirty = true;
+        }
 
         // Synchronous MCP dispatch against the workspace. Deferred
         // handlers (e.g. spawn_pane wait_for_idle) push into
@@ -1686,7 +1817,50 @@ fn run_server_loop(
         }
 
         if dirty {
-            broadcast_frame(clients, windows, &trace)?;
+            // A failed frame write removes only that peer. If it owned an
+            // active gesture, cancel the partial selection/resize and
+            // repaint the surviving clients. Removing the smallest client
+            // can also enlarge the shared workspace, which likewise needs
+            // an immediate replacement frame.
+            loop {
+                let dropped_client_ids = broadcast_frame(clients, windows, &trace)?;
+                if dropped_client_ids.is_empty() {
+                    break;
+                }
+
+                let mut repaint_after_drop = false;
+                for client_id in dropped_client_ids {
+                    if mouse_gesture_owner.is_some_and(|owner| owner.client_id == client_id) {
+                        repaint_after_drop |= windows.cancel_all_mouse_gestures();
+                        mouse_gesture_owner = None;
+                    }
+                    if trace.is_active() {
+                        let _ = trace.record_json(
+                            TraceKind::ClientDetach,
+                            TraceContext {
+                                client_id: Some(client_id),
+                                window_id: Some(windows.active_trace_window_id()),
+                                pane_id: Some(windows.active().active_pane_id() as u32),
+                            },
+                            &serde_json::json!({
+                                "attached": true,
+                                "reason": "frame_write_failed",
+                            }),
+                        );
+                    }
+                }
+
+                if clients.iter().any(|client| client.attached) {
+                    let new_size = min_client_size(clients);
+                    if windows.size() != new_size {
+                        windows.resize(new_size)?;
+                        repaint_after_drop = true;
+                    }
+                }
+                if !repaint_after_drop {
+                    break;
+                }
+            }
         }
 
         // A size cap or disk/write failure can stop the writer without a
@@ -1749,6 +1923,44 @@ fn coalesce_resizes(messages: Vec<ClientMessage>) -> Vec<ClientMessage> {
     coalesced
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseGestureOwner {
+    client_id: u64,
+    window_id: u32,
+}
+
+fn mouse_event_allowed(
+    owner: Option<MouseGestureOwner>,
+    candidate: MouseGestureOwner,
+    mouse: MouseEvent,
+) -> bool {
+    if mouse.is_left_press() {
+        return owner.is_none() || owner == Some(candidate);
+    }
+    if mouse.is_left_drag_motion() || mouse.is_left_release() {
+        return owner == Some(candidate);
+    }
+    // Wheel and non-left mouse events do not participate in selection or
+    // resize ownership. They retain the existing mirrored-client behavior.
+    true
+}
+
+fn mouse_action_name(mouse: MouseEvent) -> &'static str {
+    if mouse.is_scroll_up() {
+        "wheel_up"
+    } else if mouse.is_scroll_down() {
+        "wheel_down"
+    } else if mouse.is_left_press() {
+        "left_press"
+    } else if mouse.is_left_drag_motion() {
+        "left_drag"
+    } else if mouse.is_left_release() {
+        "left_release"
+    } else {
+        "other"
+    }
+}
+
 fn accept_pending_connections(
     listener: &UnixListener,
     clients: &mut Vec<AttachedClient>,
@@ -1798,9 +2010,9 @@ fn broadcast_frame(
     clients: &mut Vec<AttachedClient>,
     windows: &crate::windows::WindowSet,
     trace: &TraceHub,
-) -> io::Result<()> {
+) -> io::Result<Vec<u64>> {
     if !clients.iter().any(|client| client.attached) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let frame = ServerMessage::Frame {
         size: windows.size(),
@@ -1808,8 +2020,14 @@ fn broadcast_frame(
         lines: windows.active().render_frame(),
         cursor: windows.active().cursor_screen_position(),
     };
+    let encoded = encode_server_message(&frame)?;
+    let has_changed_recipient = clients.iter().any(|client| {
+        client.attached && frame_changed(client.last_frame.as_deref(), encoded.as_slice())
+    });
+    if !has_changed_recipient {
+        return Ok(Vec::new());
+    }
     if trace.is_active() {
-        let encoded = encode_server_message(&frame)?;
         let _ = trace.record_bytes(
             TraceKind::ServerFrame,
             TraceContext {
@@ -1820,23 +2038,33 @@ fn broadcast_frame(
             &encoded,
         );
     }
-    let mut dead: Vec<usize> = Vec::new();
+    let mut dead: Vec<(usize, u64)> = Vec::new();
     for (index, client) in clients.iter_mut().enumerate() {
         if !client.attached {
             continue;
         }
-        if let Err(error) = send_server_message(client.stream_mut(), &frame) {
+        if !frame_changed(client.last_frame.as_deref(), encoded.as_slice()) {
+            continue;
+        }
+        if let Err(error) = client.stream_mut().write_all(&encoded) {
             if is_dead_client_write_error(error.kind()) {
-                dead.push(index);
+                dead.push((index, client.id));
             } else {
                 return Err(error);
             }
+        } else {
+            client.last_frame = Some(encoded.clone());
         }
     }
-    for index in dead.into_iter().rev() {
+    let dead_client_ids = dead.iter().map(|(_, client_id)| *client_id).collect();
+    for (index, _) in dead.into_iter().rev() {
         clients.swap_remove(index);
     }
-    Ok(())
+    Ok(dead_client_ids)
+}
+
+fn frame_changed(previous: Option<&[u8]>, next: &[u8]) -> bool {
+    previous != Some(next)
 }
 
 fn server_trace_status(status: TraceStatusSnapshot) -> ServerMessage {
@@ -2246,6 +2474,10 @@ struct AttachedClient {
     // 24x80 until the first Attach/Resize lands so `min_size` across
     // clients stays sensible.
     size: PtySize,
+    // Protocol-encoded logical frame most recently sent to this client.
+    // Comparing before write suppresses daemon->attach traffic for PTY
+    // control bytes that leave the rendered screen and cursor unchanged.
+    last_frame: Option<Vec<u8>>,
 }
 
 impl AttachedClient {
@@ -2263,6 +2495,7 @@ impl AttachedClient {
             decoder: ClientDecoder::default(),
             input_parser: InputParser::default(),
             size: PtySize::new(24, 80),
+            last_frame: None,
         }
     }
 
@@ -2535,9 +2768,11 @@ pub fn print_session_list_verbose(
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachInput, PrefixKeyParser, coalesce_resizes, is_dead_client_write_error,
-        print_session_list, send_server_message, validate_session_name,
+        AttachInput, MouseGestureOwner, PrefixKeyParser, coalesce_resizes, frame_changed,
+        is_dead_client_write_error, mouse_event_allowed, print_session_list, send_server_message,
+        validate_session_name,
     };
+    use crate::input::MouseEvent;
     use crate::protocol::{ClientMessage, ServerMessage};
     use crate::pty::PtySize;
     use std::io;
@@ -2546,6 +2781,59 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn identical_frame_cache_entries_are_suppressed() {
+        assert!(frame_changed(None, b"frame-a"));
+        assert!(!frame_changed(Some(b"frame-a"), b"frame-a"));
+        assert!(frame_changed(Some(b"frame-a"), b"frame-b"));
+    }
+
+    #[test]
+    fn mouse_gesture_events_stay_with_the_pressing_client_and_window() {
+        let owner = MouseGestureOwner {
+            client_id: 7,
+            window_id: 2,
+        };
+        let foreign_client = MouseGestureOwner {
+            client_id: 8,
+            window_id: 2,
+        };
+        let foreign_window = MouseGestureOwner {
+            client_id: 7,
+            window_id: 3,
+        };
+        let press = MouseEvent {
+            button: 0,
+            col: 3,
+            row: 4,
+            final_byte: b'M',
+        };
+        let drag = MouseEvent {
+            button: 32,
+            ..press
+        };
+        let release = MouseEvent {
+            final_byte: b'm',
+            ..press
+        };
+        let wheel = MouseEvent {
+            button: 64,
+            ..press
+        };
+
+        assert!(mouse_event_allowed(None, owner, press));
+        assert!(mouse_event_allowed(Some(owner), owner, press));
+        assert!(mouse_event_allowed(Some(owner), owner, drag));
+        assert!(mouse_event_allowed(Some(owner), owner, release));
+        assert!(!mouse_event_allowed(Some(owner), foreign_client, press));
+        assert!(!mouse_event_allowed(Some(owner), foreign_client, drag));
+        assert!(!mouse_event_allowed(Some(owner), foreign_client, release));
+        assert!(!mouse_event_allowed(Some(owner), foreign_window, drag));
+        assert!(mouse_event_allowed(Some(owner), foreign_client, wheel));
+        assert!(!mouse_event_allowed(None, owner, drag));
+        assert!(!mouse_event_allowed(None, owner, release));
+    }
 
     #[test]
     fn detached_daemon_log_is_private_and_appendable() {

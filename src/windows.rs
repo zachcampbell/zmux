@@ -607,6 +607,10 @@ impl WindowSet {
     fn switch_active(&mut self, index: usize) {
         let previous_window_id = self.active_trace_window_id();
         if index != self.active {
+            // Pointer coordinates belong to the window where the press
+            // began. A switch cannot carry an in-progress selection or
+            // separator resize into a different workspace.
+            self.windows[self.active].cancel_mouse_gesture();
             self.last_active = self.active;
         }
         self.active = index;
@@ -741,6 +745,24 @@ impl WindowSet {
         }
     }
 
+    /// Continue a mouse selection beyond the active pane's visible top or
+    /// bottom edge. Only the active window can own an attached-client drag.
+    pub(crate) fn tick_mouse_drag_autoscroll(&mut self, now: std::time::Instant) -> bool {
+        self.active_mut().tick_mouse_drag_autoscroll(now)
+    }
+
+    pub(crate) fn active_mouse_gesture(&self) -> bool {
+        self.active().mouse_gesture_active()
+    }
+
+    pub(crate) fn cancel_all_mouse_gestures(&mut self) -> bool {
+        let mut changed = false;
+        for window in &mut self.windows {
+            changed |= window.cancel_mouse_gesture();
+        }
+        changed
+    }
+
     // Mouse tracking mode of the active window — what the client needs
     // to configure the terminal for. Non-active windows can disagree;
     // we only care about the frontmost one.
@@ -867,6 +889,33 @@ mod tests {
         assert_eq!(set.active_index(), 0);
         assert!(set.previous_window());
         assert_eq!(set.active_index(), 2);
+    }
+
+    #[test]
+    fn switching_windows_cancels_the_old_windows_mouse_gesture() {
+        use crate::input::{InputAction, MouseEvent};
+
+        let mut set = build();
+        set.new_window().expect("second window");
+        let pressed_window = set.active_index();
+        set.active_mut()
+            .handle_input(InputAction::Mouse(MouseEvent {
+                button: 0,
+                col: 1,
+                row: 1,
+                final_byte: b'M',
+            }))
+            .expect("mouse press");
+        assert!(set.active_mouse_gesture());
+
+        assert!(set.next_window());
+        assert!(!set.active_mouse_gesture());
+        assert!(set.select_window(pressed_window));
+        assert!(!set.active_mouse_gesture());
+        assert!(
+            !set.active().has_selection(),
+            "a partial selection must not survive a window switch"
+        );
     }
 
     #[test]

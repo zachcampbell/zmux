@@ -19,6 +19,7 @@ use crate::layout::{
     WorkspaceLayout,
 };
 use crate::mouse::{MouseTrackingMode, ScreenMode};
+use crate::pane::WheelOutcome;
 use crate::pty::PtySize;
 use crate::session::Session;
 use crate::style::{Attrs, Cell, Color, Style, display_width, serialize_row};
@@ -38,6 +39,10 @@ const DEFAULT_IDLE_THRESHOLD: Duration = Duration::from_millis(750);
 // status updates).
 const PANE_OUTPUT_BYTE_THRESHOLD: u64 = 64;
 const PANE_OUTPUT_TIME_THRESHOLD: Duration = Duration::from_millis(100);
+// Once a drag reaches the pane's top/bottom edge, continue extending the
+// selection through history even if the host terminal emits no more motion
+// reports while the pointer is held outside its window.
+const MOUSE_SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(60);
 
 // Minimal subset of the POSIX `struct tm` fields, used to format local
 // wall-clock time for the status bar. Order matches glibc/musl layout on
@@ -153,6 +158,16 @@ pub struct Workspace {
     // selection when they belong to an in-progress drag, not when the
     // terminal happens to emit stray motion for another reason.
     mouse_drag_active: bool,
+    // Pane where the current text-selection drag began. Motion/release is
+    // pinned to this pane even when the pointer crosses its header, a
+    // separator, another pane, or the terminal status row.
+    mouse_drag_pane: Option<PaneId>,
+    // Active edge-scroll direction while a selection drag is held outside
+    // the pane's visible content. The daemon ticks this at a bounded cadence
+    // so selecting beyond the viewport does not depend on repeated host
+    // motion packets at the clamped terminal edge.
+    mouse_drag_edge: Option<MouseDragEdge>,
+    mouse_drag_last_autoscroll: Option<Instant>,
     // Set when the user grabbed a pane border with the mouse. Holds
     // the two neighbor panes on either side of the separator plus the
     // last pointer position we applied weight adjustments at, so each
@@ -265,6 +280,12 @@ struct MouseResize {
     right_or_bottom_pane: PaneId,
     last_col: u16,
     last_row: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseDragEdge {
+    Up { local_col: usize },
+    Down { local_col: usize },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -487,6 +508,9 @@ impl Workspace {
             rename_input: None,
             sync_panes: false,
             mouse_drag_active: false,
+            mouse_drag_pane: None,
+            mouse_drag_edge: None,
+            mouse_drag_last_autoscroll: None,
             mouse_resize: None,
             // Start at Quadrants so the first Ctrl-a Space cycles to
             // TwoColumns — the least-destructive default of the three.
@@ -587,6 +611,9 @@ impl Workspace {
             rename_input: None,
             sync_panes: false,
             mouse_drag_active: false,
+            mouse_drag_pane: None,
+            mouse_drag_edge: None,
+            mouse_drag_last_autoscroll: None,
             mouse_resize: None,
             last_preset: LayoutPreset::Quadrants,
             pending_clipboard: None,
@@ -677,6 +704,17 @@ impl Workspace {
         self.session_for(self.active)
             .map(|managed| !managed.session.follow_output())
             .unwrap_or(false)
+    }
+
+    pub(crate) fn active_viewport_state(&self) -> (usize, bool) {
+        self.session_for(self.active)
+            .map(|managed| {
+                (
+                    managed.session.scrollback_viewport_top(),
+                    managed.session.follow_output(),
+                )
+            })
+            .unwrap_or((0, true))
     }
 
     // Returns Ok(true) if a new pane was actually spawned. Refuses with
@@ -913,14 +951,13 @@ impl Workspace {
     pub fn scroll_active_up(&mut self, lines: usize) -> bool {
         self.session_for_mut(self.active)
             .map(|session| {
-                let before = session.session.follow_output();
-                session.session.wheel_up(lines);
-                // wheel_up returns no explicit bool; treat it as dirty if
-                // we transitioned out of follow-output mode or viewport
-                // moved. The session API doesn't expose the movement
-                // delta cleanly, so we conservatively assume dirty.
-                let _ = before;
-                true
+                matches!(
+                    session.session.wheel_up(lines),
+                    WheelOutcome::ViewportChanged {
+                        lines_scrolled: 1..,
+                        ..
+                    }
+                )
             })
             .unwrap_or(false)
     }
@@ -928,8 +965,13 @@ impl Workspace {
     pub fn scroll_active_down(&mut self, lines: usize) -> bool {
         self.session_for_mut(self.active)
             .map(|session| {
-                session.session.wheel_down(lines);
-                true
+                matches!(
+                    session.session.wheel_down(lines),
+                    WheelOutcome::ViewportChanged {
+                        lines_scrolled: 1..,
+                        ..
+                    }
+                )
             })
             .unwrap_or(false)
     }
@@ -1055,11 +1097,10 @@ impl Workspace {
     // so state from pane A doesn't bleed into pane B.
     fn clear_active_pane_transients(&mut self) -> bool {
         let a = self.clear_search();
-        let b = self.clear_selection();
-        let c = self.cancel_rename();
-        let d = self.cancel_command_prompt();
-        let e = self.mouse_drag_active;
-        self.mouse_drag_active = false;
+        let b = self.cancel_mouse_gesture();
+        let c = self.clear_selection();
+        let d = self.cancel_rename();
+        let e = self.cancel_command_prompt();
         a || b || c || d || e
     }
 
@@ -1815,8 +1856,11 @@ impl Workspace {
     pub fn scroll_active_to_bottom(&mut self) -> bool {
         self.session_for_mut(self.active)
             .map(|session| {
+                let before_top = session.session.scrollback_viewport_top();
+                let before_follow = session.session.follow_output();
                 session.session.scroll_to_bottom();
-                true
+                before_top != session.session.scrollback_viewport_top()
+                    || before_follow != session.session.follow_output()
             })
             .unwrap_or(false)
     }
@@ -3043,12 +3087,238 @@ impl Workspace {
         Ok(None)
     }
 
+    fn set_mouse_selection_cursor(
+        &mut self,
+        pane_id: PaneId,
+        local_col: usize,
+        local_row: usize,
+    ) -> bool {
+        let Some(managed) = self.session_for(pane_id) else {
+            return false;
+        };
+        let buffer_line = managed.session.scrollback_viewport_top() + local_row;
+        let Some(selection) = self.selection.as_mut() else {
+            return false;
+        };
+        let changed = selection.cursor_line != buffer_line || selection.cursor_col != local_col;
+        selection.cursor_line = buffer_line;
+        selection.cursor_col = local_col;
+        changed
+    }
+
+    fn scroll_mouse_selection_edge(&mut self, edge: MouseDragEdge) -> bool {
+        let Some(pane_id) = self.mouse_drag_pane else {
+            return false;
+        };
+        let Some(layout) = self.layout.pane_frame(pane_id) else {
+            return false;
+        };
+        let local_row = match edge {
+            MouseDragEdge::Up { .. } => 0,
+            MouseDragEdge::Down { .. } => layout.content.height.saturating_sub(1) as usize,
+        };
+        let local_col = match edge {
+            MouseDragEdge::Up { local_col } | MouseDragEdge::Down { local_col } => local_col,
+        };
+
+        let moved = match self.session_for_mut(pane_id) {
+            Some(managed) if managed.session.screen_mode() == ScreenMode::Primary => {
+                let outcome = match edge {
+                    MouseDragEdge::Up { .. } => managed.session.wheel_up(1),
+                    MouseDragEdge::Down { .. } => managed.session.wheel_down(1),
+                };
+                matches!(
+                    outcome,
+                    WheelOutcome::ViewportChanged {
+                        lines_scrolled: 1..,
+                        ..
+                    }
+                )
+            }
+            _ => false,
+        };
+        self.set_mouse_selection_cursor(pane_id, local_col, local_row) || moved
+    }
+
+    fn update_mouse_selection_drag(&mut self, mouse: MouseEvent, scroll_edge: bool) -> bool {
+        let Some(pane_id) = self.mouse_drag_pane else {
+            return false;
+        };
+        let Some(layout) = self.layout.pane_frame(pane_id) else {
+            return false;
+        };
+        if layout.content.width == 0 || layout.content.height == 0 {
+            return false;
+        }
+
+        let local_col = mouse
+            .col
+            .saturating_sub(layout.content.x)
+            .min(layout.content.width.saturating_sub(1)) as usize;
+        let content_bottom = layout.content.y.saturating_add(layout.content.height);
+        let (edge, local_row) = if mouse.row < layout.content.y {
+            (Some(MouseDragEdge::Up { local_col }), 0)
+        } else if mouse.row >= content_bottom {
+            (
+                Some(MouseDragEdge::Down { local_col }),
+                layout.content.height.saturating_sub(1) as usize,
+            )
+        } else {
+            (None, (mouse.row - layout.content.y) as usize)
+        };
+
+        if scroll_edge && let Some(edge) = edge {
+            let now = Instant::now();
+            let entered_edge = !matches!(
+                (self.mouse_drag_edge, edge),
+                (Some(MouseDragEdge::Up { .. }), MouseDragEdge::Up { .. })
+                    | (Some(MouseDragEdge::Down { .. }), MouseDragEdge::Down { .. })
+            );
+            let interval_elapsed = self.mouse_drag_last_autoscroll.is_none_or(|last| {
+                now.saturating_duration_since(last) >= MOUSE_SELECTION_AUTOSCROLL_INTERVAL
+            });
+            self.mouse_drag_edge = Some(edge);
+            if entered_edge || interval_elapsed {
+                self.mouse_drag_last_autoscroll = Some(now);
+                return self.scroll_mouse_selection_edge(edge);
+            }
+
+            // Terminals can batch many motion packets while a finger or
+            // pointer is held at the edge. Keep horizontal selection
+            // movement responsive, but let the bounded timer advance the
+            // viewport instead of racing one history row per packet.
+            return self.set_mouse_selection_cursor(pane_id, local_col, local_row);
+        }
+
+        self.mouse_drag_edge = None;
+        self.mouse_drag_last_autoscroll = None;
+        self.set_mouse_selection_cursor(pane_id, local_col, local_row)
+    }
+
+    fn finish_mouse_selection_drag(&mut self) -> bool {
+        let pane_id = self.mouse_drag_pane.take().unwrap_or(self.active);
+        self.mouse_drag_active = false;
+        self.mouse_drag_edge = None;
+        self.mouse_drag_last_autoscroll = None;
+
+        let Some(selection) = self.selection else {
+            return true;
+        };
+        if selection.anchor_line == selection.cursor_line
+            && selection.anchor_col == selection.cursor_col
+        {
+            self.selection = None;
+            return true;
+        }
+
+        // `extract_char_stream` addresses scrollback plus the live grid as
+        // one timeline, so rows that moved off screen while edge-scrolling
+        // remain selectable and copy in the same order they were painted.
+        if let Some(managed) = self.session_for(pane_id) {
+            let text = extract_char_stream(managed, selection);
+            self.paste_buffer = Some(text.clone());
+            self.pending_clipboard = Some(text);
+        }
+        true
+    }
+
+    pub(crate) fn tick_mouse_drag_autoscroll(&mut self, now: Instant) -> bool {
+        if !self.mouse_drag_active {
+            return false;
+        }
+        let Some(edge) = self.mouse_drag_edge else {
+            return false;
+        };
+        if self.mouse_drag_last_autoscroll.is_some_and(|last| {
+            now.saturating_duration_since(last) < MOUSE_SELECTION_AUTOSCROLL_INTERVAL
+        }) {
+            return false;
+        }
+        self.mouse_drag_last_autoscroll = Some(now);
+        let before = self.active_viewport_state();
+        let changed = self.scroll_mouse_selection_edge(edge);
+        let after = self.active_viewport_state();
+        if changed
+            && let Some((hub, window_id)) = &self.trace
+            && hub.is_active()
+        {
+            let direction = match edge {
+                MouseDragEdge::Up { .. } => "up",
+                MouseDragEdge::Down { .. } => "down",
+            };
+            let _ = hub.record_json(
+                TraceKind::State,
+                TraceContext {
+                    window_id: Some(*window_id),
+                    pane_id: self.mouse_drag_pane.map(|pane| pane as u32),
+                    ..TraceContext::default()
+                },
+                &serde_json::json!({
+                    "event": "mouse_selection_autoscroll",
+                    "direction": direction,
+                    "viewport_top_before": before.0,
+                    "viewport_top_after": after.0,
+                    "follow_before": before.1,
+                    "follow_after": after.1,
+                }),
+            );
+        }
+        changed
+    }
+
+    pub(crate) fn mouse_gesture_active(&self) -> bool {
+        self.mouse_drag_active
+            || self.mouse_drag_pane.is_some()
+            || self.mouse_drag_edge.is_some()
+            || self.mouse_resize.is_some()
+    }
+
+    pub(crate) fn cancel_mouse_gesture(&mut self) -> bool {
+        let had_drag = self.mouse_drag_active
+            || self.mouse_drag_pane.is_some()
+            || self.mouse_drag_edge.is_some();
+        let had_resize = self.mouse_resize.take().is_some();
+        self.mouse_drag_active = false;
+        self.mouse_drag_pane = None;
+        self.mouse_drag_edge = None;
+        self.mouse_drag_last_autoscroll = None;
+        let cleared_partial_selection = had_drag && self.selection.take().is_some();
+        had_drag || had_resize || cleared_partial_selection
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) -> io::Result<bool> {
+        // A fresh press is also recovery from a missing release packet.
+        // Discard the old partial selection/resize before starting the new
+        // gesture so stale state cannot hijack this press.
+        let cancelled_stale = if mouse.is_left_press() && self.mouse_gesture_active() {
+            self.cancel_mouse_gesture()
+        } else {
+            false
+        };
+
+        // Once a primary-screen text drag has started, it owns every motion
+        // and release until button-up — even outside the pane's content.
+        // Routing through the ordinary hit test first would switch panes or
+        // drop header/status-row events, leaving the selection stuck and
+        // making it impossible to select beyond the visible viewport.
+        if self.mouse_drag_active {
+            if mouse.is_left_drag_motion() {
+                return Ok(self.update_mouse_selection_drag(mouse, true));
+            }
+            if mouse.is_left_release() {
+                // The last motion event already fixed the selection cursor
+                // in combined-history coordinates. Recomputing it from the
+                // release's screen row would corrupt a selection if fresh
+                // PTY output moved the viewport between motion and button-up.
+                return Ok(self.finish_mouse_selection_drag());
+            }
+        }
+
         // Separator hit test — drag-resize hijacks press/motion/release
         // over a pane border so a grab on the border line becomes a
         // resize gesture instead of a selection inside the pane below.
         if let Some(dirty) = self.handle_mouse_resize(mouse)? {
-            return Ok(dirty);
+            return Ok(cancelled_stale || dirty);
         }
 
         if let Some((pane_id, local_col, local_row)) =
@@ -3068,10 +3338,10 @@ impl Workspace {
                     managed.session.screen_mode() == ScreenMode::Primary,
                     managed.exit_status,
                 ),
-                None => return Ok(active_changed),
+                None => return Ok(cancelled_stale || active_changed),
             };
             if exit_status.is_some() {
-                return Ok(active_changed);
+                return Ok(cancelled_stale || active_changed);
             }
 
             // On the primary screen we handle click+drag ourselves to
@@ -3082,7 +3352,7 @@ impl Workspace {
             if is_primary {
                 let viewport_top = match self.session_for(pane_id) {
                     Some(managed) => managed.session.scrollback_viewport_top(),
-                    None => return Ok(active_changed),
+                    None => return Ok(cancelled_stale || active_changed),
                 };
                 if mouse.is_left_press() {
                     let buffer_line = viewport_top + local_row as usize;
@@ -3095,52 +3365,16 @@ impl Workspace {
                         cursor_col: buffer_col,
                     });
                     self.mouse_drag_active = true;
-                    return Ok(true);
-                }
-                if mouse.is_left_drag_motion() && self.mouse_drag_active {
-                    let buffer_line = viewport_top + local_row as usize;
-                    let buffer_col = local_col as usize;
-                    if let Some(selection) = self.selection.as_mut() {
-                        selection.cursor_line = buffer_line;
-                        selection.cursor_col = buffer_col;
-                    }
-                    return Ok(true);
-                }
-                if mouse.is_left_release() && self.mouse_drag_active {
-                    self.mouse_drag_active = false;
-                    if let Some(sel) = self.selection {
-                        if sel.anchor_line == sel.cursor_line && sel.anchor_col == sel.cursor_col {
-                            // Collapsed selection (press and release on
-                            // the same cell). Nothing to copy; drop the
-                            // stray [SEL char] tag.
-                            self.selection = None;
-                        } else {
-                            // `extract_char_stream` reads through the
-                            // combined-timeline accessors, so output
-                            // that streamed in mid-drag (moving some of
-                            // the highlighted rows from the live grid
-                            // into scrollback) still resolves to the
-                            // same content — no drain needed here.
-                            if let Some(active) = self.session_for(self.active) {
-                                // Auto-yank the drag selection so the
-                                // user gets the desktop-terminal UX:
-                                // release the mouse and the highlight
-                                // is on the clipboard. Selection stays
-                                // visible until the next click so the
-                                // user sees what was copied.
-                                let text = extract_char_stream(active, sel);
-                                self.paste_buffer = Some(text.clone());
-                                self.pending_clipboard = Some(text);
-                            }
-                        }
-                    }
+                    self.mouse_drag_pane = Some(pane_id);
+                    self.mouse_drag_edge = None;
+                    self.mouse_drag_last_autoscroll = None;
                     return Ok(true);
                 }
             }
 
             let wheel_scroll_lines = self.wheel_scroll_lines;
             let Some(managed) = self.session_for_mut(pane_id) else {
-                return Ok(active_changed);
+                return Ok(cancelled_stale || active_changed);
             };
             let local_mouse = mouse
                 .translate(mouse.col - local_col, mouse.row - local_row)
@@ -3148,7 +3382,7 @@ impl Workspace {
             let handled = managed
                 .session
                 .handle_mouse_event(local_mouse, wheel_scroll_lines)?;
-            return Ok(active_changed || handled || mouse.is_left_press());
+            return Ok(cancelled_stale || active_changed || handled || mouse.is_left_press());
         }
 
         let wheel_scroll_lines = self.wheel_scroll_lines;
@@ -3157,7 +3391,10 @@ impl Workspace {
             && active.exit_status.is_none()
             && active.session.screen_mode() == ScreenMode::Primary
         {
-            return active.session.handle_mouse_event(mouse, wheel_scroll_lines);
+            return active
+                .session
+                .handle_mouse_event(mouse, wheel_scroll_lines)
+                .map(|dirty| cancelled_stale || dirty);
         }
 
         if mouse.is_left_press()
@@ -3168,10 +3405,10 @@ impl Workspace {
                 self.clear_active_pane_transients();
             }
             self.change_active(pane_id);
-            return Ok(changed);
+            return Ok(cancelled_stale || changed);
         }
 
-        Ok(false)
+        Ok(cancelled_stale)
     }
 
     fn leaves_in_order(&self) -> Vec<PaneId> {
@@ -3530,7 +3767,8 @@ fn read_hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BroadcastFilter, InputAction, PromptKind, Selection, SelectionMode, Workspace, stamp_text,
+        BroadcastFilter, InputAction, MOUSE_SELECTION_AUTOSCROLL_INTERVAL, PromptKind, Selection,
+        SelectionMode, Workspace, stamp_text,
     };
     use crate::PtySize;
     use crate::agent::AgentState;
@@ -4252,6 +4490,120 @@ mod tests {
     }
 
     #[test]
+    fn dragging_above_pane_autoscrolls_and_copies_offscreen_history() {
+        use super::handle_mouse_test_input as ev;
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(8, 40)).expect("spawn workspace");
+        let active = workspace.active;
+        {
+            let managed = workspace.session_for_mut(active).expect("active pane");
+            for index in 1..=20 {
+                managed
+                    .session
+                    .pane_mut()
+                    .append_plain(&format!("history line {index}"));
+            }
+        }
+
+        let pane = workspace.layout.pane_frame(active).expect("pane layout");
+        let col = pane.content.x + 5;
+        let start_row = pane.content.y + 2;
+        let edge_row = pane.content.y.saturating_sub(1);
+        let before = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .scrollback_viewport_top();
+
+        workspace
+            .handle_input(InputAction::Mouse(ev(col, start_row, 0, b'M')))
+            .expect("press");
+        workspace
+            .handle_input(InputAction::Mouse(ev(col, edge_row, 32, b'M')))
+            .expect("drag above content");
+        let after_first = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .scrollback_viewport_top();
+        assert_eq!(before - after_first, 1, "edge entry scrolls immediately");
+
+        // Termius can deliver several identical motion reports in one
+        // socket read. They are all inside the same 60 ms interval and
+        // must not turn into an unbounded multi-row jump.
+        for _ in 0..4 {
+            workspace
+                .handle_input(InputAction::Mouse(ev(col, edge_row, 32, b'M')))
+                .expect("batched edge motion");
+        }
+        let after_batched_motion = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .scrollback_viewport_top();
+        assert_eq!(
+            after_batched_motion, after_first,
+            "same-edge motion inside one interval must not race through history"
+        );
+
+        // No additional motion packet is required: holding above the pane
+        // advances selection/history on the daemon's bounded timer.
+        let last = workspace
+            .mouse_drag_last_autoscroll
+            .expect("edge drag starts timer");
+        assert!(workspace.tick_mouse_drag_autoscroll(last + MOUSE_SELECTION_AUTOSCROLL_INTERVAL));
+        let after_tick = workspace
+            .session_for(active)
+            .expect("active pane")
+            .session
+            .scrollback_viewport_top();
+        assert_eq!(after_first - after_tick, 1, "held edge keeps scrolling");
+
+        workspace
+            .handle_input(InputAction::Mouse(ev(col, edge_row, 0, b'm')))
+            .expect("release over header");
+        assert!(!workspace.mouse_drag_active);
+        assert!(workspace.mouse_drag_pane.is_none());
+        assert!(workspace.mouse_drag_edge.is_none());
+        let copied = workspace
+            .take_pending_clipboard()
+            .expect("offscreen selection auto-copies on outside release");
+        assert!(
+            copied.contains("history line"),
+            "copy must include rows reached through edge scrolling: {copied:?}"
+        );
+        assert!(copied.contains('\n'), "copy must span offscreen rows");
+    }
+
+    #[test]
+    fn legacy_release_over_header_clears_active_mouse_drag() {
+        use super::handle_mouse_test_input as ev;
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(8, 40)).expect("spawn workspace");
+        let pane = workspace
+            .layout
+            .pane_frame(workspace.active)
+            .expect("pane layout");
+        let col = pane.content.x + 2;
+
+        workspace
+            .handle_input(InputAction::Mouse(ev(col, pane.content.y, 0, b'M')))
+            .expect("press");
+        workspace
+            .handle_input(InputAction::Mouse(ev(
+                col,
+                pane.content.y.saturating_sub(1),
+                3,
+                b'M',
+            )))
+            .expect("legacy release outside content");
+
+        assert!(!workspace.mouse_drag_active);
+        assert!(workspace.mouse_drag_pane.is_none());
+        assert!(workspace.mouse_drag_edge.is_none());
+    }
+
+    #[test]
     fn shift_vertical_drag_remains_text_selection() {
         use super::handle_mouse_test_input as ev;
         let mut workspace =
@@ -4786,6 +5138,37 @@ mod tests {
             .session
             .scrollback_viewport_top();
         assert_eq!(configured_before - configured_after, 4);
+    }
+
+    #[test]
+    fn scroll_commands_report_clean_at_viewport_limits() {
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(6, 20)).expect("spawn workspace");
+        let active = workspace.active;
+        {
+            let managed = workspace.session_for_mut(active).expect("active pane");
+            for index in 1..=12 {
+                managed
+                    .session
+                    .pane_mut()
+                    .append_plain(&format!("line {index}"));
+            }
+        }
+
+        assert!(workspace.scroll_active_up(usize::MAX));
+        assert!(
+            !workspace.scroll_active_up(1),
+            "scrolling above the oldest row is a clean no-op"
+        );
+        assert!(workspace.scroll_active_down(usize::MAX));
+        assert!(
+            !workspace.scroll_active_down(1),
+            "scrolling below the live bottom is a clean no-op"
+        );
+        assert!(
+            !workspace.scroll_active_to_bottom(),
+            "already-following viewport must not request another frame"
+        );
     }
 
     #[test]

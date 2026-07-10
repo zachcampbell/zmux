@@ -52,10 +52,14 @@ impl MouseEvent {
     }
 
     // Button-up on the left button. Terminals signal release with
-    // lowercase 'm' in SGR mode; the button field repeats what was
-    // released. We only care about the left button here.
+    // lowercase 'm' in SGR mode; classic X10/rxvt reporting instead
+    // uses button code 3 with uppercase 'M' for a generic release.
+    // Accept both so a legacy host cannot leave drag-selection wedged.
     pub fn is_left_release(self) -> bool {
-        self.final_byte == b'm' && self.button & 64 == 0 && (self.button & 0b11) == 0
+        let sgr_left_release = self.final_byte == b'm' && (self.button & 0b11) == 0;
+        let legacy_release =
+            self.final_byte == b'M' && self.button & 32 == 0 && (self.button & 0b11) == 3;
+        self.button & 64 == 0 && (sgr_left_release || legacy_release)
     }
 
     pub fn translate(self, origin_col: u16, origin_row: u16) -> Option<Self> {
@@ -313,6 +317,22 @@ mod tests {
                 row: 4,
                 final_byte: b'M'
             })]
+        );
+    }
+
+    #[test]
+    fn recognizes_x10_and_rxvt_button_releases() {
+        let mut parser = InputParser::default();
+        let x10 = parser.push_bytes(b"\x1b[M !!\x1b[M#!!");
+        assert!(
+            matches!(x10.as_slice(), [InputAction::Mouse(press), InputAction::Mouse(release)]
+            if press.is_left_press() && release.is_left_release())
+        );
+
+        let rxvt = parser.push_bytes(b"\x1b[0;1;1M\x1b[3;1;1M");
+        assert!(
+            matches!(rxvt.as_slice(), [InputAction::Mouse(press), InputAction::Mouse(release)]
+            if press.is_left_press() && release.is_left_release())
         );
     }
 

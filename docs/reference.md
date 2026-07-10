@@ -94,7 +94,8 @@ screen program is active: scrolling up reveals the retained primary history,
 and `G` restores the live alternate buffer. If the application enabled mouse
 tracking, wheel events inside its pane are forwarded to the application.
 On the primary screen, click-drag selects text in any direction and copies it
-on release.
+on release. Dragging above or below the pane keeps scrolling and extending the
+selection through off-screen history.
 
 ## Command prompt (Ctrl-a :)
 
@@ -289,7 +290,10 @@ zmux trace replay  ~/.local/state/zmux/traces/work/<bundle>
 The start/status response prints the exact bundle path. The default cap is
 256 MiB. Recording is asynchronous and best-effort: a full queue, size cap,
 or disk error is recorded in status and disables capture without taking down
-the session. Bundle directories are mode `0700` and files are mode `0600`.
+the session. `trace stop` is not a flush barrier for final ANSI that the
+attached client has already buffered, so let the screen settle before stopping
+when the last repaint matters. Bundle directories are mode `0700` and files
+are mode `0600`.
 
 **Trace bundles are sensitive.** They can contain keystrokes, passwords,
 source code, prompts, clipboard text, PTY output, rendered screen contents,

@@ -1274,6 +1274,37 @@ impl TerminalIngest {
                     ScreenMode::Alternate => self.alternate.previous_line(count),
                 }
             }
+            b'S' if prefix.is_none()
+                && !has_private_marker
+                && intermediate.is_none()
+                && params.len() <= 1 =>
+            {
+                // SU — Scroll Up Ps rows inside the active DECSTBM
+                // region without moving the cursor. Codex uses a
+                // top-anchored region for its transcript and composer;
+                // rows leaving that kind of primary region must enter
+                // scrollback just like rows displaced by IND.
+                let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
+                match pane.screen_mode() {
+                    ScreenMode::Primary => self.primary_scroll_up_within_region(pane, count),
+                    ScreenMode::Alternate => self.alternate.scroll_up_within_region(count),
+                }
+            }
+            b'T' if prefix.is_none()
+                && !has_private_marker
+                && intermediate.is_none()
+                && params.len() <= 1 =>
+            {
+                // SD — Scroll Down Ps rows inside the active DECSTBM
+                // region, cursor unchanged. The parameter-count guard
+                // avoids confusing the historical multi-parameter
+                // xterm highlight-tracking form with ECMA-48 SD.
+                let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
+                match pane.screen_mode() {
+                    ScreenMode::Primary => self.primary_scroll_down_within_region(count),
+                    ScreenMode::Alternate => self.alternate.scroll_down_within_region(count),
+                }
+            }
             b'J' if pane.screen_mode() == ScreenMode::Alternate => {
                 let mode = params.first().and_then(|value| *value).unwrap_or(0);
                 self.alternate.erase_display(mode);
@@ -2442,6 +2473,7 @@ impl TerminalIngest {
     }
 
     fn primary_scroll_up_within_region(&mut self, pane: &mut Pane, count: usize) {
+        self.primary_wrap_pending = false;
         let max_row = self.alternate.rows.saturating_sub(1);
         let top = self.primary_scroll_top.min(max_row);
         let bottom = self.primary_scroll_bottom.min(max_row);
@@ -2483,6 +2515,7 @@ impl TerminalIngest {
     // region the other way and blank the rows that rotated in at the
     // top instead of the bottom.
     fn primary_scroll_down_within_region(&mut self, count: usize) {
+        self.primary_wrap_pending = false;
         let max_row = self.alternate.rows.saturating_sub(1);
         let top = self.primary_scroll_top.min(max_row);
         let bottom = self.primary_scroll_bottom.min(max_row);
@@ -4839,6 +4872,86 @@ mod tests {
             ingest.render_lines(&pane).first().map(String::as_str),
             Some("one"),
             "the preserved Codex transcript must become visible on scroll-up"
+        );
+    }
+
+    #[test]
+    fn codex_su_scrolls_partial_region_and_commits_transcript_rows() {
+        let mut pane = Pane::new("codex", 32, 6);
+        let mut ingest = TerminalIngest::new(PtySize::new(6, 32));
+
+        ingest.ingest_bytes(&mut pane, b"one\ntwo\nthree\nfour\nfive\nsix");
+        // Trace-derived Codex shape: reserve the bottom two composer rows,
+        // then use SU rather than LF/IND to advance two transcript rows.
+        ingest.ingest_bytes(&mut pane, b"\x1b[1;4r\x1b[2S");
+
+        assert_eq!(
+            pane.scrollback_text(8, true),
+            vec!["one", "two"],
+            "CSI S rows leaving a top-anchored region must enter history"
+        );
+        assert_eq!(
+            ingest.render_lines(&pane),
+            vec!["three", "four", "", "", "five", "six"],
+            "CSI S must shift only the configured transcript region"
+        );
+    }
+
+    #[test]
+    fn primary_su_clears_delayed_wrap_before_the_next_graphic() {
+        let mut pane = Pane::new("codex", 32, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 4));
+
+        // Filling the rightmost column arms delayed autowrap. SU keeps the
+        // cursor in place but, like every editing operation, must cancel
+        // that pending wrap so X overwrites the current cell instead of
+        // triggering an extra linefeed/scroll first.
+        ingest.ingest_bytes(&mut pane, b"abcd\x1b[SX");
+        let rendered = ingest.render_lines(&pane);
+        assert_eq!(rendered.first().map(String::as_str), Some("   X"));
+    }
+
+    #[test]
+    fn primary_sd_shifts_only_the_configured_region() {
+        let mut pane = Pane::new("app", 32, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 16));
+        ingest.ingest_bytes(&mut pane, b"top\none\ntwo\nbottom\x1b[2;3r\x1b[T");
+
+        assert_eq!(ingest.render_lines(&pane), vec!["top", "", "one", "bottom"]);
+        assert_eq!(pane.total_lines(), 0, "SD must not synthesize history");
+    }
+
+    #[test]
+    fn private_and_intermediate_su_forms_are_ignored() {
+        let mut pane = Pane::new("app", 32, 4);
+        let mut ingest = TerminalIngest::new(PtySize::new(4, 16));
+        ingest.ingest_bytes(&mut pane, b"one\ntwo");
+        let before = ingest.render_lines(&pane);
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[<S\x1b[ S\x1b[1;2S");
+        assert_eq!(ingest.render_lines(&pane), before);
+    }
+
+    #[test]
+    fn su_and_sd_shift_alternate_scroll_region_without_moving_cursor() {
+        let mut pane = Pane::new("app", 16, 5);
+        let mut ingest = TerminalIngest::new(PtySize::new(5, 16));
+
+        ingest.ingest_bytes(
+            &mut pane,
+            b"\x1b[?1049h\x1b[Htop\x1b[2;1Hone\x1b[3;1Htwo\x1b[4;1Hthree\x1b[5;1Hbottom\x1b[2;4r\x1b[3;7H\x1b[S",
+        );
+        assert_eq!(ingest.screen_cursor(&pane), Some((2, 6)));
+        assert_eq!(
+            ingest.render_lines(&pane),
+            vec!["top", "two", "three", "", "bottom"]
+        );
+
+        ingest.ingest_bytes(&mut pane, b"\x1b[T");
+        assert_eq!(ingest.screen_cursor(&pane), Some((2, 6)));
+        assert_eq!(
+            ingest.render_lines(&pane),
+            vec!["top", "", "two", "three", "bottom"]
         );
     }
 

@@ -50,8 +50,9 @@ The mouse works the way you'd hope: the wheel scrolls the pane under the
 cursor one row at a time by default, including primary history behind a
 full-screen alternate buffer when the app is not capturing mouse input.
 Click-drag selects text in any direction, and releasing the selection copies
-it to your clipboard via OSC 52. Full binding list, config format, and CLI
-reference: [docs/reference.md](docs/reference.md).
+it to your clipboard via OSC 52. Hold the drag above or below the pane to
+keep selecting through off-screen history. Full binding list, config format,
+and CLI reference: [docs/reference.md](docs/reference.md).
 
 ## The agent part
 
@@ -154,8 +155,9 @@ joined emoji, the SGR zoo). Full xterm parity is a non-goal.
   correctness. If something renders wrong, `zmux trace start <session>`
   captures ordered client input, PTY traffic, resizes, frames, and exact host
   ANSI; `zmux capture` remains available for a small one-pane raw dump. Traces
-  contain screen contents and secrets, so share them carefully. Detached-daemon
-  diagnostics are retained at `$ZMUX_STATE_DIR/logs/<session>.log`.
+  are best-effort at the exact stop boundary and contain screen contents and
+  secrets, so share them carefully. Detached-daemon diagnostics are retained
+  at `$ZMUX_STATE_DIR/logs/<session>.log`.
 - One `watch_events` subscription per MCP connection.
 
 ## License

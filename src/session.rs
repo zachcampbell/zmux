@@ -270,12 +270,12 @@ impl Session {
         self.pty.kill()
     }
 
-    pub fn wheel_up(&mut self, lines: usize) {
-        let _ = self.pane.wheel_up(lines);
+    pub fn wheel_up(&mut self, lines: usize) -> WheelOutcome {
+        self.pane.wheel_up(lines)
     }
 
-    pub fn wheel_down(&mut self, lines: usize) {
-        let _ = self.pane.wheel_down(lines);
+    pub fn wheel_down(&mut self, lines: usize) -> WheelOutcome {
+        self.pane.wheel_down(lines)
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -436,7 +436,7 @@ impl Session {
             };
 
             return match outcome {
-                WheelOutcome::ViewportChanged { .. } => Ok(true),
+                WheelOutcome::ViewportChanged { lines_scrolled, .. } => Ok(lines_scrolled > 0),
                 WheelOutcome::PassedToApplication => {
                     self.write_input(&mouse.encode_sgr())?;
                     Ok(true)
