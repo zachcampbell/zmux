@@ -84,6 +84,11 @@ const CLIENT_LIST_PANES: u8 = 54;
 const CLIENT_OPEN_SUPERVISOR: u8 = 55;
 const CLIENT_SET_LABEL: u8 = 56;
 const CLIENT_LAST_WINDOW: u8 = 57;
+const CLIENT_TRACE_START: u8 = 58;
+const CLIENT_TRACE_STOP: u8 = 59;
+const CLIENT_TRACE_STATUS: u8 = 60;
+const CLIENT_TRACE_CLIENT_INPUT: u8 = 61;
+const CLIENT_TRACE_CLIENT_OUTPUT: u8 = 62;
 
 const SERVER_FRAME: u8 = 1;
 const SERVER_EXITED: u8 = 2;
@@ -91,6 +96,7 @@ const SERVER_ERROR: u8 = 3;
 const SERVER_BUSY: u8 = 4;
 const SERVER_CLIPBOARD: u8 = 5;
 const SERVER_PANE_LIST: u8 = 6;
+const SERVER_TRACE_STATUS: u8 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientMessage {
@@ -175,6 +181,23 @@ pub enum ClientMessage {
         pane_id: u32,
         label: Option<String>,
     },
+    /// Start a structured trace for this session. `path` is resolved
+    /// server-side; `None` requests the daemon's default trace path.
+    TraceStart {
+        path: Option<String>,
+        max_bytes: u64,
+    },
+    /// Stop the active structured trace, if any.
+    TraceStop,
+    /// Request the current structured trace state.
+    TraceStatus,
+    /// Raw bytes observed at the attach client's input boundary. The
+    /// daemon records these when tracing is active and never forwards
+    /// them to the pane PTY.
+    TraceClientInput(Vec<u8>),
+    /// Final ANSI bytes emitted by the attach client. The daemon
+    /// records these when tracing is active and never forwards them.
+    TraceClientOutput(Vec<u8>),
 }
 
 /// Per-pane row in `ServerMessage::PaneList`. Field order is stable
@@ -240,6 +263,14 @@ pub enum ServerMessage {
     /// Reply to `ClientMessage::ListPanes`. One row per pane across all
     /// windows in the receiving session.
     PaneList(Vec<PaneSummary>),
+    /// Reply to trace start, stop, and status requests.
+    TraceStatus {
+        active: bool,
+        path: Option<String>,
+        bytes_written: u64,
+        dropped_records: u64,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -392,6 +423,23 @@ pub fn encode_client_message(message: &ClientMessage) -> io::Result<Vec<u8>> {
             write_u32(&mut body, *pane_id);
             write_optional_string(&mut body, label.as_deref());
         }
+        ClientMessage::TraceStart { path, max_bytes } => {
+            body.push(CLIENT_TRACE_START);
+            write_optional_string(&mut body, path.as_deref());
+            write_u64(&mut body, *max_bytes);
+        }
+        ClientMessage::TraceStop => body.push(CLIENT_TRACE_STOP),
+        ClientMessage::TraceStatus => body.push(CLIENT_TRACE_STATUS),
+        ClientMessage::TraceClientInput(bytes) => {
+            body.push(CLIENT_TRACE_CLIENT_INPUT);
+            write_u32(&mut body, bytes.len() as u32);
+            body.extend_from_slice(bytes);
+        }
+        ClientMessage::TraceClientOutput(bytes) => {
+            body.push(CLIENT_TRACE_CLIENT_OUTPUT);
+            write_u32(&mut body, bytes.len() as u32);
+            body.extend_from_slice(bytes);
+        }
     }
 
     wrap_frame(body)
@@ -462,6 +510,20 @@ pub fn encode_server_message(message: &ServerMessage) -> io::Result<Vec<u8>> {
                 write_u16(&mut body, row.size_cols);
                 write_u16(&mut body, row.size_rows);
             }
+        }
+        ServerMessage::TraceStatus {
+            active,
+            path,
+            bytes_written,
+            dropped_records,
+            reason,
+        } => {
+            body.push(SERVER_TRACE_STATUS);
+            body.push(u8::from(*active));
+            write_optional_string(&mut body, path.as_deref());
+            write_u64(&mut body, *bytes_written);
+            write_u64(&mut body, *dropped_records);
+            write_optional_string(&mut body, reason.as_deref());
         }
     }
 
@@ -677,6 +739,30 @@ fn parse_client_message(frame: &[u8]) -> io::Result<ClientMessage> {
             }
             Ok(ClientMessage::SetLabel { pane_id, label })
         }
+        CLIENT_TRACE_START => {
+            let (path, rest) = take_optional_string(rest)?;
+            let (max_bytes, rest) = take_u64(rest)?;
+            if !rest.is_empty() {
+                return Err(invalid_data("trailing bytes after trace-start"));
+            }
+            Ok(ClientMessage::TraceStart { path, max_bytes })
+        }
+        CLIENT_TRACE_STOP if rest.is_empty() => Ok(ClientMessage::TraceStop),
+        CLIENT_TRACE_STATUS if rest.is_empty() => Ok(ClientMessage::TraceStatus),
+        CLIENT_TRACE_CLIENT_INPUT => {
+            let (length, rest) = take_u32(rest)?;
+            if rest.len() != length as usize {
+                return Err(invalid_data("invalid trace-client-input payload"));
+            }
+            Ok(ClientMessage::TraceClientInput(rest.to_vec()))
+        }
+        CLIENT_TRACE_CLIENT_OUTPUT => {
+            let (length, rest) = take_u32(rest)?;
+            if rest.len() != length as usize {
+                return Err(invalid_data("invalid trace-client-output payload"));
+            }
+            Ok(ClientMessage::TraceClientOutput(rest.to_vec()))
+        }
         _ => Err(invalid_data("unknown client message")),
     }
 }
@@ -863,6 +949,30 @@ fn parse_server_message(frame: &[u8]) -> io::Result<ServerMessage> {
             }
             Ok(ServerMessage::PaneList(rows))
         }
+        SERVER_TRACE_STATUS => {
+            let Some((&active, rest)) = rest.split_first() else {
+                return Err(invalid_data("missing trace active byte"));
+            };
+            let active = match active {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid_data("invalid trace active byte")),
+            };
+            let (path, rest) = take_optional_string(rest)?;
+            let (bytes_written, rest) = take_u64(rest)?;
+            let (dropped_records, rest) = take_u64(rest)?;
+            let (reason, rest) = take_optional_string(rest)?;
+            if !rest.is_empty() {
+                return Err(invalid_data("trailing bytes in trace-status"));
+            }
+            Ok(ServerMessage::TraceStatus {
+                active,
+                path,
+                bytes_written,
+                dropped_records,
+                reason,
+            })
+        }
         _ => Err(invalid_data("unknown server message")),
     }
 }
@@ -918,6 +1028,18 @@ fn take_u32(bytes: &[u8]) -> io::Result<(u32, &[u8])> {
     ))
 }
 
+fn take_u64(bytes: &[u8]) -> io::Result<(u64, &[u8])> {
+    if bytes.len() < 8 {
+        return Err(invalid_data("truncated u64"));
+    }
+    Ok((
+        u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]),
+        &bytes[8..],
+    ))
+}
+
 fn write_size(buffer: &mut Vec<u8>, size: PtySize) {
     write_u16(buffer, size.rows);
     write_u16(buffer, size.cols);
@@ -928,6 +1050,10 @@ fn write_u16(buffer: &mut Vec<u8>, value: u16) {
 }
 
 fn write_u32(buffer: &mut Vec<u8>, value: u32) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(buffer: &mut Vec<u8>, value: u64) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -1179,6 +1305,152 @@ mod tests {
         let mut decoder = ClientDecoder::default();
         let decoded = decoder.push_bytes(&bytes).expect("decode capture");
         assert_eq!(decoded, vec![original]);
+    }
+
+    #[test]
+    fn trace_client_messages_round_trip() {
+        let messages = vec![
+            ClientMessage::TraceStart {
+                path: Some("/tmp/zmux-trace-α.bin".into()),
+                max_bytes: u64::MAX,
+            },
+            ClientMessage::TraceStart {
+                path: None,
+                max_bytes: 0,
+            },
+            ClientMessage::TraceStop,
+            ClientMessage::TraceStatus,
+            ClientMessage::TraceClientInput(vec![0x00, 0x1b, 0xff]),
+            ClientMessage::TraceClientInput(Vec::new()),
+            ClientMessage::TraceClientOutput(b"\x1b[2J\x1b[Hprompt> ".to_vec()),
+            ClientMessage::TraceClientOutput(Vec::new()),
+        ];
+
+        let mut encoded = Vec::new();
+        for message in &messages {
+            encoded
+                .extend_from_slice(&encode_client_message(message).expect("encode trace client"));
+        }
+
+        let mut decoder = ClientDecoder::default();
+        let decoded = decoder.push_bytes(&encoded).expect("decode trace clients");
+        assert_eq!(decoded, messages);
+    }
+
+    #[test]
+    fn trace_server_messages_round_trip() {
+        let messages = vec![
+            ServerMessage::TraceStatus {
+                active: true,
+                path: Some("/tmp/zmux-trace-α.bin".into()),
+                bytes_written: u64::MAX,
+                dropped_records: 42,
+                reason: Some("writer queue full".into()),
+            },
+            ServerMessage::TraceStatus {
+                active: false,
+                path: None,
+                bytes_written: 0,
+                dropped_records: 0,
+                reason: None,
+            },
+        ];
+
+        let mut encoded = Vec::new();
+        for message in &messages {
+            encoded
+                .extend_from_slice(&encode_server_message(message).expect("encode trace status"));
+        }
+
+        let mut decoder = ServerDecoder::default();
+        let decoded = decoder.push_bytes(&encoded).expect("decode trace statuses");
+        assert_eq!(decoded, messages);
+    }
+
+    #[test]
+    fn trace_client_messages_reject_malformed_payloads() {
+        let mut invalid_utf8_path = vec![super::CLIENT_TRACE_START, 1];
+        super::write_u32(&mut invalid_utf8_path, 1);
+        invalid_utf8_path.push(0xff);
+        super::write_u64(&mut invalid_utf8_path, 1024);
+
+        let mut trailing_trace_start = vec![super::CLIENT_TRACE_START, 0];
+        super::write_u64(&mut trailing_trace_start, 1024);
+        trailing_trace_start.push(0xff);
+
+        let mut short_client_input = vec![super::CLIENT_TRACE_CLIENT_INPUT];
+        super::write_u32(&mut short_client_input, 2);
+        short_client_input.push(0xff);
+
+        let mut trailing_client_input = vec![super::CLIENT_TRACE_CLIENT_INPUT];
+        super::write_u32(&mut trailing_client_input, 0);
+        trailing_client_input.push(0xff);
+
+        let mut short_client_output = vec![super::CLIENT_TRACE_CLIENT_OUTPUT];
+        super::write_u32(&mut short_client_output, 3);
+        short_client_output.extend_from_slice(&[0x1b, b'[']);
+
+        let malformed_bodies = [
+            vec![super::CLIENT_TRACE_START, 2],
+            vec![super::CLIENT_TRACE_START, 0, 1, 2, 3],
+            invalid_utf8_path,
+            trailing_trace_start,
+            vec![super::CLIENT_TRACE_STOP, 0],
+            vec![super::CLIENT_TRACE_STATUS, 0],
+            vec![super::CLIENT_TRACE_CLIENT_INPUT],
+            short_client_input,
+            trailing_client_input,
+            vec![super::CLIENT_TRACE_CLIENT_OUTPUT, 1, 2, 3],
+            short_client_output,
+        ];
+
+        for body in malformed_bodies {
+            let frame = super::wrap_frame(body).expect("wrap malformed trace client");
+            let mut decoder = ClientDecoder::default();
+            assert!(
+                decoder.push_bytes(&frame).is_err(),
+                "malformed trace client payload must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_status_rejects_malformed_payloads() {
+        let mut invalid_utf8_path = vec![super::SERVER_TRACE_STATUS, 1, 1];
+        super::write_u32(&mut invalid_utf8_path, 1);
+        invalid_utf8_path.push(0xff);
+        super::write_u64(&mut invalid_utf8_path, 1);
+        super::write_u64(&mut invalid_utf8_path, 2);
+        invalid_utf8_path.push(0);
+
+        let mut invalid_reason_presence = vec![super::SERVER_TRACE_STATUS, 0, 0];
+        super::write_u64(&mut invalid_reason_presence, 1);
+        super::write_u64(&mut invalid_reason_presence, 2);
+        invalid_reason_presence.push(2);
+
+        let mut trailing = vec![super::SERVER_TRACE_STATUS, 0, 0];
+        super::write_u64(&mut trailing, 1);
+        super::write_u64(&mut trailing, 2);
+        trailing.extend_from_slice(&[0, 0xff]);
+
+        let malformed_bodies = [
+            vec![super::SERVER_TRACE_STATUS],
+            vec![super::SERVER_TRACE_STATUS, 2],
+            vec![super::SERVER_TRACE_STATUS, 1, 2],
+            vec![super::SERVER_TRACE_STATUS, 0, 0, 1, 2, 3],
+            invalid_utf8_path,
+            invalid_reason_presence,
+            trailing,
+        ];
+
+        for body in malformed_bodies {
+            let frame = super::wrap_frame(body).expect("wrap malformed trace status");
+            let mut decoder = ServerDecoder::default();
+            assert!(
+                decoder.push_bytes(&frame).is_err(),
+                "malformed trace-status payload must be rejected"
+            );
+        }
     }
 
     #[test]

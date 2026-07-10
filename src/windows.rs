@@ -8,6 +8,7 @@ use crate::events::{Event, EventBus};
 use crate::layout::PaneId;
 use crate::mouse::MouseTrackingMode;
 use crate::pty::PtySize;
+use crate::trace::{TraceContext, TraceHub, TraceKind};
 use crate::workspace::{PaneSummaryView, Workspace};
 
 const WINDOW_PANE_ID_STRIDE: PaneId = 10_000;
@@ -46,6 +47,7 @@ pub struct WindowSet {
     status_bar_hints: bool,
     wheel_scroll_lines: usize,
     status_label_override: Option<String>,
+    trace: Option<TraceHub>,
 }
 
 impl WindowSet {
@@ -73,6 +75,7 @@ impl WindowSet {
             status_bar_hints,
             wheel_scroll_lines,
             status_label_override,
+            trace: None,
         };
         set.sync_window_indicator();
         set
@@ -84,6 +87,61 @@ impl WindowSet {
 
     pub fn active_mut(&mut self) -> &mut Workspace {
         &mut self.windows[self.active]
+    }
+
+    pub fn set_trace_hub(&mut self, hub: TraceHub) {
+        self.trace = Some(hub.clone());
+        for (window_id, workspace) in self.windows.iter_mut().enumerate() {
+            workspace.set_trace_hub(hub.clone(), window_id as u32);
+        }
+        if hub.is_active() {
+            let _ = hub.record_json(
+                TraceKind::State,
+                TraceContext::default(),
+                &serde_json::json!({
+                    "event": "window_set_attached",
+                    "window_count": self.windows.len(),
+                    "active_window": self.active,
+                    "scrollback_lines": self.scrollback_lines,
+                    "wheel_scroll_lines": self.wheel_scroll_lines,
+                    "status_bar_hints": self.status_bar_hints,
+                    "status_label": self.status_label_override,
+                }),
+            );
+        }
+    }
+
+    pub(crate) fn trace_hub(&self) -> Option<&TraceHub> {
+        self.trace.as_ref()
+    }
+
+    pub(crate) fn active_trace_window_id(&self) -> u32 {
+        self.active()
+            .trace_window_id()
+            .unwrap_or(self.active as u32)
+    }
+
+    pub(crate) fn record_trace_snapshot(&self) {
+        for workspace in &self.windows {
+            workspace.record_trace_snapshot();
+        }
+        if let Some(hub) = &self.trace
+            && hub.is_active()
+        {
+            let _ = hub.record_json(
+                TraceKind::State,
+                TraceContext::default(),
+                &serde_json::json!({
+                    "event": "session_snapshot",
+                    "window_count": self.windows.len(),
+                    "active_window": self.active,
+                    "scrollback_lines": self.scrollback_lines,
+                    "wheel_scroll_lines": self.wheel_scroll_lines,
+                    "status_bar_hints": self.status_bar_hints,
+                    "status_label": self.status_label_override,
+                }),
+            );
+        }
     }
 
     /// Subscribe to the session-wide event bus used by MCP
@@ -421,6 +479,9 @@ impl WindowSet {
         )?;
         workspace.set_wheel_scroll_lines(self.wheel_scroll_lines);
         workspace.set_session_event_bus(self.session_event_bus.clone());
+        if let Some(trace) = &self.trace {
+            workspace.set_trace_hub(trace.clone(), (pane_id / WINDOW_PANE_ID_STRIDE) as u32);
+        }
         // Carry the status_label_override onto the new window so the
         // left label stays consistent across windows.
         workspace.set_status_label_override(self.status_label_override.clone());
@@ -451,6 +512,9 @@ impl WindowSet {
         )?;
         workspace.set_wheel_scroll_lines(self.wheel_scroll_lines);
         workspace.set_session_event_bus(self.session_event_bus.clone());
+        if let Some(trace) = &self.trace {
+            workspace.set_trace_hub(trace.clone(), (pane_id / WINDOW_PANE_ID_STRIDE) as u32);
+        }
         workspace.set_status_label_override(self.status_label_override.clone());
         self.windows.push(workspace);
         // Deliberately NOT switching the active window: this is the
@@ -541,11 +605,28 @@ impl WindowSet {
     // All window switches funnel through here so `last_active` always
     // remembers where Ctrl-a Ctrl-a should jump back to.
     fn switch_active(&mut self, index: usize) {
+        let previous_window_id = self.active_trace_window_id();
         if index != self.active {
             self.last_active = self.active;
         }
         self.active = index;
         self.sync_window_indicator();
+        if let Some(hub) = &self.trace
+            && hub.is_active()
+        {
+            let _ = hub.record_json(
+                TraceKind::State,
+                TraceContext {
+                    window_id: Some(self.active_trace_window_id()),
+                    ..TraceContext::default()
+                },
+                &serde_json::json!({
+                    "event": "window_focus",
+                    "from": previous_window_id,
+                    "to": self.active_trace_window_id(),
+                }),
+            );
+        }
     }
 
     // Close the active window. Returns Ok(true) if a window was
@@ -559,6 +640,19 @@ impl WindowSet {
     fn close_window_at(&mut self, index: usize) -> io::Result<bool> {
         if self.windows.len() <= 1 || index >= self.windows.len() {
             return Ok(false);
+        }
+        let closing_window_id = self.windows[index].trace_window_id();
+        if let (Some(hub), Some(window_id)) = (&self.trace, closing_window_id)
+            && hub.is_active()
+        {
+            let _ = hub.record_json(
+                TraceKind::State,
+                TraceContext {
+                    window_id: Some(window_id),
+                    ..TraceContext::default()
+                },
+                &serde_json::json!({ "event": "window_close" }),
+            );
         }
         self.windows[index].close_all_panes_for_window_removal()?;
         self.windows.remove(index);

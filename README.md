@@ -28,6 +28,7 @@ Or grab a prebuilt binary from the
 
 ```sh
 zmux new work        # create a session and attach
+zmux new repro --debug-trace  # create with whole-session diagnostics enabled
 zmux attach work     # come back later
 zmux ls --verbose    # sessions, panes, states, last commands
 zmux kill work       # tear it down
@@ -150,9 +151,11 @@ joined emoji, the SGR zoo). Full xterm parity is a non-goal.
 - Multiple clients can attach to one session; they mirror the same view at
   the smallest client's size. Per-client viewports don't exist yet.
 - The VT and layout layers are fuzzed for robustness, not rendering
-  correctness. If something renders wrong, `zmux capture` the pane and file
-  the bytes; there's a replay tool for bisecting. Detached-daemon diagnostics
-  are retained at `$ZMUX_STATE_DIR/logs/<session>.log`.
+  correctness. If something renders wrong, `zmux trace start <session>`
+  captures ordered client input, PTY traffic, resizes, frames, and exact host
+  ANSI; `zmux capture` remains available for a small one-pane raw dump. Traces
+  contain screen contents and secrets, so share them carefully. Detached-daemon
+  diagnostics are retained at `$ZMUX_STATE_DIR/logs/<session>.log`.
 - One `watch_events` subscription per MCP connection.
 
 ## License

@@ -6,6 +6,7 @@ The long version. For the pitch and quick start, see the [README](../README.md).
 
 ```
 zmux new [name]            create + attach (default name "default")
+  --debug-trace [--trace-output PATH] [--trace-max-mb 256]
 zmux attach [name]         reattach to an existing session
 zmux ls                    list live sessions (hides stale + .mcp.sock entries)
 zmux ls --verbose          ls plus per-pane state, last command, last exit
@@ -14,6 +15,9 @@ zmux prune [--dry-run]     remove stale session and .mcp.sock files
 zmux serve [name]          run the server in the foreground (usually called by new)
 zmux capture <s> <p> <f>   dump raw PTY bytes from session s, pane p, into file f
 zmux label <s> <p> <text>  set a human label on a pane (use - to clear)
+zmux trace start [s] [--output PATH] [--max-mb 256]
+zmux trace status|stop [s]
+zmux trace inspect|replay <bundle>
 zmux mcp --session <name>  stdio bridge for MCP clients (Claude Code, Cursor, ...)
 ```
 
@@ -123,7 +127,7 @@ agent_prompts  = ["│ > ", "architect> ", ">>> "]
 
 | Var | Purpose |
 |---|---|
-| `ZMUX_STATE_DIR` | override the state directory (default `$XDG_STATE_HOME/zmux` or `~/.local/state/zmux`). Holds daemon logs, Claude hook event streams, pair-mode locks, and MCP audit logs. |
+| `ZMUX_STATE_DIR` | override the state directory (default `$XDG_STATE_HOME/zmux` or `~/.local/state/zmux`). Holds daemon logs, structured traces, Claude hook event streams, pair-mode locks, and MCP audit logs. |
 | `ZMUX_PAIR_TIMEOUT_SECS` | Ollama HTTP timeout for `zmux pair` in seconds (default 60). |
 | `ZMUX_PTY_DUMP` | debug only: append every PTY ingest's raw bytes to the given path. Prefer `zmux capture` for bug repros. |
 
@@ -268,6 +272,37 @@ Pair connects to the same `<session>.mcp.sock` as any external MCP client;
 the confirmation gate lives in pair's UX, not in the MCP layer.
 
 ## Debugging rendering issues
+
+For an intermittent whole-session problem, start a structured trace before
+reproducing it:
+
+```sh
+zmux new repro --debug-trace
+# or, for an already-running session:
+zmux trace start work --max-mb 256
+zmux trace status work
+zmux trace stop work
+zmux trace inspect ~/.local/state/zmux/traces/work/<bundle>
+zmux trace replay  ~/.local/state/zmux/traces/work/<bundle>
+```
+
+The start/status response prints the exact bundle path. The default cap is
+256 MiB. Recording is asynchronous and best-effort: a full queue, size cap,
+or disk error is recorded in status and disables capture without taking down
+the session. Bundle directories are mode `0700` and files are mode `0600`.
+
+**Trace bundles are sensitive.** They can contain keystrokes, passwords,
+source code, prompts, clipboard text, PTY output, rendered screen contents,
+and the final ANSI sent to the host terminal. Capture is opt-in; inspect the
+bundle before sharing it.
+
+The trace event stream correlates stable client/window/pane ids and timing for
+raw host input, decoded client messages, PTY input/output, resizes and pane
+lifecycle, logical server frames, and exact client-side ANSI writes. `inspect`
+prints a safely escaped event timeline; `replay` renders the last recorded
+logical frame.
+
+For a minimal one-pane VT fixture, the older raw capture path remains useful:
 
 Capture the failing pane's raw bytes and replay them:
 

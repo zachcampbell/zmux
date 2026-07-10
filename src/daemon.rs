@@ -27,6 +27,7 @@ use crate::protocol::{
 use crate::pty::PtySize;
 use crate::state_paths::{ensure_private_dir, safe_component, state_dir};
 use crate::style::display_width;
+use crate::trace::{TraceContext, TraceHub, TraceKind, TraceStartOptions, TraceStatusSnapshot};
 use crate::tty::{TerminalGuard, poll_readable};
 use crate::workspace::{LayoutPreset, PANE_NUMBER_OVERLAY_DURATION, PromptKind, Workspace};
 
@@ -44,6 +45,7 @@ const DEFAULT_SESSION_NAME: &str = "default";
 // conventionally use for this same ambiguity.
 const SERVER_POLL_MS: u64 = 20;
 const STARTUP_WAIT_MS: u64 = 1_000;
+pub const DEFAULT_TRACE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 // The daemon's event loop is single-threaded: every client socket is
 // serviced from the same tick, and `broadcast_frame` writes to each
 // attached client in turn. Accepted client streams are blocking (only
@@ -66,6 +68,33 @@ pub struct SessionEntry {
 pub struct PruneReport {
     pub removed: Vec<PathBuf>,
     pub kept: Vec<SessionEntry>,
+}
+
+/// Synchronous result returned by the trace control socket. Kept separate
+/// from the trace writer's internal status snapshot so the public CLI API is
+/// stable even if the writer implementation changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceControlStatus {
+    pub active: bool,
+    pub path: Option<PathBuf>,
+    pub bytes_written: u64,
+    pub dropped_records: u64,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceLaunchOptions {
+    pub output: Option<PathBuf>,
+    pub max_bytes: u64,
+}
+
+impl Default for TraceLaunchOptions {
+    fn default() -> Self {
+        Self {
+            output: None,
+            max_bytes: DEFAULT_TRACE_MAX_BYTES,
+        }
+    }
 }
 
 pub fn default_session_name() -> &'static str {
@@ -93,6 +122,10 @@ fn open_daemon_log_at(path: &Path) -> io::Result<std::fs::File> {
 }
 
 pub fn create_session(name: &str) -> io::Result<()> {
+    create_session_with_trace(name, None)
+}
+
+pub fn create_session_with_trace(name: &str, trace: Option<TraceLaunchOptions>) -> io::Result<()> {
     validate_session_name(name)?;
     ensure_session_root()?;
 
@@ -118,6 +151,15 @@ pub fn create_session(name: &str) -> io::Result<()> {
 
     let mut command = Command::new(exe);
     command.arg("serve").arg(name);
+    if let Some(options) = trace {
+        command
+            .arg("--debug-trace")
+            .arg("--trace-max-bytes")
+            .arg(options.max_bytes.to_string());
+        if let Some(path) = options.output {
+            command.arg("--trace-output").arg(path);
+        }
+    }
     command.stdin(Stdio::from(stdin));
     command.stdout(Stdio::from(stdout));
     command.stderr(Stdio::from(stderr));
@@ -157,7 +199,10 @@ pub fn attach_session(name: &str) -> io::Result<AttachOutcome> {
     validate_session_name(name)?;
     let config = crate::config::Config::load();
     let mut stream = UnixStream::connect(session_socket_path(name))?;
-    let mut terminal = TerminalGuard::enter()?;
+    // Keep a tap at the final stdout boundary. It is drained every loop
+    // and only forwarded while the daemon reports an active structured
+    // trace, so normal sessions pay no unbounded buffering cost.
+    let mut terminal = TerminalGuard::enter_with_write_capture()?;
     let mut decoder = ServerDecoder::default();
     let mut prefix_keys = PrefixKeyParser::with_prefix(config.prefix_byte);
     let mut current_size = terminal.size()?;
@@ -180,6 +225,7 @@ pub fn attach_session(name: &str) -> io::Result<AttachOutcome> {
     // while active, byte input is forwarded as the corresponding
     // Input protocol message until Enter commits or Esc cancels.
     let mut prompt_mode: Option<PromptMode> = None;
+    let mut trace_active = false;
 
     send_client_message(&mut stream, &ClientMessage::Attach { size: current_size })?;
 
@@ -223,13 +269,35 @@ pub fn attach_session(name: &str) -> io::Result<AttachOutcome> {
                         // attached client, ignore it rather than
                         // tearing down the session.
                     }
+                    ServerMessage::TraceStatus { active, .. } => {
+                        trace_active = active;
+                        terminal.set_write_capture(active);
+                    }
                 }
             }
         }
 
+        // Capture the exact ANSI/text sequence emitted after frame diffing,
+        // cursor placement, clipboard handling, and mouse-mode changes. The
+        // trace-status notification for a startup trace arrives before this
+        // first drain, so even TerminalGuard's alternate-screen setup is
+        // retained in an opt-in trace.
+        let rendered = terminal.take_captured_writes();
+        if trace_active && !rendered.is_empty() {
+            send_client_message(&mut stream, &ClientMessage::TraceClientOutput(rendered))?;
+        }
+        terminal.set_write_capture(trace_active);
+
         let input = terminal.read_input(50)?;
         if input.is_empty() {
             continue;
+        }
+        // Preserve raw host-terminal input before the prefix parser turns it
+        // into zmux commands. This is the evidence needed to distinguish a
+        // terminal emulator that emitted no touch/gesture bytes from a zmux
+        // parser or routing bug.
+        if trace_active {
+            send_client_message(&mut stream, &ClientMessage::TraceClientInput(input.clone()))?;
         }
 
         for action in prefix_keys.push_bytes(&input) {
@@ -683,7 +751,70 @@ pub fn send_admin_message(name: &str, message: ClientMessage) -> io::Result<()> 
     send_client_message(&mut stream, &message)
 }
 
+/// Send one trace-control request and wait for its status reply. Unlike the
+/// legacy admin sender, trace start/stop must report the actual bundle path or
+/// a writer failure to the caller, so this path is deliberately synchronous.
+pub fn request_trace_control(name: &str, message: ClientMessage) -> io::Result<TraceControlStatus> {
+    if !matches!(
+        message,
+        ClientMessage::TraceStart { .. } | ClientMessage::TraceStop | ClientMessage::TraceStatus
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "request_trace_control requires a trace control message",
+        ));
+    }
+    validate_session_name(name)?;
+    let mut stream = UnixStream::connect(session_socket_path(name))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    send_client_message(&mut stream, &message)?;
+
+    let mut decoder = ServerDecoder::default();
+    let mut buffer = [0u8; 4096];
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "trace control request timed out",
+            ));
+        }
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "daemon closed before trace status reply",
+            ));
+        }
+        for reply in decoder.push_bytes(&buffer[..count])? {
+            match reply {
+                ServerMessage::TraceStatus {
+                    active,
+                    path,
+                    bytes_written,
+                    dropped_records,
+                    reason,
+                } => {
+                    return Ok(TraceControlStatus {
+                        active,
+                        path: path.map(PathBuf::from),
+                        bytes_written,
+                        dropped_records,
+                        reason,
+                    });
+                }
+                ServerMessage::Error(message) => return Err(io::Error::other(message)),
+                _ => {}
+            }
+        }
+    }
+}
+
 pub fn run_server(name: &str) -> io::Result<i32> {
+    run_server_with_trace(name, None)
+}
+
+pub fn run_server_with_trace(name: &str, trace: Option<TraceLaunchOptions>) -> io::Result<i32> {
     validate_session_name(name)?;
     ensure_session_root()?;
 
@@ -705,7 +836,7 @@ pub fn run_server(name: &str) -> io::Result<i32> {
     }
     // Any failure after bind (shell spawn, loop body, ...) must still remove
     // the socket file so that stale, unowned sockets do not linger.
-    let result = run_server_after_bind(&listener, &socket_path, name);
+    let result = run_server_after_bind(&listener, &socket_path, name, trace);
     let _ = fs::remove_file(&socket_path);
     result
 }
@@ -714,8 +845,26 @@ fn run_server_after_bind(
     listener: &UnixListener,
     socket_path: &Path,
     name: &str,
+    trace: Option<TraceLaunchOptions>,
 ) -> io::Result<i32> {
     listener.set_nonblocking(true)?;
+
+    let trace_hub = TraceHub::new(name);
+    if let Some(options) = trace {
+        match trace_hub.start(TraceStartOptions {
+            output: options.output,
+            max_bytes: options.max_bytes,
+        }) {
+            Ok(path) => eprintln!(
+                "zmux: structured trace active at {} (contains input, output, screen contents, and possibly secrets)",
+                path.display()
+            ),
+            Err(error) => {
+                trace_hub.note_failure(format!("trace start failed: {error}"));
+                eprintln!("zmux: structured trace could not start: {error}");
+            }
+        }
+    }
 
     let config = crate::config::Config::load();
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -745,6 +894,9 @@ fn run_server_after_bind(
         config.status_bar_hints,
         config.status_label.clone(),
     );
+    // Install the controller even while inactive. Runtime `trace start`
+    // then activates every existing and future pane without rewiring them.
+    windows.set_trace_hub(trace_hub.clone());
     let mut clients: Vec<AttachedClient> = Vec::new();
     let mut registry = CommandRegistry::new();
     register_tier1(&mut registry);
@@ -782,6 +934,7 @@ fn run_server_after_bind(
         mcp_rx.as_ref(),
         &mut mcp_audit,
     );
+    let _ = trace_hub.stop();
     // Mirror the client-socket cleanup from `run_server`: the MCP
     // socket is daemon-scoped, so removing it on shutdown keeps the
     // session directory clean for the next run.
@@ -798,6 +951,10 @@ fn run_server_loop(
     mcp_rx: Option<&std::sync::mpsc::Receiver<mcp::McpRequest>>,
     mcp_audit: &mut mcp::AuditLog,
 ) -> io::Result<i32> {
+    let trace = windows
+        .trace_hub()
+        .cloned()
+        .expect("daemon installs a trace controller before entering the loop");
     // Tracks the last wall-clock second we rendered for a client so the
     // status bar clock ticks once per second even when nothing else
     // changes. Zero means "no frame sent yet in this session."
@@ -806,6 +963,10 @@ fn run_server_loop(
     // `Outcome::Defer`. Walked on every iteration via `tick_pending`;
     // see `mcp::execute` module docs for the full lifecycle.
     let mut pending_mcp: Vec<mcp::Pending> = Vec::new();
+    // Monotonic connection ids survive Vec compaction/swap_remove and make
+    // multi-client traces unambiguous.
+    let mut next_client_id: u64 = 1;
+    let mut trace_was_active = trace.status().active;
     loop {
         // If our socket was removed out from under us (e.g. a user manually
         // cleaning /tmp, or a stale-cleanup race), shut down rather than
@@ -821,7 +982,7 @@ fn run_server_loop(
         }
 
         let client_count_before = clients.len();
-        accept_pending_connections(listener, clients);
+        accept_pending_connections(listener, clients, &mut next_client_id);
 
         let mut shutdown = false;
         // Accumulate dirty state across every handler in this iteration so
@@ -835,6 +996,10 @@ fn run_server_loop(
         let mut clipboard_replies: Vec<(usize, String)> = Vec::new();
         // ListPanes replies queued for specific clients (by index).
         let mut pane_list_replies: Vec<(usize, Vec<crate::protocol::PaneSummary>)> = Vec::new();
+        // Trace control replies are also used as notifications for attached
+        // clients so their raw-input/final-ANSI taps turn on and off with the
+        // daemon-owned controller.
+        let mut trace_status_replies: Vec<(usize, ServerMessage)> = Vec::new();
 
         for index in 0..clients.len() {
             let read = read_socket_available(clients[index].stream_mut());
@@ -881,8 +1046,52 @@ fn run_server_loop(
             let messages = coalesce_resizes(clients[index].decoder.push_bytes(&bytes)?);
             let mut detached_now = false;
             for message in messages {
+                let trace_context = TraceContext {
+                    client_id: Some(clients[index].id),
+                    window_id: Some(windows.active_trace_window_id()),
+                    pane_id: Some(windows.active().active_pane_id() as u32),
+                };
+                if trace.is_active() {
+                    match &message {
+                        ClientMessage::TraceClientInput(bytes) => {
+                            let _ =
+                                trace.record_bytes(TraceKind::ClientInput, trace_context, bytes);
+                        }
+                        ClientMessage::TraceClientOutput(bytes) => {
+                            let _ =
+                                trace.record_bytes(TraceKind::ClientOutput, trace_context, bytes);
+                        }
+                        _ => {
+                            if let Ok(encoded) = encode_client_message(&message) {
+                                let _ = trace.record_bytes(
+                                    TraceKind::ClientMessage,
+                                    trace_context,
+                                    &encoded,
+                                );
+                            }
+                        }
+                    }
+                }
                 match message {
-                    ClientMessage::Attach { size } | ClientMessage::Resize { size } => {
+                    ClientMessage::Attach { size } => {
+                        clients[index].attached = true;
+                        clients[index].size = size;
+                        if trace.is_active() {
+                            let _ = trace.record_json(
+                                TraceKind::ClientAttach,
+                                trace_context,
+                                &serde_json::json!({ "rows": size.rows, "cols": size.cols }),
+                            );
+                        }
+                        if trace.is_active() {
+                            let snapshot = trace.status();
+                            trace_status_replies.push((index, server_trace_status(snapshot)));
+                        }
+                        let new_size = min_client_size(clients);
+                        windows.resize(new_size)?;
+                        dirty = true;
+                    }
+                    ClientMessage::Resize { size } => {
                         clients[index].size = size;
                         let new_size = min_client_size(clients);
                         windows.resize(new_size)?;
@@ -1277,6 +1486,64 @@ fn run_server_loop(
                         let changed = windows.set_pane_label(pane_id, label);
                         dirty |= changed;
                     }
+                    ClientMessage::TraceStart { path, max_bytes } => {
+                        let result = trace.start(TraceStartOptions {
+                            output: path.map(PathBuf::from),
+                            max_bytes,
+                        });
+                        if let Err(error) = result {
+                            let message = format!("trace start failed: {error}");
+                            trace.note_failure(message.clone());
+                            trace_status_replies.push((index, ServerMessage::Error(message)));
+                        } else {
+                            // Re-attach the already-shared hub so a runtime
+                            // start emits a complete pane/layout checkpoint,
+                            // not just events that happen after this command.
+                            windows.record_trace_snapshot();
+                            if let Ok(encoded) = encode_client_message(&ClientMessage::TraceStart {
+                                path: trace
+                                    .status()
+                                    .path
+                                    .as_ref()
+                                    .map(|path| path.to_string_lossy().into_owned()),
+                                max_bytes,
+                            }) {
+                                // The generic pre-dispatch record ran while the
+                                // hub was inactive. Record this activating command
+                                // again now that its writer exists.
+                                let _ = trace.record_bytes(
+                                    TraceKind::ClientMessage,
+                                    trace_context,
+                                    &encoded,
+                                );
+                            }
+                            let snapshot = trace.status();
+                            trace_was_active = snapshot.active;
+                            for (target, client) in clients.iter().enumerate() {
+                                if target == index || client.attached {
+                                    trace_status_replies
+                                        .push((target, server_trace_status(snapshot.clone())));
+                                }
+                            }
+                        }
+                    }
+                    ClientMessage::TraceStop => {
+                        let snapshot = trace.stop();
+                        trace_was_active = snapshot.active;
+                        for (target, client) in clients.iter().enumerate() {
+                            if target == index || client.attached {
+                                trace_status_replies
+                                    .push((target, server_trace_status(snapshot.clone())));
+                            }
+                        }
+                    }
+                    ClientMessage::TraceStatus => {
+                        trace_status_replies.push((index, server_trace_status(trace.status())));
+                    }
+                    ClientMessage::TraceClientInput(_) | ClientMessage::TraceClientOutput(_) => {
+                        // Recorded above. These evidence messages must never
+                        // reach the PTY or mark the workspace dirty.
+                    }
                     ClientMessage::Detach => {
                         detached_now = true;
                         break;
@@ -1322,15 +1589,36 @@ fn run_server_loop(
             }
         }
 
+        for (index, reply) in trace_status_replies {
+            if to_remove.contains(&index) {
+                continue;
+            }
+            if send_server_message(clients[index].stream_mut(), &reply).is_err() {
+                to_remove.push(index);
+            }
+        }
+
         // Remove dropped clients in reverse index order. Recompute pane
         // size if the set changed.
         if !to_remove.is_empty() {
             to_remove.sort_unstable();
             to_remove.dedup();
             for index in to_remove.into_iter().rev() {
+                let context = TraceContext {
+                    client_id: Some(clients[index].id),
+                    window_id: Some(windows.active_trace_window_id()),
+                    pane_id: Some(windows.active().active_pane_id() as u32),
+                };
+                if trace.is_active() {
+                    let _ = trace.record_json(
+                        TraceKind::ClientDetach,
+                        context,
+                        &serde_json::json!({ "attached": clients[index].attached }),
+                    );
+                }
                 clients.swap_remove(index);
             }
-            if !clients.is_empty() {
+            if clients.iter().any(|client| client.attached) {
                 let new_size = min_client_size(clients);
                 if windows.size() != new_size {
                     windows.resize(new_size)?;
@@ -1386,7 +1674,7 @@ fn run_server_loop(
         // Clock tick: when any client is attached and the wall-clock
         // second has advanced, force a render so the status bar stays
         // live even during idle periods (no typing, no PTY output).
-        if !clients.is_empty() {
+        if clients.iter().any(|client| client.attached) {
             let current = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
@@ -1398,7 +1686,21 @@ fn run_server_loop(
         }
 
         if dirty {
-            broadcast_frame(clients, windows)?;
+            broadcast_frame(clients, windows, &trace)?;
+        }
+
+        // A size cap or disk/write failure can stop the writer without a
+        // control command. Tell attached clients promptly so they stop
+        // forwarding raw stdin and final ANSI evidence too.
+        if trace_was_active {
+            let snapshot = trace.status();
+            if !snapshot.active {
+                trace_was_active = false;
+                let reply = server_trace_status(snapshot);
+                for client in clients.iter_mut().filter(|client| client.attached) {
+                    let _ = send_server_message(client.stream_mut(), &reply);
+                }
+            }
         }
 
         if let Some(exit_code) = windows.exit_code_if_complete() {
@@ -1447,10 +1749,18 @@ fn coalesce_resizes(messages: Vec<ClientMessage>) -> Vec<ClientMessage> {
     coalesced
 }
 
-fn accept_pending_connections(listener: &UnixListener, clients: &mut Vec<AttachedClient>) {
+fn accept_pending_connections(
+    listener: &UnixListener,
+    clients: &mut Vec<AttachedClient>,
+    next_client_id: &mut u64,
+) {
     while poll_readable(listener.as_raw_fd(), 0).unwrap_or(false) {
         match listener.accept() {
-            Ok((stream, _)) => clients.push(AttachedClient::new(stream)),
+            Ok((stream, _)) => {
+                let id = *next_client_id;
+                *next_client_id = next_client_id.saturating_add(1);
+                clients.push(AttachedClient::new(stream, id));
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
             Err(_) => break,
         }
@@ -1462,16 +1772,17 @@ fn accept_pending_connections(listener: &UnixListener, clients: &mut Vec<Attache
 // terminals see empty columns / rows beyond the workspace, which beats
 // clipping content for the smaller client.
 fn min_client_size(clients: &[AttachedClient]) -> PtySize {
-    if clients.is_empty() {
+    let attached: Vec<&AttachedClient> = clients.iter().filter(|client| client.attached).collect();
+    if attached.is_empty() {
         return PtySize::new(24, 80);
     }
-    let rows = clients
+    let rows = attached
         .iter()
         .map(|c| c.size.rows)
         .min()
         .unwrap_or(24)
         .max(4);
-    let cols = clients
+    let cols = attached
         .iter()
         .map(|c| c.size.cols)
         .min()
@@ -1486,8 +1797,9 @@ fn min_client_size(clients: &[AttachedClient]) -> PtySize {
 fn broadcast_frame(
     clients: &mut Vec<AttachedClient>,
     windows: &crate::windows::WindowSet,
+    trace: &TraceHub,
 ) -> io::Result<()> {
-    if clients.is_empty() {
+    if !clients.iter().any(|client| client.attached) {
         return Ok(());
     }
     let frame = ServerMessage::Frame {
@@ -1496,8 +1808,23 @@ fn broadcast_frame(
         lines: windows.active().render_frame(),
         cursor: windows.active().cursor_screen_position(),
     };
+    if trace.is_active() {
+        let encoded = encode_server_message(&frame)?;
+        let _ = trace.record_bytes(
+            TraceKind::ServerFrame,
+            TraceContext {
+                window_id: Some(windows.active_trace_window_id()),
+                pane_id: Some(windows.active().active_pane_id() as u32),
+                ..TraceContext::default()
+            },
+            &encoded,
+        );
+    }
     let mut dead: Vec<usize> = Vec::new();
     for (index, client) in clients.iter_mut().enumerate() {
+        if !client.attached {
+            continue;
+        }
         if let Err(error) = send_server_message(client.stream_mut(), &frame) {
             if is_dead_client_write_error(error.kind()) {
                 dead.push(index);
@@ -1510,6 +1837,16 @@ fn broadcast_frame(
         clients.swap_remove(index);
     }
     Ok(())
+}
+
+fn server_trace_status(status: TraceStatusSnapshot) -> ServerMessage {
+    ServerMessage::TraceStatus {
+        active: status.active,
+        path: status.path.map(|path| path.to_string_lossy().into_owned()),
+        bytes_written: status.bytes_written,
+        dropped_records: status.dropped_records,
+        reason: status.reason,
+    }
 }
 
 // Errors from writing to a client socket that mean "this peer is gone (or
@@ -1898,6 +2235,8 @@ pub enum AttachOutcome {
 
 #[derive(Debug)]
 struct AttachedClient {
+    id: u64,
+    attached: bool,
     stream: UnixStream,
     decoder: ClientDecoder,
     // Separate InputParser per client: two clients each mid-CSI would
@@ -1910,7 +2249,7 @@ struct AttachedClient {
 }
 
 impl AttachedClient {
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: UnixStream, id: u64) -> Self {
         // Bound every write to this client so a stuck peer can't wedge the
         // single-threaded server loop (see `CLIENT_WRITE_TIMEOUT`). Ignore
         // failures here: on the platforms zmux targets this only fails for
@@ -1918,6 +2257,8 @@ impl AttachedClient {
         // infallible rather than tearing down a brand-new connection.
         let _ = stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
         Self {
+            id,
+            attached: false,
             stream,
             decoder: ClientDecoder::default(),
             input_parser: InputParser::default(),

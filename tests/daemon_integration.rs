@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use zmux::PtySize;
 use zmux::protocol::{ClientMessage, ServerDecoder, ServerMessage, encode_client_message};
+use zmux::trace::{TraceKind, TraceReader};
 
 mod support;
 
@@ -66,6 +67,174 @@ fn read_message(stream: &mut UnixStream) -> ServerMessage {
 fn send(stream: &mut UnixStream, message: &ClientMessage) {
     let bytes = encode_client_message(message).expect("encode client message");
     stream.write_all(&bytes).expect("write to daemon");
+}
+
+fn read_trace_reply(stream: &mut UnixStream) -> ServerMessage {
+    let mut decoder = ServerDecoder::default();
+    let mut buffer = [0_u8; 16 * 1024];
+    let deadline = Instant::now() + READ_TIMEOUT;
+    loop {
+        assert!(
+            Instant::now() <= deadline,
+            "timed out waiting for trace reply"
+        );
+        let count = stream.read(&mut buffer).expect("read trace reply");
+        assert!(count > 0, "daemon closed before trace reply");
+        for message in decoder
+            .push_bytes(&buffer[..count])
+            .expect("decode trace reply")
+        {
+            if matches!(
+                message,
+                ServerMessage::TraceStatus { .. } | ServerMessage::Error(_)
+            ) {
+                return message;
+            }
+        }
+    }
+}
+
+#[test]
+fn runtime_trace_captures_client_pty_resize_and_frame_evidence() {
+    let name = support::unique_name("it-trace");
+    let path = support::client_socket_path(&name);
+    let bundle =
+        std::env::temp_dir().join(format!("zmux-it-trace-{}-{}", std::process::id(), name));
+    let _ = std::fs::remove_dir_all(&bundle);
+
+    let mut session = support::spawn_serve(&name);
+    support::wait_for_socket(&path);
+
+    let mut admin = connect(&path);
+    send(
+        &mut admin,
+        &ClientMessage::TraceStart {
+            path: Some(bundle.to_string_lossy().into_owned()),
+            max_bytes: 4 * 1024 * 1024,
+        },
+    );
+    match read_trace_reply(&mut admin) {
+        ServerMessage::TraceStatus {
+            active: true,
+            path: Some(reported),
+            ..
+        } => assert_eq!(Path::new(&reported), bundle),
+        other => panic!("expected active TraceStatus, got {other:?}"),
+    }
+    drop(admin);
+
+    let mut attached = connect(&path);
+    send(
+        &mut attached,
+        &ClientMessage::Attach {
+            size: PtySize::new(24, 80),
+        },
+    );
+    // TraceStatus and the initial Frame are sent in the same daemon tick and
+    // may coalesce into one socket read, so retain one decoder for both.
+    let mut decoder = ServerDecoder::default();
+    let mut saw_active = false;
+    let mut saw_frame = false;
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let mut buffer = [0_u8; 16 * 1024];
+    while !(saw_active && saw_frame) {
+        assert!(
+            Instant::now() <= deadline,
+            "timed out waiting for trace attach replies"
+        );
+        let count = attached
+            .read(&mut buffer)
+            .expect("read trace attach replies");
+        assert!(count > 0, "daemon closed during trace attach");
+        for message in decoder
+            .push_bytes(&buffer[..count])
+            .expect("decode trace attach replies")
+        {
+            match message {
+                ServerMessage::TraceStatus { active: true, .. } => saw_active = true,
+                ServerMessage::Frame { .. } => saw_frame = true,
+                other => panic!("unexpected trace attach reply: {other:?}"),
+            }
+        }
+    }
+
+    send(
+        &mut attached,
+        &ClientMessage::TraceClientInput(b"raw-touch-input".to_vec()),
+    );
+    send(
+        &mut attached,
+        &ClientMessage::TraceClientOutput(b"\x1b[2Jfinal-ansi".to_vec()),
+    );
+    send(
+        &mut attached,
+        &ClientMessage::Resize {
+            size: PtySize::new(30, 100),
+        },
+    );
+    send(
+        &mut attached,
+        &ClientMessage::Input(b"printf trace-pty\\n\r".to_vec()),
+    );
+    thread::sleep(Duration::from_millis(150));
+
+    let mut stop_admin = connect(&path);
+    send(&mut stop_admin, &ClientMessage::TraceStop);
+    match read_trace_reply(&mut stop_admin) {
+        ServerMessage::TraceStatus { active: false, .. } => {}
+        other => panic!("expected stopped TraceStatus, got {other:?}"),
+    }
+
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let mut saw_stopped = false;
+    while !saw_stopped {
+        assert!(
+            Instant::now() <= deadline,
+            "timed out waiting for attached trace-stop notification"
+        );
+        let count = attached
+            .read(&mut buffer)
+            .expect("read attached trace-stop notification");
+        assert!(count > 0, "daemon closed before trace-stop notification");
+        for message in decoder
+            .push_bytes(&buffer[..count])
+            .expect("decode attached trace-stop notification")
+        {
+            if matches!(message, ServerMessage::TraceStatus { active: false, .. }) {
+                saw_stopped = true;
+            }
+        }
+    }
+
+    drop(attached);
+    drop(stop_admin);
+    let mut shutdown_admin = connect(&path);
+    send(&mut shutdown_admin, &ClientMessage::Shutdown);
+    drop(shutdown_admin);
+    wait_for_removal(&path);
+    let status = session.wait_for_exit(CONNECT_TIMEOUT);
+    assert!(status.success(), "daemon exited with {status}");
+
+    let records = TraceReader::open(&bundle)
+        .expect("open trace bundle")
+        .read_all()
+        .expect("read trace records");
+    for kind in [
+        TraceKind::ClientAttach,
+        TraceKind::ClientInput,
+        TraceKind::ClientOutput,
+        TraceKind::PaneInput,
+        TraceKind::PaneOutput,
+        TraceKind::Resize,
+        TraceKind::ServerFrame,
+        TraceKind::Stop,
+    ] {
+        assert!(
+            records.iter().any(|record| record.kind == kind),
+            "trace should contain {kind:?}: {records:#?}"
+        );
+    }
+    std::fs::remove_dir_all(bundle).unwrap();
 }
 
 #[test]

@@ -9,12 +9,14 @@ use crate::pane::WheelOutcome;
 use crate::pane::{Pane, PaneOutputSlice};
 use crate::pty::{PtyProcess, PtySize};
 use crate::terminal::TerminalIngest;
+use crate::trace::{TraceContext, TraceHub, TraceKind};
 
 #[derive(Debug)]
 pub struct Session {
     pane: Pane,
     pty: PtyProcess,
     ingest: TerminalIngest,
+    trace: Option<(TraceHub, TraceContext)>,
 }
 
 impl Session {
@@ -33,11 +35,61 @@ impl Session {
             pane,
             pty,
             ingest: TerminalIngest::new(size),
+            trace: None,
         })
     }
 
     pub fn write_input(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.pty.write_all(bytes)
+        self.pty.write_all(bytes)?;
+        self.trace_bytes(TraceKind::PaneInput, bytes);
+        Ok(())
+    }
+
+    /// Attach this PTY to the daemon's session-level trace controller.
+    /// The hub is cheap to clone and a no-op while tracing is disabled.
+    pub fn set_trace(&mut self, hub: TraceHub, context: TraceContext) {
+        self.trace = Some((hub, context));
+    }
+
+    fn trace_bytes(&self, kind: TraceKind, bytes: &[u8]) {
+        if let Some((hub, context)) = &self.trace {
+            let _ = hub.record_bytes(kind, *context, bytes);
+        }
+    }
+
+    fn trace_resize(&self, size: PtySize) {
+        if let Some((hub, context)) = &self.trace {
+            if !hub.is_active() {
+                return;
+            }
+            let _ = hub.record_json(
+                TraceKind::Resize,
+                *context,
+                &serde_json::json!({ "rows": size.rows, "cols": size.cols }),
+            );
+        }
+    }
+
+    fn trace_terminal_state(&self, output_bytes: usize) {
+        if let Some((hub, context)) = &self.trace {
+            if !hub.is_active() {
+                return;
+            }
+            let _ = hub.record_json(
+                TraceKind::State,
+                *context,
+                &serde_json::json!({
+                    "event": "terminal_state",
+                    "output_bytes": output_bytes,
+                    "screen_mode": format!("{:?}", self.screen_mode()),
+                    "mouse_tracking": format!("{:?}", self.mouse_tracking_mode()),
+                    "follow_output": self.follow_output(),
+                    "viewport_top": self.pane.viewport_top(),
+                    "viewport_height": self.pane.viewport_height(),
+                    "bracketed_paste": self.bracketed_paste_enabled(),
+                }),
+            );
+        }
     }
 
     // Mutable access to the underlying Pane. Used by the daemon's
@@ -168,6 +220,7 @@ impl Session {
         let bytes = self.pty.read_available()?;
         let count = bytes.len();
         if count > 0 {
+            self.trace_bytes(TraceKind::PaneOutput, &bytes);
             // Optional raw-byte capture for debugging ingest issues. Set
             // ZMUX_PTY_DUMP to a file path to log everything we read from
             // this pane's PTY. The file is append-only and shared across
@@ -189,8 +242,9 @@ impl Session {
             self.pane.mirror_capture(&bytes);
             let replies = self.ingest.ingest_bytes(&mut self.pane, &bytes);
             if !replies.is_empty() {
-                self.pty.write_all(&replies)?;
+                self.write_input(&replies)?;
             }
+            self.trace_terminal_state(count);
         }
 
         Ok(count)
@@ -204,6 +258,7 @@ impl Session {
         }
         self.pane.set_scrollback_live_tail(resize.live_tail);
         self.pane.set_viewport_height(viewport_height);
+        self.trace_resize(size);
         Ok(())
     }
 
@@ -399,6 +454,7 @@ impl Session {
 
     pub fn drain_to_completion(mut self) -> io::Result<CompletedSession> {
         let bytes = self.pty.read_to_end()?;
+        self.trace_bytes(TraceKind::PaneOutput, &bytes);
         self.pane.mirror_capture(&bytes);
         let _ = self.ingest.ingest_bytes(&mut self.pane, &bytes);
         self.ingest.flush_incomplete_line(&mut self.pane);

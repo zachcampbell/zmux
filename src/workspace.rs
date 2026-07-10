@@ -25,6 +25,7 @@ use crate::style::{Attrs, Cell, Color, Style, display_width, serialize_row};
 use crate::supervisor::{
     BroadcastFilter, BroadcastState, SupervisorRow, SupervisorState, render_supervisor,
 };
+use crate::trace::{TraceContext, TraceHub, TraceKind};
 use crate::workspace_render::{draw_big_digits, stamp_cells, stamp_row_text, stamp_text};
 
 // Default cadence for `IdleDetector::tick`; the workspace's per-frame
@@ -206,6 +207,9 @@ pub struct Workspace {
     // subscribers can observe panes across every window, including
     // background windows.
     session_event_bus: Option<Arc<Mutex<EventBus>>>,
+    // Session-wide structured trace controller plus this workspace's stable
+    // window id. Every pane receives a clone with its pane context.
+    trace: Option<(TraceHub, u32)>,
     // Wall-clock threshold the per-pane `IdleDetector` uses to decide
     // when a pane has gone quiet. Loaded from `[agent].idle_threshold_ms`
     // when present; defaults to `DEFAULT_IDLE_THRESHOLD` otherwise. Held
@@ -464,7 +468,6 @@ impl Workspace {
             bytes_since_emit: 0,
             last_output_emit_at: Instant::now(),
         };
-
         Ok(Self {
             sessions: vec![session],
             active: pane_id,
@@ -500,6 +503,7 @@ impl Workspace {
             // late subscribers should enumerate via `ListPanes`.
             event_bus: EventBus::default(),
             session_event_bus: None,
+            trace: None,
             idle_threshold: DEFAULT_IDLE_THRESHOLD,
             shell_prompts: vec!["$ ".into(), "# ".into(), "> ".into(), "% ".into()],
             agent_prompts: vec!["│ > ".into(), "architect> ".into(), ">>> ".into()],
@@ -594,6 +598,7 @@ impl Workspace {
             prompt_error: None,
             event_bus: EventBus::default(),
             session_event_bus: None,
+            trace: None,
             idle_threshold: DEFAULT_IDLE_THRESHOLD,
             shell_prompts: vec!["$ ".into(), "# ".into(), "> ".into(), "% ".into()],
             agent_prompts: vec!["│ > ".into(), "architect> ".into(), ">>> ".into()],
@@ -707,7 +712,7 @@ impl Workspace {
             .pane_frame(new_id)
             .expect("split_at must leave the new pane in the tree");
         let title = format!("pane-{new_id}");
-        let session = ManagedSession {
+        let mut session = ManagedSession {
             id: new_id,
             title: title.clone(),
             session: Session::spawn_command(
@@ -724,6 +729,7 @@ impl Workspace {
             bytes_since_emit: 0,
             last_output_emit_at: Instant::now(),
         };
+        self.trace_new_session(&mut session, None);
 
         // PTY construction is the fallible part. Commit structural state only
         // after it succeeds so an invalid shell cannot leave a phantom pane,
@@ -769,6 +775,7 @@ impl Workspace {
             .expect("tree must retain at least one leaf after remove");
 
         if let Some(index) = self.sessions.iter().position(|pane| pane.id == closing) {
+            self.trace_pane_close(closing, "user_close");
             let mut removed = self.sessions.remove(index);
             // Idempotent force-kill so the shell isn't left as a zombie.
             // The Result is intentionally dropped: kill on an already-reaped
@@ -1669,6 +1676,7 @@ impl Workspace {
             return Ok(false);
         }
         if let Some(idx) = self.sessions.iter().position(|s| s.id == target) {
+            self.trace_pane_close(target, "targeted_close");
             let mut removed = self.sessions.remove(idx);
             let _ = removed.session.close();
             self.publish_event(Event::PaneClosed {
@@ -1688,6 +1696,9 @@ impl Workspace {
     /// cleanup.
     pub(crate) fn close_all_panes_for_window_removal(&mut self) -> io::Result<Vec<u32>> {
         let pane_ids: Vec<u32> = self.sessions.iter().map(|s| s.id as u32).collect();
+        for pane_id in &pane_ids {
+            self.trace_pane_close(*pane_id as PaneId, "window_close");
+        }
         for session in &mut self.sessions {
             let _ = session.session.close()?;
         }
@@ -1761,7 +1772,7 @@ impl Workspace {
         // user can tell at a glance what's running there. The user can
         // still rename it with Ctrl-a , afterward.
         let title = truncate_command_label(command);
-        let session = ManagedSession {
+        let mut session = ManagedSession {
             id: new_id,
             title: title.clone(),
             session: Session::spawn_command(
@@ -1778,6 +1789,7 @@ impl Workspace {
             bytes_since_emit: 0,
             last_output_emit_at: Instant::now(),
         };
+        self.trace_new_session(&mut session, Some(command));
 
         self.next_pane_id = new_id.saturating_add(1);
         self.zoomed = None;
@@ -2105,10 +2117,180 @@ impl Workspace {
         self.session_event_bus = Some(bus);
     }
 
+    pub(crate) fn set_trace_hub(&mut self, hub: TraceHub, window_id: u32) {
+        self.trace = Some((hub.clone(), window_id));
+        for managed in &mut self.sessions {
+            let context = TraceContext {
+                window_id: Some(window_id),
+                pane_id: Some(managed.id as u32),
+                ..TraceContext::default()
+            };
+            managed.session.set_trace(hub.clone(), context);
+        }
+        self.record_trace_snapshot();
+    }
+
+    pub(crate) fn record_trace_snapshot(&self) {
+        let Some((hub, window_id)) = &self.trace else {
+            return;
+        };
+        if !hub.is_active() {
+            return;
+        }
+        for managed in &self.sessions {
+            let _ = hub.record_json(
+                TraceKind::PaneSpawn,
+                TraceContext {
+                    window_id: Some(*window_id),
+                    pane_id: Some(managed.id as u32),
+                    ..TraceContext::default()
+                },
+                &serde_json::json!({
+                    "title": &managed.title,
+                    "existing": true,
+                }),
+            );
+        }
+        self.trace_layout("trace_attached");
+    }
+
+    pub(crate) fn trace_window_id(&self) -> Option<u32> {
+        self.trace.as_ref().map(|(_, window_id)| *window_id)
+    }
+
+    fn trace_new_session(&self, managed: &mut ManagedSession, command: Option<&str>) {
+        let Some((hub, window_id)) = &self.trace else {
+            return;
+        };
+        let context = TraceContext {
+            window_id: Some(*window_id),
+            pane_id: Some(managed.id as u32),
+            ..TraceContext::default()
+        };
+        managed.session.set_trace(hub.clone(), context);
+        if !hub.is_active() {
+            return;
+        }
+        let _ = hub.record_json(
+            TraceKind::PaneSpawn,
+            context,
+            &serde_json::json!({
+                "title": managed.title,
+                "command": command,
+                "existing": false,
+            }),
+        );
+    }
+
+    fn trace_pane_close(&self, pane_id: PaneId, reason: &str) {
+        if let Some((hub, window_id)) = &self.trace
+            && hub.is_active()
+        {
+            let _ = hub.record_json(
+                TraceKind::PaneClose,
+                TraceContext {
+                    window_id: Some(*window_id),
+                    pane_id: Some(pane_id as u32),
+                    ..TraceContext::default()
+                },
+                &serde_json::json!({ "reason": reason }),
+            );
+        }
+    }
+
+    fn trace_layout(&self, reason: &str) {
+        let Some((hub, window_id)) = &self.trace else {
+            return;
+        };
+        if !hub.is_active() {
+            return;
+        }
+        let panes: Vec<_> = self
+            .layout
+            .panes
+            .iter()
+            .map(|(pane_id, pane)| {
+                serde_json::json!({
+                    "pane_id": *pane_id as u32,
+                    "x": pane.frame.x,
+                    "y": pane.frame.y,
+                    "width": pane.frame.width,
+                    "height": pane.frame.height,
+                })
+            })
+            .collect();
+        let _ = hub.record_json(
+            TraceKind::Layout,
+            TraceContext {
+                window_id: Some(*window_id),
+                ..TraceContext::default()
+            },
+            &serde_json::json!({
+                "reason": reason,
+                "active_pane": self.active as u32,
+                "rows": self.size.rows,
+                "cols": self.size.cols,
+                "zoomed_pane": self.zoomed.map(|id| id as u32),
+                "panes": panes,
+            }),
+        );
+    }
+
     // Mirrors the event into the supervisor overlay state so the
     // dashboard stays live without a separate subscriber. New
     // publish sites should prefer this helper.
     pub(crate) fn publish_event(&mut self, event: Event) {
+        if let Some((hub, window_id)) = &self.trace
+            && hub.is_active()
+        {
+            match &event {
+                Event::PaneStateChanged { pane_id, from, to } => {
+                    let _ = hub.record_json(
+                        TraceKind::State,
+                        TraceContext {
+                            window_id: Some(*window_id),
+                            pane_id: Some(*pane_id),
+                            ..TraceContext::default()
+                        },
+                        &serde_json::json!({
+                            "event": "pane_state_changed",
+                            "from": from,
+                            "to": to,
+                        }),
+                    );
+                }
+                Event::PaneExited { pane_id, exit_code } => {
+                    let _ = hub.record_json(
+                        TraceKind::State,
+                        TraceContext {
+                            window_id: Some(*window_id),
+                            pane_id: Some(*pane_id),
+                            ..TraceContext::default()
+                        },
+                        &serde_json::json!({
+                            "event": "pane_exited",
+                            "exit_code": exit_code,
+                        }),
+                    );
+                }
+                Event::LabelChanged { pane_id, label } => {
+                    let _ = hub.record_json(
+                        TraceKind::State,
+                        TraceContext {
+                            window_id: Some(*window_id),
+                            pane_id: Some(*pane_id),
+                            ..TraceContext::default()
+                        },
+                        &serde_json::json!({
+                            "event": "pane_label_changed",
+                            "label": label,
+                        }),
+                    );
+                }
+                Event::PaneOutput { .. } | Event::PaneSpawned { .. } | Event::PaneClosed { .. } => {
+                }
+            }
+        }
         if let Some(state) = self.supervisor.as_mut() {
             state.apply_event(&event);
         }
@@ -3018,6 +3200,23 @@ impl Workspace {
         if old_id == new_id {
             return;
         }
+        if let Some((hub, window_id)) = &self.trace
+            && hub.is_active()
+        {
+            let _ = hub.record_json(
+                TraceKind::State,
+                TraceContext {
+                    window_id: Some(*window_id),
+                    pane_id: Some(new_id as u32),
+                    ..TraceContext::default()
+                },
+                &serde_json::json!({
+                    "event": "pane_focus",
+                    "from": old_id as u32,
+                    "to": new_id as u32,
+                }),
+            );
+        }
         if let Some(prev) = self.session_for_mut(old_id)
             && prev.session.focus_events_enabled()
         {
@@ -3050,6 +3249,7 @@ impl Workspace {
                 session.resize(size)?;
             }
         }
+        self.trace_layout("layout_applied");
         Ok(())
     }
 

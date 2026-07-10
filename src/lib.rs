@@ -27,6 +27,8 @@ pub mod state_paths;
 pub mod style;
 pub mod supervisor;
 pub mod terminal;
+pub mod trace;
+pub mod trace_tools;
 pub mod tty;
 pub mod windows;
 pub mod workspace;
@@ -34,9 +36,11 @@ pub mod workspace_render;
 
 pub use config::Config;
 pub use daemon::{
-    AttachOutcome, PruneReport, SessionEntry, attach_session, create_session, daemon_log_path,
+    AttachOutcome, PruneReport, SessionEntry, TraceControlStatus, TraceLaunchOptions,
+    attach_session, create_session, create_session_with_trace, daemon_log_path,
     default_session_name, kill_session, list_sessions, list_sessions_verbose, print_session_list,
-    print_session_list_verbose, prune_stale_sessions, run_server, send_admin_message,
+    print_session_list_verbose, prune_stale_sessions, request_trace_control, run_server,
+    run_server_with_trace, send_admin_message,
 };
 pub use input::{InputAction, InputParser, MouseEvent};
 pub use interactive::run_shell;
@@ -50,5 +54,6 @@ pub use protocol::ClientMessage;
 pub use pty::{PtyProcess, PtySize};
 pub use scrollback::ScrollbackBuffer;
 pub use session::{CompletedSession, Session};
+pub use trace::{TraceContext, TraceHub, TraceKind, TraceStartOptions, TraceStatusSnapshot};
 pub use windows::WindowSet;
 pub use workspace::Workspace;

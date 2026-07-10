@@ -81,10 +81,28 @@ pub struct TerminalGuard {
     // keys on a readline, say) still triggers a write even though every
     // row diffed clean.
     last_cursor: Option<(u16, u16)>,
+    // Optional exact-byte tap used by the structured trace client. This
+    // lives at the final stdout boundary, after frame diffing and cursor/
+    // mouse-mode serialization, so it captures what the host terminal
+    // actually received rather than merely what the daemon intended to
+    // render. Ordinary foreground/demo callers leave the tap disabled.
+    capture_writes: bool,
+    captured_writes: Vec<u8>,
 }
 
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
+        Self::enter_inner(false)
+    }
+
+    /// Enter raw terminal mode while retaining exact stdout writes for a
+    /// structured session trace. Callers must drain `take_captured_writes`
+    /// regularly; the attach loop does so once per poll iteration.
+    pub fn enter_with_write_capture() -> io::Result<Self> {
+        Self::enter_inner(true)
+    }
+
+    fn enter_inner(capture_writes: bool) -> io::Result<Self> {
         let stdin = io::stdin();
         let stdin_fd = stdin.as_raw_fd();
         let original_mode = read_termios(stdin_fd)?;
@@ -99,6 +117,8 @@ impl TerminalGuard {
             last_frame: Vec::new(),
             last_size: None,
             last_cursor: None,
+            capture_writes,
+            captured_writes: Vec::new(),
         };
         // `?1049h` alt-screen, `?25l` hide cursor, clear+home. `?2004h`
         // (bracketed paste) tells the host terminal to wrap multiline
@@ -109,6 +129,18 @@ impl TerminalGuard {
         guard.write_escape("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?2004h")?;
         guard.set_mouse_tracking_mode(MouseTrackingMode::Click)?;
         Ok(guard)
+    }
+
+    /// Drain exact ANSI/text bytes written since the previous call.
+    pub fn take_captured_writes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.captured_writes)
+    }
+
+    pub fn set_write_capture(&mut self, enabled: bool) {
+        self.capture_writes = enabled;
+        if !enabled {
+            self.captured_writes.clear();
+        }
     }
 
     pub fn size(&self) -> io::Result<PtySize> {
@@ -257,6 +289,9 @@ impl TerminalGuard {
 
     fn write_escape(&mut self, sequence: &str) -> io::Result<()> {
         self.stdout.write_all(sequence.as_bytes())?;
+        if self.capture_writes {
+            self.captured_writes.extend_from_slice(sequence.as_bytes());
+        }
         self.stdout.flush()
     }
 
