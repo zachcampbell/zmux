@@ -1220,40 +1220,33 @@ impl TerminalIngest {
                     self.alternate.vertical_absolute(row.saturating_sub(1));
                 }
             },
-            b'A' => match pane.screen_mode() {
-                ScreenMode::Primary => {
-                    // CUU on primary: cursor up N rows, clamped at row 0.
-                    // This is the bug-fix sequence — claude redraws its
-                    // input box by sending CUU + write, and prior to
-                    // this the move was silently dropped so writes
-                    // cascaded down.
-                    let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
-                    self.primary_wrap_pending = false;
-                    self.primary_cursor_row = self.primary_cursor_row.saturating_sub(count);
+            b'A' => {
+                // CUU: cursor up N rows, stopping at the scroll region's
+                // top margin (row 0 only when starting above it) — see
+                // `primary_cursor_up`. This is the bug-fix sequence —
+                // claude redraws its input box by sending CUU + write,
+                // and prior to this the move was silently dropped so
+                // writes cascaded down. An explicit 0 means 1, per xterm.
+                let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
+                match pane.screen_mode() {
+                    ScreenMode::Primary => self.primary_cursor_up(count),
+                    ScreenMode::Alternate => self.alternate.cursor_up(count),
                 }
-                ScreenMode::Alternate => {
-                    let count = params.first().and_then(|value| *value).unwrap_or(1);
-                    self.alternate.move_cursor(-(count as isize), 0);
+            }
+            b'B' => {
+                // CUD: cursor down N rows, stopping at the scroll
+                // region's bottom margin (viewport bottom only when
+                // starting below it). Clamping against the VIEWPORT
+                // rather than grid.len() matters on primary — claude
+                // moves the cursor to fixed terminal rows to redraw UI;
+                // clamping to the existing grid tail produced ghost-
+                // duplicate UI elements.
+                let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
+                match pane.screen_mode() {
+                    ScreenMode::Primary => self.primary_cursor_down(count),
+                    ScreenMode::Alternate => self.alternate.cursor_down(count),
                 }
-            },
-            b'B' => match pane.screen_mode() {
-                ScreenMode::Primary => {
-                    // CUD on primary: cursor down N rows, clamped at the
-                    // VIEWPORT bottom (PTY rows). Same reasoning as CUP/
-                    // VPA — claude moves the cursor to a fixed terminal
-                    // row to redraw UI; clamping to grid.len() left it
-                    // pinned to the existing tail and produced ghost-
-                    // duplicate UI elements.
-                    let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
-                    let max_row = self.alternate.rows.saturating_sub(1);
-                    self.primary_wrap_pending = false;
-                    self.primary_cursor_row = (self.primary_cursor_row + count).min(max_row);
-                }
-                ScreenMode::Alternate => {
-                    let count = params.first().and_then(|value| *value).unwrap_or(1);
-                    self.alternate.move_cursor(count as isize, 0);
-                }
-            },
+            }
             b'C' => match pane.screen_mode() {
                 ScreenMode::Primary => {
                     // CUF on primary: cursor right N columns, clamped at
@@ -1267,7 +1260,8 @@ impl TerminalIngest {
                         .min(self.alternate.cols.saturating_sub(1));
                 }
                 ScreenMode::Alternate => {
-                    let count = params.first().and_then(|value| *value).unwrap_or(1);
+                    // Explicit 0 means 1, per xterm.
+                    let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
                     self.alternate.move_cursor(0, count as isize);
                 }
             },
@@ -1279,7 +1273,8 @@ impl TerminalIngest {
                     self.primary_cursor_col = self.primary_cursor_col.saturating_sub(count);
                 }
                 ScreenMode::Alternate => {
-                    let count = params.first().and_then(|value| *value).unwrap_or(1);
+                    // Explicit 0 means 1, per xterm.
+                    let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
                     self.alternate.move_cursor(0, -(count as isize));
                 }
             },
@@ -1832,8 +1827,10 @@ impl TerminalIngest {
     /// Background cell using the current SGR style — what an erase
     /// op should leave behind so the cleared region picks up whatever
     /// background color is active (matches xterm semantics).
+    // The cell erase/insert fills paint with — the pen's background and
+    // nothing else (see Style::erase_fill).
     fn primary_blank_cell(&self) -> Cell {
-        Cell::styled(' ', self.current_style.clone())
+        Cell::styled(' ', self.current_style.erase_fill())
     }
 
     fn primary_blank_row(&self) -> Vec<Cell> {
@@ -2108,21 +2105,45 @@ impl TerminalIngest {
         }
     }
 
-    fn primary_next_line(&mut self, count: usize) {
-        // CNL: move down N rows and return to column 0. It does not
-        // print or scroll; subsequent output lazily grows the grid if
-        // the target row hasn't existed yet.
-        let max_row = self.alternate.rows.saturating_sub(1);
+    // CUU/CUD (and CNL/CPL, which are these plus a carriage return) are
+    // margin-confined, per DEC STD 070 / xterm: a cursor starting at or
+    // below the top margin stops there on the way up, one starting at
+    // or above the bottom margin stops there on the way down. Only a
+    // cursor already OUTSIDE the region gets the full screen bound.
+    // Never scrolls — relative moves clamp, they don't push content.
+    fn primary_cursor_up(&mut self, count: usize) {
         self.primary_wrap_pending = false;
-        self.primary_cursor_row = (self.primary_cursor_row + count).min(max_row);
+        let top = if self.primary_cursor_row < self.primary_scroll_top {
+            0
+        } else {
+            self.primary_scroll_top
+        };
+        self.primary_cursor_row = self.primary_cursor_row.saturating_sub(count).max(top);
+    }
+
+    fn primary_cursor_down(&mut self, count: usize) {
+        self.primary_wrap_pending = false;
+        let max_row = self.alternate.rows.saturating_sub(1);
+        let bottom = if self.primary_cursor_row > self.primary_scroll_bottom {
+            max_row
+        } else {
+            self.primary_scroll_bottom.min(max_row)
+        };
+        self.primary_cursor_row = self.primary_cursor_row.saturating_add(count).min(bottom);
+    }
+
+    fn primary_next_line(&mut self, count: usize) {
+        // CNL: CUD + CR. It does not print or scroll (margin-clamped
+        // like any relative vertical move); subsequent output lazily
+        // grows the grid if the target row hasn't existed yet.
+        self.primary_cursor_down(count);
         self.primary_cursor_col = 0;
     }
 
     fn primary_previous_line(&mut self, count: usize) {
-        // CPL: move up N rows and return to column 0. Missing this leaves
-        // redraw cursors too low when a TUI walks back up to repaint boxes.
-        self.primary_wrap_pending = false;
-        self.primary_cursor_row = self.primary_cursor_row.saturating_sub(count);
+        // CPL: CUU + CR. Missing this leaves redraw cursors too low
+        // when a TUI walks back up to repaint boxes.
+        self.primary_cursor_up(count);
         self.primary_cursor_col = 0;
     }
 
@@ -2521,17 +2542,16 @@ impl TerminalIngest {
             return;
         }
 
+        // Otherwise the cursor sits on the last screen row but NOT at
+        // the scroll bottom — i.e. below an active region's bottom
+        // margin (the margin-equal case returned above). xterm parks
+        // the cursor: no move, and absolutely no scroll — evicting
+        // grid[0] here would drag rows out through a region that exists
+        // to protect them (codex parks its composer exactly like this,
+        // under a top-anchored region).
         if self.primary_cursor_row + 1 < max_rows {
             self.primary_cursor_row += 1;
-            return;
         }
-
-        let evicted = self.primary_grid.remove(0);
-        // See the comment on the sibling eviction branch above.
-        self.sync_live_tail(pane);
-        pane.append_output_line(evicted);
-        self.primary_grid.push(Vec::new());
-        self.primary_cursor_row = max_rows - 1;
     }
 
     // RI (`ESC M`): cursor up one row, column untouched. Mirrors
@@ -2793,7 +2813,10 @@ impl AlternateScreen {
     }
 
     fn set_fill_style(&mut self, style: Style) {
-        self.fill = Cell::styled(' ', style);
+        // BCE keeps only the background: erased/shifted-in blanks must
+        // not inherit fg, underline/reverse, or a hyperlink from the
+        // pen (see Style::erase_fill).
+        self.fill = Cell::styled(' ', style.erase_fill());
     }
 
     fn set_auto_wrap(&mut self, enabled: bool) {
@@ -2876,6 +2899,31 @@ impl AlternateScreen {
         self.set_cursor(row, col);
     }
 
+    // Margin-confined relative vertical moves (CUU/CUD and the CNL/CPL
+    // built on them), mirroring `primary_cursor_up`/`primary_cursor_down`:
+    // stop at the scroll margin when the cursor starts inside the
+    // region, at the screen edge only when it starts outside. Never
+    // scrolls.
+    fn cursor_up(&mut self, count: usize) {
+        self.wrap_pending = false;
+        let top = if self.cursor_row < self.scroll_top {
+            0
+        } else {
+            self.scroll_top
+        };
+        self.cursor_row = self.cursor_row.saturating_sub(count).max(top);
+    }
+
+    fn cursor_down(&mut self, count: usize) {
+        self.wrap_pending = false;
+        let bottom = if self.cursor_row > self.scroll_bottom {
+            self.rows.saturating_sub(1)
+        } else {
+            self.scroll_bottom.min(self.rows.saturating_sub(1))
+        };
+        self.cursor_row = self.cursor_row.saturating_add(count).min(bottom);
+    }
+
     fn set_scroll_region(&mut self, top: usize, bottom: usize) {
         // Clamp-then-validate, same as the primary screen: xterm pulls
         // an oversized bottom margin back to the last row instead of
@@ -2939,21 +2987,17 @@ impl AlternateScreen {
     }
 
     fn next_line(&mut self, count: usize) {
-        // Cap at 2×rows: once the cursor has reached the scroll bottom
-        // and the region has scrolled through its full height, every
-        // further linefeed leaves the screen in the same state, so a
-        // larger count is wasted work (parse_params already bounds the
-        // value; this keeps the loop O(rows) regardless).
-        let count = count.max(1).min(self.rows.saturating_mul(2).max(2));
-        for _ in 0..count {
-            self.linefeed();
-        }
+        // CNL is CUD + CR — a pure cursor move. It clamps at the bottom
+        // margin and NEVER scrolls; routing it through linefeed() used
+        // to scroll the region once the cursor reached the margin,
+        // destroying rows a real terminal would keep.
+        self.cursor_down(count.max(1));
         self.carriage_return();
     }
 
     fn previous_line(&mut self, count: usize) {
-        self.wrap_pending = false;
-        self.cursor_row = self.cursor_row.saturating_sub(count.max(1));
+        // CPL: CUU + CR, margin-clamped like next_line.
+        self.cursor_up(count.max(1));
         self.carriage_return();
     }
 

@@ -99,6 +99,19 @@ impl Style {
         0
     }
 
+    // The style erase/insert fills paint with: the pen's BACKGROUND and
+    // nothing else. xterm's BCE copies only the background color onto
+    // erased cells — fg, underline/reverse/bold/italic/dim, and any
+    // hyperlink stay with real glyphs. Without this, an EL under an
+    // underline pen leaves a run of underlined blanks, and a reverse
+    // pen paints the fg color across the erased span.
+    pub fn erase_fill(&self) -> Style {
+        Style {
+            bg: self.bg,
+            ..Style::DEFAULT
+        }
+    }
+
     // Colon-subparameter SGR forms (ISO 8613-6, kitty underline styles).
     // The whole `lead:sub:sub…` group arrives as one ';'-separated part;
     // unknown groups are dropped as a unit — misreading `4:3` as SGR 0

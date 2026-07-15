@@ -11,6 +11,13 @@
 //   4: BCE (background color erase) on the primary screen
 //   5: DECSTBM oversized-bottom clamping
 //   6: alt-screen clear timing for modes 47 / 1047 / 1049
+//
+// A second sweep (same audit, follow-up round) added:
+//   7: LF below an active scroll region must not scroll the screen
+//   8: CNL/CPL are cursor moves — they never scroll
+//   9: CUU/CUD/CNL/CPL stop at the DECSTBM margins
+//  10: erase/insert fills carry background only, never fg/attributes
+//  11: explicit param 0 on CUU/CUD/CUF/CUB means 1 on both screens
 
 use zmux::pane::Pane;
 use zmux::pty::PtySize;
@@ -377,6 +384,179 @@ fn alt_decstbm_clamps_oversized_bottom() {
         vec!["r0", "r1", "r3", "r4", "r5"],
         "got {:?}",
         lines
+    );
+}
+
+// Suspect 7: a linefeed with the cursor parked at the BOTTOM OF THE
+// SCREEN, below an active scroll region's bottom margin, must do
+// nothing — no cursor move (there's nowhere lower) and, critically, no
+// scroll. Today it evicts grid row 0 (inside the region!) to scrollback
+// and drags the entire screen up one row, chewing through codex-style
+// layouts that park a composer under a top-anchored region.
+#[test]
+fn linefeed_below_region_at_screen_bottom_does_not_scroll() {
+    let mut pane = Pane::new("t", 256, 6);
+    let mut ingest = TerminalIngest::new(PtySize::new(6, 32));
+    ingest.ingest_bytes(&mut pane, b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5");
+    // Region rows 1..4 (1-based); cursor to the screen's last row (6),
+    // which sits below the region. Feed a bare LF.
+    ingest.ingest_bytes(&mut pane, b"\x1b[1;4r\x1b[6;1H\n");
+    ingest.ingest_bytes(&mut pane, b"\x1b[r");
+    let lines = ingest.render_lines(&pane);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .collect::<Vec<_>>(),
+        vec!["r0", "r1", "r2", "r3", "r4", "r5"],
+        "LF below the region must not move any row, got {lines:?}"
+    );
+    assert_eq!(
+        pane.total_lines(),
+        0,
+        "nothing may evict to scrollback while the region protects the screen"
+    );
+}
+
+// Suspect 8: CNL (`CSI E`) is CUD + CR — a pure cursor move. At the
+// bottom margin it clamps; it NEVER scrolls the region. Today the
+// alt-screen path routes CNL through linefeed(), which scrolls at the
+// margin and destroys the top row.
+#[test]
+fn alt_cnl_at_bottom_margin_clamps_without_scrolling() {
+    let mut pane = Pane::new("t", 64, 4);
+    let mut ingest = TerminalIngest::new(PtySize::new(4, 16));
+    ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b[HTOP");
+    // Park the cursor on the last row, then CNL far past the bottom.
+    ingest.ingest_bytes(&mut pane, b"\x1b[4;5H\x1b[9EX");
+    let lines = ingest.render_lines(&pane);
+    assert_eq!(
+        lines.first().map(|l| l.trim_end()),
+        Some("TOP"),
+        "CNL must not scroll TOP away, got {lines:?}"
+    );
+    assert_eq!(
+        lines.get(3).map(|l| l.trim_end()),
+        Some("X"),
+        "cursor must clamp to the last row, column 0, got {lines:?}"
+    );
+}
+
+// Suspect 9a: CUD stops at the region's bottom margin when the cursor
+// starts at or above it (xterm/DEC STD 070). Without the clamp a TUI's
+// relative moves walk out of its own region into fixed UI rows.
+#[test]
+fn primary_cud_stops_at_bottom_margin() {
+    let mut pane = Pane::new("t", 256, 6);
+    let mut ingest = TerminalIngest::new(PtySize::new(6, 32));
+    ingest.ingest_bytes(&mut pane, b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5");
+    // Region rows 2..5 (1-based). Cursor inside at row 3, CUD 9: must
+    // stop on row 5 (the margin), where X overwrites r4's first cell.
+    ingest.ingest_bytes(&mut pane, b"\x1b[2;5r\x1b[3;1H\x1b[9BX\x1b[r");
+    let lines = ingest.render_lines(&pane);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .collect::<Vec<_>>(),
+        vec!["r0", "r1", "r2", "r3", "X4", "r5"],
+        "CUD must clamp at the bottom margin, got {lines:?}"
+    );
+}
+
+// Suspect 9b: CUU stops at the region's top margin on the alt screen.
+#[test]
+fn alt_cuu_stops_at_top_margin() {
+    let mut pane = Pane::new("t", 256, 6);
+    let mut ingest = TerminalIngest::new(PtySize::new(6, 32));
+    ingest.ingest_bytes(
+        &mut pane,
+        b"\x1b[?1049h\x1b[Hr0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5",
+    );
+    // Region rows 2..5; cursor inside at row 4, CUU 9: stops on row 2.
+    ingest.ingest_bytes(&mut pane, b"\x1b[2;5r\x1b[4;1H\x1b[9AY");
+    let lines = ingest.render_lines(&pane);
+    assert_eq!(
+        lines.get(1).map(|l| l.trim_end()),
+        Some("Y1"),
+        "CUU must clamp at the top margin (row 2), got {lines:?}"
+    );
+    assert_eq!(
+        lines.first().map(|l| l.trim_end()),
+        Some("r0"),
+        "row 0 must be untouched, got {lines:?}"
+    );
+}
+
+// Suspect 10a: erased cells take the pen's BACKGROUND and nothing else.
+// An underline/reverse/colored-fg pen must not leave underlined or
+// reversed blanks behind (xterm erases with bg only).
+#[test]
+fn primary_erase_fill_drops_fg_and_attributes() {
+    let mut pane = Pane::new("t", 64, 4);
+    let mut ingest = TerminalIngest::new(PtySize::new(4, 8));
+    ingest.ingest_bytes(&mut pane, b"hello");
+    // Underline + reverse + red fg + red bg, then EL 2.
+    ingest.ingest_bytes(&mut pane, b"\x1b[4;7;31;41m\x1b[2K");
+    let cells = ingest.render_cells(&pane);
+    let row = &cells[0];
+    assert!(!row.is_empty(), "EL2 must materialize BCE cells");
+    for (col, cell) in row.iter().enumerate() {
+        assert_eq!(
+            cell.style.bg,
+            zmux::style::Color::Indexed(1),
+            "col {col} must keep the red bg"
+        );
+        assert_eq!(
+            cell.style.fg,
+            zmux::style::Color::Default,
+            "col {col}: erased cells must not carry the pen's fg"
+        );
+        assert!(
+            !cell.style.attrs.underline && !cell.style.attrs.reverse,
+            "col {col}: erased cells must not carry underline/reverse"
+        );
+    }
+}
+
+// Suspect 10b: same rule for the alt screen's fill (erase, and the
+// blanks that IL/ICH shift in).
+#[test]
+fn alt_erase_fill_drops_fg_and_attributes() {
+    let mut pane = Pane::new("t", 64, 4);
+    let mut ingest = TerminalIngest::new(PtySize::new(4, 8));
+    ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b[Hhello");
+    ingest.ingest_bytes(&mut pane, b"\x1b[4;7;44m\x1b[2K");
+    let cells = ingest.render_cells(&pane);
+    let row = &cells[0];
+    for (col, cell) in row.iter().enumerate() {
+        assert_eq!(
+            cell.style.bg,
+            zmux::style::Color::Indexed(4),
+            "col {col} must keep the blue bg"
+        );
+        assert!(
+            !cell.style.attrs.underline && !cell.style.attrs.reverse,
+            "col {col}: erased cells must not carry underline/reverse"
+        );
+    }
+}
+
+// Suspect 11: an explicit 0 parameter on CUU/CUD/CUF/CUB means 1 (the
+// primary arms already normalize; the alt-screen arms passed 0 through
+// as "move zero cells").
+#[test]
+fn alt_cursor_moves_treat_zero_param_as_one() {
+    let mut pane = Pane::new("t", 64, 4);
+    let mut ingest = TerminalIngest::new(PtySize::new(4, 16));
+    // Cursor to (3,3) 1-based, CUU 0 + CUB 0 must each move one step,
+    // landing at (2,2) where A is written.
+    ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b[3;3H\x1b[0A\x1b[0DA");
+    let lines = ingest.render_lines(&pane);
+    assert_eq!(
+        lines.get(1).map(|l| l.trim_end()),
+        Some(" A"),
+        "CSI 0 A / CSI 0 D must move one cell, got {lines:?}"
     );
 }
 
