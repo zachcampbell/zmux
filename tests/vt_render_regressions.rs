@@ -18,6 +18,12 @@
 //   9: CUU/CUD/CNL/CPL stop at the DECSTBM margins
 //  10: erase/insert fills carry background only, never fg/attributes
 //  11: explicit param 0 on CUU/CUD/CUF/CUB means 1 on both screens
+//
+// A third round covered the previously-deferred gaps:
+//  12: DECOM (origin mode, ?6) — CUP/VPA margin-relative and confined
+//  13: DECALN (ESC # 8) — E-fill, margins reset, cursor home
+//  14: DSR 5 (CSI 5 n) answers "terminal OK" (CSI 0 n)
+//  15: wide char at the last column with wrap off must not grow the row
 
 use zmux::pane::Pane;
 use zmux::pty::PtySize;
@@ -557,6 +563,173 @@ fn alt_cursor_moves_treat_zero_param_as_one() {
         lines.get(1).map(|l| l.trim_end()),
         Some(" A"),
         "CSI 0 A / CSI 0 D must move one cell, got {lines:?}"
+    );
+}
+
+// Suspect 12a: with DECOM set, CUP addresses rows relative to the
+// scroll region's top margin and cannot place the cursor outside the
+// margins; clearing DECOM goes back to absolute addressing. Setting or
+// clearing the mode homes the cursor (to the region's origin / the
+// screen's origin respectively).
+#[test]
+fn decom_cup_is_margin_relative_and_confined() {
+    let mut pane = Pane::new("t", 256, 6);
+    let mut ingest = TerminalIngest::new(PtySize::new(6, 32));
+    ingest.ingest_bytes(&mut pane, b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5");
+    // Region rows 2..5 (1-based). DECOM on homes to the region origin
+    // (absolute row 2), where A lands. CUP 99;1 clamps to the bottom
+    // margin (absolute row 5) for B. DECOM off + CUP 1;1 is absolute
+    // again: C lands on the screen's row 1.
+    ingest.ingest_bytes(
+        &mut pane,
+        b"\x1b[2;5r\x1b[?6hA\x1b[99;1HB\x1b[?6l\x1b[1;1HC\x1b[r",
+    );
+    let lines = ingest.render_lines(&pane);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .collect::<Vec<_>>(),
+        vec!["C0", "A1", "r2", "r3", "B4", "r5"],
+        "got {lines:?}"
+    );
+}
+
+// Suspect 12b: same relative addressing on the alternate screen.
+#[test]
+fn alt_decom_cup_is_margin_relative() {
+    let mut pane = Pane::new("t", 256, 6);
+    let mut ingest = TerminalIngest::new(PtySize::new(6, 32));
+    ingest.ingest_bytes(
+        &mut pane,
+        b"\x1b[?1049h\x1b[Hr0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5",
+    );
+    // Region 2..5, DECOM on, CUP 1;2: row 1 relative = absolute row 2,
+    // column 2 — A overwrites r1's second cell.
+    ingest.ingest_bytes(&mut pane, b"\x1b[2;5r\x1b[?6h\x1b[1;2HA");
+    let lines = ingest.render_lines(&pane);
+    assert_eq!(
+        lines.get(1).map(|l| l.trim_end()),
+        Some("rA"),
+        "CUP 1;2 under DECOM must land on the region's first row, got {lines:?}"
+    );
+    assert_eq!(
+        lines.first().map(|l| l.trim_end()),
+        Some("r0"),
+        "row 0 (outside the region) must be untouched, got {lines:?}"
+    );
+}
+
+// Suspect 12c: DSR 6 (CPR) reports margin-relative coordinates while
+// DECOM is set. CUD 9 from the region origin clamps at the bottom
+// margin (absolute row 5 = relative row 4).
+#[test]
+fn decom_cpr_reports_margin_relative_position() {
+    let mut pane = Pane::new("t", 256, 6);
+    let mut ingest = TerminalIngest::new(PtySize::new(6, 32));
+    ingest.ingest_bytes(&mut pane, b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5");
+    let replies = ingest.ingest_bytes(&mut pane, b"\x1b[2;5r\x1b[?6h\x1b[9B\x1b[6n");
+    assert_eq!(
+        String::from_utf8_lossy(&replies),
+        "\x1b[4;1R",
+        "CPR must report rows relative to the top margin under DECOM"
+    );
+}
+
+// Suspect 12d: DECSC/DECRC save and restore the origin-mode flag
+// (DEC STD 070 lists it in the saved state).
+#[test]
+fn decrc_restores_origin_mode() {
+    let mut pane = Pane::new("t", 256, 6);
+    let mut ingest = TerminalIngest::new(PtySize::new(6, 32));
+    ingest.ingest_bytes(&mut pane, b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5");
+    // Save with DECOM on, clear it, restore: relative addressing must
+    // be back, so CUP 1;1 lands on the region origin (absolute row 2).
+    ingest.ingest_bytes(
+        &mut pane,
+        b"\x1b[2;5r\x1b[?6h\x1b7\x1b[?6l\x1b8\x1b[1;1HX\x1b[r",
+    );
+    let lines = ingest.render_lines(&pane);
+    assert_eq!(
+        lines.get(1).map(|l| l.trim_end()),
+        Some("X1"),
+        "DECRC must restore DECOM, got {lines:?}"
+    );
+}
+
+// Suspect 13a: DECALN fills the whole primary viewport with 'E', resets
+// the scroll margins, and homes the cursor. The X (written after) must
+// land at the home position, and SU 1 must scroll the FULL screen —
+// proving the margins were reset — leaving a blank final row.
+#[test]
+fn decaln_fills_primary_screen_resets_margins_and_homes() {
+    let mut pane = Pane::new("t", 256, 4);
+    let mut ingest = TerminalIngest::new(PtySize::new(4, 8));
+    ingest.ingest_bytes(&mut pane, b"\x1b[2;3r\x1b#8X\x1b[1S");
+    let lines = ingest.render_lines(&pane);
+    // Row 0 (XEEEEEEE) scrolled off a FULL-screen region — margins were
+    // reset — and the blank row that scrolled in at the bottom is
+    // trimmed by render_lines. A stale 2..3 region would have left
+    // XEEEEEEE on row 0 with the blank in the middle.
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .collect::<Vec<_>>(),
+        vec!["EEEEEEEE", "EEEEEEEE", "EEEEEEEE"],
+        "got {lines:?}"
+    );
+}
+
+// Suspect 13b: same on the alternate screen.
+#[test]
+fn alt_decaln_fills_screen_and_resets_margins() {
+    let mut pane = Pane::new("t", 256, 4);
+    let mut ingest = TerminalIngest::new(PtySize::new(4, 8));
+    ingest.ingest_bytes(&mut pane, b"\x1b[?1049h\x1b[2;3r\x1b#8X\x1b[1S");
+    let lines = ingest.render_lines(&pane);
+    // Same shape as the primary variant: full-screen scroll after the
+    // margin reset, trailing blank row trimmed by render_lines.
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .collect::<Vec<_>>(),
+        vec!["EEEEEEEE", "EEEEEEEE", "EEEEEEEE"],
+        "got {lines:?}"
+    );
+}
+
+// Suspect 14: DSR 5 ("are you OK?") must answer CSI 0 n. Some TUI
+// libraries probe it at startup and hang or fall back without a reply.
+#[test]
+fn dsr_5_reports_terminal_ok() {
+    let mut pane = Pane::new("t", 64, 4);
+    let mut ingest = TerminalIngest::new(PtySize::new(4, 16));
+    let replies = ingest.ingest_bytes(&mut pane, b"\x1b[5n");
+    assert_eq!(String::from_utf8_lossy(&replies), "\x1b[0n");
+}
+
+// Suspect 15: a wide char printed at the last column with autowrap OFF
+// must not push a continuation cell past the row's width. The stored
+// row keeps one cell per column (the orphan base render-clips to a
+// blank, same as the alt screen's behavior).
+#[test]
+fn wide_char_at_last_column_with_wrap_off_does_not_grow_row() {
+    let mut pane = Pane::new("t", 64, 4);
+    let mut ingest = TerminalIngest::new(PtySize::new(4, 8));
+    ingest.ingest_bytes(&mut pane, "\x1b[?7labcdefgh你".as_bytes());
+    let raw = ingest.combined_line_cells(&pane, 0);
+    assert!(
+        raw.len() <= 8,
+        "row must stay at 8 stored cells, got {}",
+        raw.len()
+    );
+    let lines = ingest.render_lines(&pane);
+    assert_eq!(
+        lines.first().map(|l| l.trim_end()),
+        Some("abcdefg"),
+        "the unfittable wide glyph renders as a blank last column, got {lines:?}"
     );
 }
 

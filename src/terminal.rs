@@ -48,6 +48,9 @@ struct SavedCursor {
     col: usize,
     pen: Style,
     charset: CharsetState,
+    // DECOM at save time — DEC STD 070 lists origin mode in the DECSC
+    // state, so a DECRC after the app toggled it puts the mode back.
+    origin: bool,
 }
 
 // A G0/G1 designator's target character set. `ESC ( 0` / `ESC ) 0`
@@ -129,6 +132,12 @@ pub struct TerminalIngest {
     primary_flushed_to_scrollback: bool,
     primary_wrap_pending: bool,
     primary_auto_wrap: bool,
+    // DECOM (`CSI ?6 h/l`). While set, CUP/HVP/VPA address rows
+    // relative to the active scroll region's top margin and clamp
+    // inside the margins, and CPR reports margin-relative coordinates.
+    // One flag for both screens (xterm keeps it in the shared mode
+    // flags; each screen still applies it against its own margins).
+    origin_mode: bool,
     alternate: AlternateScreen,
     // Tab-stop table for HT (0x09), HTS (`ESC H`), TBC (`CSI g`), CHT
     // (`CSI I`) and CBT (`CSI Z`). One table, not one per screen: tab
@@ -184,6 +193,9 @@ pub struct TerminalIngest {
     // state. Reset to CharsetState::default() on alt-screen entry, same
     // as `alt_saved_pen`.
     alt_saved_charset: CharsetState,
+    // Origin-mode half of the alt screen's DECSC slot, mirroring
+    // `SavedCursor::origin` on the primary side.
+    alt_saved_origin: bool,
     // Accumulator for multi-byte UTF-8 sequences so we can reassemble
     // them into a single `char`. A byte 0xC0..=0xFD in the ground state
     // starts a sequence whose total length is encoded in its leading
@@ -292,6 +304,7 @@ impl TerminalIngest {
             primary_flushed_to_scrollback: false,
             primary_wrap_pending: false,
             primary_auto_wrap: true,
+            origin_mode: false,
             alternate: AlternateScreen::new(size.rows as usize, size.cols as usize),
             tab_stops: None,
             cursor_visible: true,
@@ -299,6 +312,7 @@ impl TerminalIngest {
             current_style: Style::DEFAULT,
             charset: CharsetState::default(),
             alt_saved_charset: CharsetState::default(),
+            alt_saved_origin: false,
             utf8_buffer: Vec::new(),
             utf8_remaining: 0,
             cursor_shape: CursorShape::Default,
@@ -476,7 +490,7 @@ impl TerminalIngest {
             match self.state {
                 ParseState::Ground => self.handle_ground(pane, byte),
                 ParseState::Escape => self.handle_escape(pane, byte),
-                ParseState::EscapeHash => self.handle_escape_hash(byte),
+                ParseState::EscapeHash => self.handle_escape_hash(pane, byte),
                 ParseState::Charset(slot) => {
                     self.state = ParseState::Ground;
                     // G2/G3 (`slot == None`) designators are swallowed
@@ -1176,16 +1190,19 @@ impl TerminalIngest {
                         // at fixed terminal coordinates and expect those
                         // rows to logically exist even before they've
                         // been written to. The grid grows lazily on
-                        // print via ensure_primary_cell.
-                        let max_row = self.alternate.rows.saturating_sub(1);
-                        self.primary_cursor_row = row.saturating_sub(1).min(max_row);
+                        // print via ensure_primary_cell. Under DECOM the
+                        // row is relative to the top margin and confined
+                        // to the region (see `primary_absolute_row`).
+                        self.primary_wrap_pending = false;
+                        self.primary_cursor_row = self.primary_absolute_row(row);
                         self.primary_cursor_col = col
                             .saturating_sub(1)
                             .min(self.alternate.cols.saturating_sub(1));
                     }
-                    ScreenMode::Alternate => self
-                        .alternate
-                        .set_cursor(row.saturating_sub(1), col.saturating_sub(1)),
+                    ScreenMode::Alternate => {
+                        let target = self.alternate.absolute_row(row, self.origin_mode);
+                        self.alternate.set_cursor(target, col.saturating_sub(1));
+                    }
                 }
             }
             b'G' => match pane.screen_mode() {
@@ -1209,15 +1226,16 @@ impl TerminalIngest {
                     // VPA on primary: jump cursor to absolute row N
                     // (1-based). Bounded by the VIEWPORT (PTY rows),
                     // not the current grid length — same reasoning as
-                    // CUP above. The grid lazy-grows on print.
+                    // CUP above. The grid lazy-grows on print. Row
+                    // addressing is DECOM-relative, same as CUP.
                     let target_row = params.first().and_then(|value| *value).unwrap_or(1).max(1);
-                    let max_row = self.alternate.rows.saturating_sub(1);
                     self.primary_wrap_pending = false;
-                    self.primary_cursor_row = (target_row.saturating_sub(1)).min(max_row);
+                    self.primary_cursor_row = self.primary_absolute_row(target_row);
                 }
                 ScreenMode::Alternate => {
-                    let row = params.first().and_then(|value| *value).unwrap_or(1);
-                    self.alternate.vertical_absolute(row.saturating_sub(1));
+                    let row = params.first().and_then(|value| *value).unwrap_or(1).max(1);
+                    let target = self.alternate.absolute_row(row, self.origin_mode);
+                    self.alternate.vertical_absolute(target);
                 }
             },
             b'A' => {
@@ -1474,15 +1492,22 @@ impl TerminalIngest {
                             bottom.saturating_sub(1),
                         );
                     }
-                    ScreenMode::Alternate => self
-                        .alternate
-                        .set_scroll_region(top.saturating_sub(1), bottom.saturating_sub(1)),
+                    ScreenMode::Alternate => self.alternate.set_scroll_region(
+                        top.saturating_sub(1),
+                        bottom.saturating_sub(1),
+                        self.origin_mode,
+                    ),
                 }
             }
             b'n' if prefix.is_none() => {
                 let code = params.first().and_then(|value| *value).unwrap_or(0);
-                if code == 6 {
-                    return Some(self.cursor_position_report(pane));
+                match code {
+                    // DSR 5: "report status" — always answer "OK". Some
+                    // TUI libraries probe this at startup and wait on
+                    // the reply.
+                    5 => return Some(b"\x1b[0n".to_vec()),
+                    6 => return Some(self.cursor_position_report(pane)),
+                    _ => {}
                 }
             }
             b'c' if prefix == Some(b'>') => return Some(b"\x1b[>0;1;0c".to_vec()),
@@ -1519,6 +1544,24 @@ impl TerminalIngest {
                                 self.alternate.set_fill_style(self.current_style.clone());
                                 self.alt_saved_pen = Style::DEFAULT;
                                 self.alt_saved_charset = CharsetState::default();
+                                self.alt_saved_origin = false;
+                            }
+                        }
+                        6 => {
+                            // DECOM set: row addressing becomes margin-
+                            // relative, and the cursor homes to the
+                            // region's origin (xterm homes on both set
+                            // and reset).
+                            self.origin_mode = true;
+                            match pane.screen_mode() {
+                                ScreenMode::Primary => {
+                                    let top = self.primary_scroll_top;
+                                    self.primary_set_cursor(top, 0);
+                                }
+                                ScreenMode::Alternate => {
+                                    let top = self.alternate.scroll_top;
+                                    self.alternate.set_cursor(top, 0);
+                                }
                             }
                         }
                         7 => {
@@ -1572,6 +1615,15 @@ impl TerminalIngest {
                             pane.set_screen_mode(ScreenMode::Primary);
                             if param == 1049 && was_alternate {
                                 self.restore_cursor_state(pane);
+                            }
+                        }
+                        6 => {
+                            // DECOM reset: back to absolute addressing,
+                            // cursor homes to the screen origin.
+                            self.origin_mode = false;
+                            match pane.screen_mode() {
+                                ScreenMode::Primary => self.primary_set_cursor(0, 0),
+                                ScreenMode::Alternate => self.alternate.set_cursor(0, 0),
                             }
                         }
                         7 => {
@@ -1663,12 +1715,30 @@ impl TerminalIngest {
     }
 
     fn cursor_position_report(&self, pane: &Pane) -> Vec<u8> {
+        // Under DECOM the report is margin-relative, mirroring how CUP
+        // addresses rows — an app that positions with relative
+        // coordinates must read back the same coordinate space.
         let (row, col) = match pane.screen_mode() {
-            ScreenMode::Primary => (
-                self.primary_cursor_row.saturating_add(1),
-                self.primary_cursor_col.saturating_add(1),
-            ),
-            ScreenMode::Alternate => self.alternate.cursor_position(),
+            ScreenMode::Primary => {
+                let row = if self.origin_mode {
+                    self.primary_cursor_row
+                        .saturating_sub(self.primary_scroll_top)
+                } else {
+                    self.primary_cursor_row
+                };
+                (
+                    row.saturating_add(1),
+                    self.primary_cursor_col.saturating_add(1),
+                )
+            }
+            ScreenMode::Alternate => {
+                let (row, col) = self.alternate.cursor_position();
+                if self.origin_mode {
+                    (row.saturating_sub(self.alternate.scroll_top), col)
+                } else {
+                    (row, col)
+                }
+            }
         };
 
         format!("\x1b[{row};{col}R").into_bytes()
@@ -1685,7 +1755,9 @@ impl TerminalIngest {
         self.alternate.reset();
         self.alt_saved_pen = Style::DEFAULT;
         self.alt_saved_charset = CharsetState::default();
+        self.alt_saved_origin = false;
         self.alternate.set_auto_wrap(true);
+        self.origin_mode = false;
         self.reset_primary_modes(true);
         // RIS restores the power-up default tab stops (every 8th
         // column). Unlike DECSTR below, hard reset is documented to put
@@ -1708,6 +1780,8 @@ impl TerminalIngest {
         pane.set_mouse_tracking_mode(MouseTrackingMode::Off);
         self.current_style = Style::DEFAULT;
         self.alternate.set_fill_style(Style::DEFAULT);
+        // DECSTR resets DECOM, per DEC's documented reset list.
+        self.origin_mode = false;
         self.reset_primary_modes(false);
         self.alternate.set_auto_wrap(true);
         self.alternate.scroll_top = 0;
@@ -1756,12 +1830,14 @@ impl TerminalIngest {
                     col: self.primary_cursor_col,
                     pen: self.current_style.clone(),
                     charset: self.charset,
+                    origin: self.origin_mode,
                 });
             }
             ScreenMode::Alternate => {
                 self.alternate.save_cursor();
                 self.alt_saved_pen = self.current_style.clone();
                 self.alt_saved_charset = self.charset;
+                self.alt_saved_origin = self.origin_mode;
             }
         }
     }
@@ -1778,12 +1854,32 @@ impl TerminalIngest {
                     self.primary_set_cursor(saved.row, saved.col);
                     self.current_style = saved.pen;
                     self.charset = saved.charset;
+                    // Position was saved absolute; if the restored mode
+                    // is DECOM, pull it back inside the margins so the
+                    // cursor can't land where relative addressing could
+                    // never have put it.
+                    self.origin_mode = saved.origin;
+                    if self.origin_mode {
+                        let max_row = self.alternate.rows.saturating_sub(1);
+                        self.primary_cursor_row = self
+                            .primary_cursor_row
+                            .clamp(self.primary_scroll_top, self.primary_scroll_bottom)
+                            .min(max_row);
+                    }
                 }
             }
             ScreenMode::Alternate => {
                 self.alternate.restore_cursor();
                 self.current_style = self.alt_saved_pen.clone();
                 self.charset = self.alt_saved_charset;
+                self.origin_mode = self.alt_saved_origin;
+                if self.origin_mode {
+                    let row = self
+                        .alternate
+                        .cursor_row
+                        .clamp(self.alternate.scroll_top, self.alternate.scroll_bottom);
+                    self.alternate.cursor_row = row.min(self.alternate.rows.saturating_sub(1));
+                }
             }
         }
         // Erase/scroll fills must blank with the restored pen, same as
@@ -1807,6 +1903,22 @@ impl TerminalIngest {
         self.primary_cursor_col = col.min(self.alternate.cols.saturating_sub(1));
     }
 
+    // Resolve a 1-based CUP/VPA row parameter to an absolute grid row.
+    // With DECOM reset this is plain 1-based→0-based conversion clamped
+    // to the viewport; with DECOM set the parameter is relative to the
+    // scroll region's top margin and confined to the region.
+    fn primary_absolute_row(&self, row_param: usize) -> usize {
+        let max_row = self.alternate.rows.saturating_sub(1);
+        let row = row_param.saturating_sub(1);
+        if self.origin_mode {
+            self.primary_scroll_top
+                .saturating_add(row)
+                .min(self.primary_scroll_bottom.min(max_row))
+        } else {
+            row.min(max_row)
+        }
+    }
+
     fn primary_set_scroll_region(&mut self, top: usize, bottom: usize) {
         // xterm clamps an oversized bottom margin to the last row rather
         // than rejecting the sequence — `CSI 3;999r` is a common way for
@@ -1821,7 +1933,10 @@ impl TerminalIngest {
 
         self.primary_scroll_top = top;
         self.primary_scroll_bottom = bottom;
-        self.primary_set_cursor(0, 0);
+        // DECSTBM homes to the origin: the screen's top-left, or the
+        // region's when DECOM is set.
+        let home_row = if self.origin_mode { top } else { 0 };
+        self.primary_set_cursor(home_row, 0);
     }
 
     /// Background cell using the current SGR style — what an erase
@@ -2294,8 +2409,36 @@ impl TerminalIngest {
     // DECALN screen-alignment fill, so the following byte is simply
     // discarded — the point of this state is only to keep it from
     // falling through to Ground and printing as a stray character.
-    fn handle_escape_hash(&mut self, _byte: u8) {
+    fn handle_escape_hash(&mut self, pane: &mut Pane, byte: u8) {
+        // Of the `ESC #` family only DECALN (`8`, screen-alignment test)
+        // is modeled; DECDHL/DECSWL/DECDWL (`3`/`4`/`5`/`6`) still just
+        // swallow their final byte so it doesn't print literally.
+        if byte == b'8' {
+            self.decaln(pane);
+        }
         self.state = ParseState::Ground;
+    }
+
+    // DECALN (`ESC # 8`): fill the active screen with uppercase 'E' in
+    // the default rendition, reset the scroll margins and DECOM, and
+    // home the cursor. Test tools (vttest, esctest) use it to verify
+    // screen geometry; margins/origin reset per VT510 & xterm.
+    fn decaln(&mut self, pane: &mut Pane) {
+        self.origin_mode = false;
+        match pane.screen_mode() {
+            ScreenMode::Primary => {
+                let rows = self.alternate.rows.max(1);
+                let cols = self.alternate.cols.max(1);
+                self.primary_scroll_top = 0;
+                self.primary_scroll_bottom = rows - 1;
+                self.primary_wrap_pending = false;
+                let row = vec![Cell::styled('E', Style::DEFAULT); cols];
+                self.primary_grid = vec![row; rows];
+                self.primary_cursor_row = 0;
+                self.primary_cursor_col = 0;
+            }
+            ScreenMode::Alternate => self.alternate.decaln(),
+        }
     }
 
     fn handle_newline(&mut self, pane: &mut Pane) {
@@ -2636,12 +2779,17 @@ impl TerminalIngest {
         if width == 2 {
             // Continuation sentinel keeps cell-count-equals-display-width
             // so layout math stays honest. Same convention as the alt
-            // screen.
+            // screen — including the edge rule: a wide base in the last
+            // column (only reachable with autowrap off) gets NO
+            // continuation cell. Pushing one would grow the row past the
+            // pane width; the orphaned base render-clips to a blank.
             let cont_col = col + 1;
-            if cont_col < row.len() {
-                row[cont_col] = Cell::styled('\0', self.current_style.clone());
-            } else {
-                row.push(Cell::styled('\0', self.current_style.clone()));
+            if cont_col < cols {
+                if cont_col < row.len() {
+                    row[cont_col] = Cell::styled('\0', self.current_style.clone());
+                } else {
+                    row.push(Cell::styled('\0', self.current_style.clone()));
+                }
             }
         }
 
@@ -2867,6 +3015,21 @@ impl AlternateScreen {
         self.cursor_col = col.min(self.cols.saturating_sub(1));
     }
 
+    // The alt-screen counterpart of `primary_absolute_row`: resolve a
+    // 1-based CUP/VPA row parameter, margin-relative and region-confined
+    // when DECOM is set.
+    fn absolute_row(&self, row_param: usize, origin: bool) -> usize {
+        let max_row = self.rows.saturating_sub(1);
+        let row = row_param.saturating_sub(1);
+        if origin {
+            self.scroll_top
+                .saturating_add(row)
+                .min(self.scroll_bottom.min(max_row))
+        } else {
+            row.min(max_row)
+        }
+    }
+
     fn save_cursor(&mut self) {
         self.saved_cursor_row = self.cursor_row;
         self.saved_cursor_col = self.cursor_col;
@@ -2924,7 +3087,7 @@ impl AlternateScreen {
         self.cursor_row = self.cursor_row.saturating_add(count).min(bottom);
     }
 
-    fn set_scroll_region(&mut self, top: usize, bottom: usize) {
+    fn set_scroll_region(&mut self, top: usize, bottom: usize, origin: bool) {
         // Clamp-then-validate, same as the primary screen: xterm pulls
         // an oversized bottom margin back to the last row instead of
         // dropping the whole sequence.
@@ -2935,7 +3098,10 @@ impl AlternateScreen {
 
         self.scroll_top = top;
         self.scroll_bottom = bottom;
-        self.set_cursor(0, 0);
+        // DECSTBM homes to the origin: the screen's top-left, or the
+        // region's when DECOM is set.
+        let home_row = if origin { top } else { 0 };
+        self.set_cursor(home_row, 0);
     }
 
     fn reset(&mut self) {
@@ -2954,6 +3120,18 @@ impl AlternateScreen {
         self.wrap_pending = false;
         self.set_cursor(0, 0);
         self.save_cursor();
+    }
+
+    // DECALN's alt-screen half: E-fill in the default rendition, full
+    // margins, cursor home (see TerminalIngest::decaln).
+    fn decaln(&mut self) {
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
+        let fill = Cell::styled('E', Style::DEFAULT);
+        for row in &mut self.cells {
+            row.fill(fill.clone());
+        }
+        self.set_cursor(0, 0);
     }
 
     fn index(&mut self) {
@@ -5314,19 +5492,20 @@ mod tests {
     fn escape_hash_sequences_swallow_their_argument_byte() {
         // `ESC #` (DECDHL/DECSWL/DECDWL/DECALN) takes exactly one more
         // byte. Before EscapeHash existed, `#` fell through to the
-        // wildcard arm straight to Ground, so the following byte (e.g.
-        // the `8` in DECALN's screen-alignment test `ESC # 8`) printed
-        // as a stray character instead of being consumed as part of the
-        // sequence.
+        // wildcard arm straight to Ground, so the following byte
+        // printed as a stray character instead of being consumed as
+        // part of the sequence. DECSWL (`ESC # 5`) stays unimplemented,
+        // making it the pure-swallow probe; DECALN (`ESC # 8`) now has
+        // real behavior covered in tests/vt_render_regressions.rs.
         let mut pane = Pane::new("shell", 16, 4);
         let mut ingest = TerminalIngest::new(PtySize::new(4, 16));
 
-        ingest.ingest_bytes(&mut pane, b"\x1b#8ok");
+        ingest.ingest_bytes(&mut pane, b"\x1b#5ok");
 
         assert_eq!(
             ingest.render_lines(&pane)[0],
             "ok",
-            "the '8' argument byte of ESC # 8 must not print",
+            "the '5' argument byte of ESC # 5 must not print",
         );
     }
 
