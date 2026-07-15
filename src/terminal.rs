@@ -765,13 +765,12 @@ impl TerminalIngest {
 
     // Non-destructive combined-timeline read of a single line's raw
     // cells: committed scrollback first, then whatever's still live in
-    // the grid, addressed as one continuous index space. This is the
-    // same split `render_scrolled_primary_view` used to do inline
-    // before selection/search code needed the same lookup — factored
-    // out so `Session::combined_line_cells` (and everything built on
-    // it below) can address an arbitrary combined index without
-    // flushing the grid. See that function's comment for why flushing
-    // is off the table here.
+    // the grid, addressed as one continuous index space. Shared by
+    // `render_scrolled_primary_view` and `Session::combined_line_cells`
+    // (and everything built on it below) so any caller can address an
+    // arbitrary combined index without flushing the grid. See
+    // `render_scrolled_primary_view`'s comment for why flushing is off
+    // the table here.
     //
     // Wide-char continuation sentinels (`\0`) are kept, matching
     // `ScrollbackBuffer::line_cells` — callers that need visual-column
@@ -826,9 +825,7 @@ impl TerminalIngest {
     // Total addressable lines across scrollback plus the live primary
     // grid — i.e. what `pane.total_lines()` would read immediately
     // after a `flush_incomplete_line`, without paying for the flush's
-    // side effects (draining the grid, resetting the cursor). Used by
-    // selection code that used to call `flush_grid_to_scrollback()`
-    // purely to get an accurate line count.
+    // side effects (draining the grid, resetting the cursor).
     pub fn combined_total_lines(&self, pane: &Pane) -> usize {
         pane.total_lines() + self.primary_grid.len()
     }
@@ -966,14 +963,10 @@ impl TerminalIngest {
             // all four introduce a string that runs to the String
             // Terminator (`ESC \`). zmux doesn't interpret any of their
             // payloads, so all four route into the same swallow state.
-            // Before this arm existed, only DCS was caught here — APC/
-            // PM/SOS fell through to the wildcard below and landed in
-            // Ground, so the string BODY was parsed as plain text and
-            // printed to the screen. That's a real-world problem: kitty's
-            // graphics protocol opens an APC with a base64-encoded image
-            // payload that can run tens of KB, and notcurses/chafa probe
-            // it the same way, so every terminal-capability probe from
-            // those tools used to spray a garbage blob onto the pane.
+            // Swallowing matters most for APC: kitty's graphics protocol
+            // (and the notcurses/chafa probes for it) opens one with a
+            // base64 image payload that can run tens of KB — none of
+            // which may reach the screen as printable text.
             b'P' | b'_' | b'^' | b'X' => ParseState::StringSwallow,
             // `ESC #`: DECDHL (`3`/`4`), DECSWL (`5`), DECDWL (`6`), and
             // DECALN (`8`, screen-alignment test) all follow with a
@@ -985,8 +978,7 @@ impl TerminalIngest {
             // other four intermediates (`* + - .` for G2/G3, and `/`
             // for a 96-charset G3 variant) select slots zmux never
             // reads from, so their final byte is swallowed with no
-            // state recorded — same as before this parser tracked
-            // charsets at all.
+            // state recorded.
             b'(' => ParseState::Charset(Some(CharsetSlot::G0)),
             b')' => ParseState::Charset(Some(CharsetSlot::G1)),
             b'*' | b'+' | b'-' | b'.' | b'/' => ParseState::Charset(None),
@@ -1241,10 +1233,7 @@ impl TerminalIngest {
             b'A' => {
                 // CUU: cursor up N rows, stopping at the scroll region's
                 // top margin (row 0 only when starting above it) — see
-                // `primary_cursor_up`. This is the bug-fix sequence —
-                // claude redraws its input box by sending CUU + write,
-                // and prior to this the move was silently dropped so
-                // writes cascaded down. An explicit 0 means 1, per xterm.
+                // `primary_cursor_up`. An explicit 0 means 1, per xterm.
                 let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
                 match pane.screen_mode() {
                     ScreenMode::Primary => self.primary_cursor_up(count),
@@ -1254,11 +1243,10 @@ impl TerminalIngest {
             b'B' => {
                 // CUD: cursor down N rows, stopping at the scroll
                 // region's bottom margin (viewport bottom only when
-                // starting below it). Clamping against the VIEWPORT
-                // rather than grid.len() matters on primary — claude
-                // moves the cursor to fixed terminal rows to redraw UI;
-                // clamping to the existing grid tail produced ghost-
-                // duplicate UI elements.
+                // starting below it). Clamps against the VIEWPORT, not
+                // grid.len() — apps address fixed terminal rows that
+                // may not have been written yet; the grid lazy-grows
+                // on print.
                 let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
                 match pane.screen_mode() {
                     ScreenMode::Primary => self.primary_cursor_down(count),
@@ -1268,10 +1256,9 @@ impl TerminalIngest {
             b'C' => match pane.screen_mode() {
                 ScreenMode::Primary => {
                     // CUF on primary: cursor right N columns, clamped at
-                    // cols-1. Cell content underneath is unchanged — the
-                    // prior implementation extended the row with blanks,
-                    // but with a 2D grid the row is padded lazily on the
-                    // next print, so CUF just moves the cursor.
+                    // cols-1. Pure cursor move — cell content underneath
+                    // is unchanged; the row pads lazily on the next
+                    // print.
                     let count = params.first().and_then(|value| *value).unwrap_or(1).max(1);
                     self.primary_wrap_pending = false;
                     self.primary_cursor_col = (self.primary_cursor_col + count)
@@ -1987,11 +1974,10 @@ impl TerminalIngest {
         let col = self.primary_cursor_col;
         let blank = self.primary_blank_cell();
         // BCE: with the default pen, erased cells can stay implicit
-        // (rows keep their sparse tails, exactly the old behavior). A
-        // pen with color/attrs must leave real styled blanks behind so
-        // the cleared span shows the active background — including
-        // cells past a row's stored end, which have to be materialized
-        // to carry a style at all.
+        // (rows keep their sparse tails). A pen with a real background
+        // must leave styled blanks behind so the cleared span shows
+        // that background — including cells past a row's stored end,
+        // which have to be materialized to carry a style at all.
         let styled = self.current_style.bg != Color::Default;
         if self.primary_grid.is_empty() && !styled {
             return;
@@ -3166,9 +3152,8 @@ impl AlternateScreen {
 
     fn next_line(&mut self, count: usize) {
         // CNL is CUD + CR — a pure cursor move. It clamps at the bottom
-        // margin and NEVER scrolls; routing it through linefeed() used
-        // to scroll the region once the cursor reached the margin,
-        // destroying rows a real terminal would keep.
+        // margin and NEVER scrolls (routing it through linefeed() would
+        // scroll the region away once the cursor reaches the margin).
         self.cursor_down(count.max(1));
         self.carriage_return();
     }

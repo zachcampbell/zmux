@@ -1003,9 +1003,9 @@ fn run_server_loop(
 
         let mut shutdown = false;
         // Accumulate dirty state across every handler in this iteration so
-        // we send at most one frame per poll cycle. A batched client message
-        // that contains ten Input actions used to produce ten frame writes;
-        // now it produces one.
+        // we send at most one frame per poll cycle — a batched client
+        // message with ten Input actions must produce one frame write,
+        // not ten.
         let mut dirty = false;
         // Indices of clients that detached or errored this iteration.
         let mut to_remove: Vec<usize> = Vec::new();
@@ -2437,11 +2437,10 @@ fn validate_session_name(name: &str) -> io::Result<()> {
     // of the old explicit '\0' check. The session name ends up in the
     // socket filename (session_socket_path) and, via the status bar's
     // "name@host" label, directly in another client's rendered
-    // terminal (see stamp_row_text's own control-char filtering for
-    // the defense-in-depth half of this fix); rejecting control chars
-    // here stops both a malformed socket path and an escape-sequence
-    // injection at the source instead of relying only on the
-    // downstream filter.
+    // terminal (stamp_row_text's own control-char filtering is the
+    // downstream defense-in-depth); rejecting control chars here stops
+    // both a malformed socket path and an escape-sequence injection at
+    // the source instead of relying only on the downstream filter.
     if name.is_empty() || name.contains('/') || name.chars().any(char::is_control) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

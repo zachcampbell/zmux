@@ -1058,8 +1058,8 @@ impl Workspace {
         // miss a query matching text that's plainly on screen. Use the
         // combined-timeline search instead of draining the grid first —
         // draining is destructive (see `Session::flush_grid_to_
-        // scrollback`'s doc comment) and unnecessary now that the
-        // combined accessors can address live-grid rows directly.
+        // scrollback`'s doc comment) and unnecessary: the combined
+        // accessors address live-grid rows directly.
         let matches = active.session.combined_search(&query);
         if matches.is_empty() {
             self.search_results = Some(SearchResults {
@@ -1709,7 +1709,8 @@ impl Workspace {
             return Ok(false);
         }
         // If the targeted pane is currently active, route through
-        // close_active so focus migration matches the prior behaviour.
+        // close_active so focus migrates exactly as an interactive
+        // close would.
         if self.active == target {
             return self.close_active();
         }

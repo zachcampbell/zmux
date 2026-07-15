@@ -545,9 +545,7 @@ pub fn poll_readable(fd: i32, timeout_ms: i32) -> io::Result<bool> {
     // Retry on EINTR rather than propagating it: a signal landing mid-poll
     // isn't a poll failure, and treating it as one would make an
     // otherwise-routine signal look like a dead fd to every caller
-    // (client reads, PTY reads, the accept-loop) — see daemon.rs's
-    // client-read handling, which used to tear down the whole session
-    // on exactly this.
+    // (client reads, PTY reads, the accept-loop).
     loop {
         let ready = unsafe { poll(poll_fd.as_mut_ptr(), poll_fd.len(), timeout_ms) };
         if ready == -1 {

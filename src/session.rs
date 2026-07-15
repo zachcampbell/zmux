@@ -421,10 +421,9 @@ impl Session {
     /// visible_text` -> `ScrollbackBuffer::visible_lines`), so while the
     /// pane is following live output it always reports the line that
     /// was on screen `grid_rows` writes ago instead of the line that's
-    /// actually on screen now — the same staleness this fix's combined
-    /// timeline addresses for scrolling. Prompt detection needs "what's
-    /// on screen right now," so it goes through the same composed
-    /// render as `snapshot_visible_lines` instead.
+    /// actually on screen now. Prompt detection needs "what's on screen
+    /// right now," so it goes through the same composed render as
+    /// `snapshot_visible_lines` instead.
     pub fn visible_last_line(&self) -> Option<String> {
         self.snapshot_visible_lines()
             .into_iter()

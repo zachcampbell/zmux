@@ -30,7 +30,7 @@ pub struct Attrs {
     pub reverse: bool,
 }
 
-// Style is no longer Copy because it carries an optional OSC 8 hyperlink
+// Style is not Copy because it carries an optional OSC 8 hyperlink
 // target, which lives behind an Arc so identical URLs across many cells
 // share one allocation. Clones are still cheap — Arc::clone is one
 // atomic bump, and None clones are free.
