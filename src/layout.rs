@@ -338,9 +338,6 @@ impl LayoutNode {
         false
     }
 
-    // Remove the leaf for `target`. If removing it leaves a Split with
-    // only one child, that Split is collapsed into its surviving child.
-    // Returns true if the target was found and removed.
     // Swap two leaves' PaneIds in-place. Tree structure and weights stay
     // exactly the same — only which PaneId sits at each slot changes. Used
     // by the pane swap bindings so the user can reposition a pane in the
@@ -349,10 +346,10 @@ impl LayoutNode {
         if a == b {
             return false;
         }
-        // Two-pass: verify BOTH leaves exist before mutating. An earlier
-        // version rewrote eagerly and could corrupt the tree when only
-        // one of the two ids was present (rewrote it to the missing
-        // id, then reported failure).
+        // Two-pass: verify BOTH leaves exist before mutating. Rewriting
+        // eagerly corrupts the tree when only one of the two ids is
+        // present (it gets rewritten to the missing id, and the call
+        // then reports failure anyway).
         let leaves = self.leaves();
         if !leaves.contains(&a) || !leaves.contains(&b) {
             return false;
@@ -378,6 +375,9 @@ impl LayoutNode {
         }
     }
 
+    // Remove the leaf for `target`. If removing it leaves a Split with
+    // only one child, that Split is collapsed into its surviving child.
+    // Returns true if the target was found and removed.
     pub fn remove_leaf(&mut self, target: PaneId) -> bool {
         // A Leaf at the root is a degenerate case — there's nothing left
         // to host a workspace, so refuse the removal.

@@ -745,16 +745,15 @@ impl TerminalIngest {
     }
 
     // Non-destructive combined-timeline render for the scrolled-back
-    // (non-follow) case. The live grid is never flushed to produce this
-    // — flushing resets the cursor and, worse, makes the *next* bit of
-    // follow-mode output render top-aligned with blank rows below it
-    // instead of growing naturally from the bottom (that's why this
-    // fix doesn't use `flush_incomplete_line` to solve the wheel-jump
-    // bug). Instead we address into "scrollback lines, then live grid
-    // rows" as one continuous space: `pane.viewport_top()` /
-    // `pane.total_lines()` are already combined-timeline-aware via
-    // `ScrollbackBuffer`'s `live_tail` (see `sync_live_tail`), so this
-    // just has to pick the right side of the split for each row.
+    // (non-follow) case. The live grid must never be flushed to produce
+    // this — flushing resets the cursor and, worse, makes the *next*
+    // bit of follow-mode output render top-aligned with blank rows
+    // below it instead of growing naturally from the bottom. Instead we
+    // address into "scrollback lines, then live grid rows" as one
+    // continuous space: `pane.viewport_top()` / `pane.total_lines()`
+    // are already combined-timeline-aware via `ScrollbackBuffer`'s
+    // `live_tail` (see `sync_live_tail`), so this just has to pick the
+    // right side of the split for each row.
     fn render_scrolled_primary_view(&self, pane: &Pane) -> Vec<Vec<Cell>> {
         let top = pane.viewport_top();
         let height = pane.viewport_height();

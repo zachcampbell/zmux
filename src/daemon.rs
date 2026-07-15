@@ -1469,9 +1469,9 @@ fn run_server_loop(
                                                     match out.side_effect {
                                                         SideEffect::None => {}
                                                         SideEffect::DisplayMessage(msg) => {
-                                                            // Store message in prompt_error slot
-                                                            // for now; a proper message overlay
-                                                            // comes in a later task.
+                                                            // There is no dedicated message
+                                                            // overlay; the prompt_error slot
+                                                            // renders the same way, so reuse it.
                                                             windows
                                                                 .active_mut()
                                                                 .set_prompt_error(msg);

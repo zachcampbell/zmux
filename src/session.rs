@@ -131,9 +131,9 @@ impl Session {
     /// Non-mutating snapshot of what the renderer would draw right now,
     /// composed from scrollback + the live primary grid. Used by MCP
     /// `read_pane` so callers see in-progress TUI state without forcing
-    /// the live grid into scrollback (which would let the running TUI's
-    /// next CUU find an empty grid and cascade — see the cascade-fix
-    /// commit). Returns a vector of plain-text lines, oldest first.
+    /// the live grid into scrollback — which would let the running
+    /// TUI's next CUU find an empty grid and cascade its redraw down
+    /// the screen. Returns a vector of plain-text lines, oldest first.
     ///
     /// When the live grid is empty (e.g., a primary-screen TUI like
     /// gemini-cli has just done `\e[2J` mid-redraw, or has scrolled all
