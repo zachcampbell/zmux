@@ -1142,18 +1142,18 @@ impl Workspace {
         let Some(session) = self.session_for(self.active) else {
             return false;
         };
-        // `scrollback_viewport_top` is already combined-timeline aware
-        // (`TerminalIngest::ingest_bytes` keeps `ScrollbackBuffer::
-        // live_tail` in sync on every feed — see `sync_live_tail`), so
-        // it names the line the user is looking at whether or not
-        // that line has reached committed scrollback yet. `total` must
-        // use the same combined space so the anchor never clamps to a
-        // scrollback-only length shorter than what's really on screen.
+        // `rendered_viewport_origin` names the combined-timeline line
+        // the user is actually looking at on the pane's top row —
+        // whether that line has reached committed scrollback yet, and
+        // whether follow mode is rendering a bottom-anchored window or
+        // a top-aligned sparse grid. `total` must use the same combined
+        // space so the anchor never clamps to a scrollback-only length
+        // shorter than what's really on screen.
         let total = session.session.combined_total_lines();
         let anchor_line = if total == 0 {
             0
         } else {
-            session.session.scrollback_viewport_top().min(total - 1)
+            session.session.rendered_viewport_origin().min(total - 1)
         };
         self.selection = Some(Selection {
             mode,
@@ -2751,11 +2751,13 @@ impl Workspace {
                 let cells = session.session.render_cells();
                 // Only the active pane owns a selection; non-active
                 // panes just draw their cells as-is. Selection state
-                // lives in scrollback-buffer coordinates (line, col),
-                // so we translate the pane's current viewport_top
-                // to find which buffer rows each visible row maps to.
+                // lives in combined-timeline coordinates (line, col),
+                // so we translate through the same origin the renderer
+                // used to pick these rows — NOT viewport_top, which
+                // diverges from the rendered window when follow mode
+                // top-aligns a sparse grid (see rendered_viewport_origin).
                 let active_selection = if focused { self.selection } else { None };
-                let viewport_top = session.session.scrollback_viewport_top();
+                let viewport_top = session.session.rendered_viewport_origin();
                 for (row_offset, line) in cells
                     .iter()
                     .enumerate()
@@ -3096,7 +3098,10 @@ impl Workspace {
         let Some(managed) = self.session_for(pane_id) else {
             return false;
         };
-        let buffer_line = managed.session.scrollback_viewport_top() + local_row;
+        // Map through the same origin the renderer used for these rows
+        // (see rendered_viewport_origin) so the drag cursor lands on
+        // the line under the pointer, not a bottom-anchored guess.
+        let buffer_line = managed.session.rendered_viewport_origin() + local_row;
         let Some(selection) = self.selection.as_mut() else {
             return false;
         };
@@ -3350,8 +3355,12 @@ impl Workspace {
             // screen (vim, less, etc.) is left alone; those apps enable
             // their own mouse tracking and we just forward to them.
             if is_primary {
+                // Anchor in the same coordinate frame the renderer used
+                // for the rows under the pointer (rendered origin, not
+                // viewport_top — they diverge when follow mode renders
+                // a sparse grid top-aligned after an ED 2).
                 let viewport_top = match self.session_for(pane_id) {
-                    Some(managed) => managed.session.scrollback_viewport_top(),
+                    Some(managed) => managed.session.rendered_viewport_origin(),
                     None => return Ok(cancelled_stale || active_changed),
                 };
                 if mouse.is_left_press() {
@@ -4433,6 +4442,63 @@ mod tests {
             "collapsed click must not leave a selection"
         );
         assert!(workspace.take_pending_clipboard().is_none());
+    }
+
+    #[test]
+    fn mouse_selection_after_ed2_yanks_the_rendered_text() {
+        use super::handle_mouse_test_input as press;
+        let mut workspace =
+            Workspace::spawn_single("/bin/sh", PtySize::new(24, 120)).expect("spawn workspace");
+        let pane_id = workspace.active_pane_id() as u32;
+        wait_for_shell_ready(&mut workspace, pane_id);
+
+        // Push enough lines through the real PTY that a chunk of them
+        // evicts into scrollback (the viewport is ~22 content rows).
+        workspace
+            .handle_input(InputAction::Forward(
+                b"i=0; while [ $i -lt 60 ]; do echo filler-$i; i=$((i+1)); done\r".to_vec(),
+            ))
+            .expect("forward filler loop");
+        wait_for_visible_line(&mut workspace, pane_id, "filler-59");
+
+        // ED 2 *without* ED 3: the live grid clears but scrollback
+        // survives (bash's `clear` adds 3J, but plenty of tools emit a
+        // bare 2J). The follow-mode render now top-aligns a grid that's
+        // shorter than the viewport, which is the state where the old
+        // bottom-anchored viewport_top mapping pointed selections at
+        // scrollback lines instead of the rows on screen.
+        workspace
+            .handle_input(InputAction::Forward(
+                b"printf '\\033[H\\033[2JTARGET-abcdefghij\\n'\r".to_vec(),
+            ))
+            .expect("forward ED2 reprint");
+        let lines = wait_for_visible_line(&mut workspace, pane_id, "TARGET-abcdefghij");
+        let content_row = lines
+            .iter()
+            .position(|line| line.trim() == "TARGET-abcdefghij")
+            .expect("target line must be visible") as u16;
+        assert_eq!(content_row, 0, "ED2 must leave the reprint at the top");
+        // +1 for the pane header row that `content_position` strips.
+        let screen_row = content_row + 1;
+
+        // Select cols 2..=6 of the target line: "RGET-".
+        workspace
+            .handle_input(InputAction::Mouse(press(2, screen_row, 0, b'M')))
+            .expect("press");
+        workspace
+            .handle_input(InputAction::Mouse(press(6, screen_row, 32, b'M')))
+            .expect("drag");
+        workspace
+            .handle_input(InputAction::Mouse(press(6, screen_row, 0, b'm')))
+            .expect("release");
+        let yanked = workspace
+            .take_pending_clipboard()
+            .expect("auto-yank must produce text");
+        assert_eq!(
+            yanked, "RGET-",
+            "yank must copy the text under the highlight, not the \
+             scrollback line a bottom-anchored viewport_top points at"
+        );
     }
 
     #[test]

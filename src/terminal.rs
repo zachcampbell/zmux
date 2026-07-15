@@ -8,7 +8,7 @@ use crate::mouse::{MouseTrackingMode, ScreenMode};
 use crate::pane::Pane;
 use crate::pty::PtySize;
 use crate::scrollback::{ScrollbackLine, search_line_indices, trimmed_line_text};
-use crate::style::{Cell, Style};
+use crate::style::{Cell, Color, Style};
 
 // Cursor shape requested via DECSCUSR (`CSI Ps SP q`). Cosmetic but
 // agent CLIs flip it to `BlinkingBar` to draw attention to a streaming
@@ -779,6 +779,36 @@ impl TerminalIngest {
         }
     }
 
+    // Combined-timeline index of the first row `render_cells` shows for
+    // this pane — the number selection code must add to a screen row
+    // offset to get a combined line index. This is NOT always
+    // `pane.viewport_top()`: follow mode with a grid shorter than the
+    // viewport (e.g. right after an ED 2 that kept scrollback) renders
+    // the grid TOP-aligned, while the scrollback viewport math is
+    // bottom-anchored — mapping through viewport_top there points
+    // selections at scrollback lines that aren't on screen at all.
+    // Every arm below mirrors the corresponding branch of
+    // `render_primary_cells` exactly; keep them in sync.
+    pub fn rendered_viewport_origin(&self, pane: &Pane) -> usize {
+        if pane.screen_mode() == ScreenMode::Primary
+            && pane.follow_output()
+            && !(self.primary_grid.is_empty() && self.primary_flushed_to_scrollback)
+        {
+            let scrollback_len = pane.total_lines();
+            if self.primary_grid.len() >= pane.viewport_height() {
+                // Bottom window of the grid: same as viewport_top, but
+                // computed from the grid so the two can't drift.
+                scrollback_len + self.primary_grid.len() - pane.viewport_height()
+            } else {
+                // Top-aligned sparse grid: row 0 is the grid's first
+                // row, i.e. the first combined index past scrollback.
+                scrollback_len
+            }
+        } else {
+            pane.viewport_top()
+        }
+    }
+
     // Total addressable lines across scrollback plus the live primary
     // grid — i.e. what `pane.total_lines()` would read immediately
     // after a `flush_incomplete_line`, without paying for the flush's
@@ -1318,6 +1348,14 @@ impl TerminalIngest {
                 match mode {
                     2 | 3 => {
                         self.primary_grid.clear();
+                        // BCE: a styled pen repaints the whole viewport
+                        // with the active background instead of leaving
+                        // the implicit default-blank screen.
+                        if self.current_style.bg != Color::Default {
+                            let viewport = self.alternate.rows.max(1);
+                            let painted = self.primary_blank_row();
+                            self.primary_grid.resize(viewport, painted);
+                        }
                         self.primary_cursor_row = 0;
                         self.primary_cursor_col = 0;
                         // Do NOT clear primary_saved_cursor here. xterm
@@ -1469,15 +1507,24 @@ impl TerminalIngest {
                                 self.save_cursor_state(pane);
                             }
                             pane.set_screen_mode(ScreenMode::Alternate);
-                            self.alternate.reset();
-                            // reset() just baselined fill to the default
-                            // pen, but erases in the freshly-entered alt
-                            // screen must blank with the CURRENTLY
-                            // RUNNING pen (BCE), not a neutral default —
-                            // resync it now that reset() is done clearing.
-                            self.alternate.set_fill_style(self.current_style.clone());
-                            self.alt_saved_pen = Style::DEFAULT;
-                            self.alt_saved_charset = CharsetState::default();
+                            // Clear-on-entry is a 1049-only behavior in
+                            // xterm. Mode 47 is a bare buffer switch —
+                            // content from the last alt session survives
+                            // until the entering app repaints — and 1047
+                            // clears on EXIT instead (see the `l` arm).
+                            if param == 1049 {
+                                self.alternate.reset();
+                                // reset() just baselined fill to the
+                                // default pen, but erases in the freshly-
+                                // entered alt screen must blank with the
+                                // CURRENTLY RUNNING pen (BCE), not a
+                                // neutral default — resync it now that
+                                // reset() is done clearing. (47/1047 skip
+                                // this: fill is already tracking the pen.)
+                                self.alternate.set_fill_style(self.current_style.clone());
+                                self.alt_saved_pen = Style::DEFAULT;
+                                self.alt_saved_charset = CharsetState::default();
+                            }
                         }
                         7 => {
                             self.set_primary_auto_wrap(true);
@@ -1519,6 +1566,14 @@ impl TerminalIngest {
                             // transition so a stray 1049l can't teleport
                             // the primary cursor.
                             let was_alternate = pane.screen_mode() == ScreenMode::Alternate;
+                            // 1047 is the "clear on exit" variant: wipe
+                            // the alt buffer on a real alt→primary
+                            // transition so stale frames can't leak into
+                            // the next bare-47 session (which enters
+                            // without clearing, per xterm).
+                            if param == 1047 && was_alternate {
+                                self.alternate.clear_all();
+                            }
                             pane.set_screen_mode(ScreenMode::Primary);
                             if param == 1049 && was_alternate {
                                 self.restore_cursor_state(pane);
@@ -1758,13 +1813,19 @@ impl TerminalIngest {
     }
 
     fn primary_set_scroll_region(&mut self, top: usize, bottom: usize) {
+        // xterm clamps an oversized bottom margin to the last row rather
+        // than rejecting the sequence — `CSI 3;999r` is a common way for
+        // apps to say "row 3 through the bottom, whatever the height".
+        // Only a region that is still degenerate after clamping (top at
+        // or below bottom) is ignored.
         let max_row = self.alternate.rows.saturating_sub(1);
-        if top >= self.alternate.rows || bottom >= self.alternate.rows || top >= bottom {
+        let bottom = bottom.min(max_row);
+        if top >= bottom {
             return;
         }
 
         self.primary_scroll_top = top;
-        self.primary_scroll_bottom = bottom.min(max_row);
+        self.primary_scroll_bottom = bottom;
         self.primary_set_cursor(0, 0);
     }
 
@@ -1777,6 +1838,22 @@ impl TerminalIngest {
 
     fn primary_blank_row(&self) -> Vec<Cell> {
         vec![self.primary_blank_cell(); self.alternate.cols.max(1)]
+    }
+
+    // Blank rows entering the grid from IL/DL/SU/SD fills. With a
+    // default background these stay zero-length — rows past a line's
+    // stored tail are implicitly blank, and keeping them sparse means
+    // flushed scrollback lines (and therefore yanked text) don't
+    // accumulate full-width runs of trailing spaces. A pen with a real
+    // background materializes cells so it paints the cleared band
+    // (BCE). The gate is the BACKGROUND only, matching xterm: fg and
+    // attributes don't propagate onto erased cells.
+    fn primary_region_fill_row(&self) -> Vec<Cell> {
+        if self.current_style.bg == Color::Default {
+            Vec::new()
+        } else {
+            self.primary_blank_row()
+        }
     }
 
     /// Pad `primary_grid[row]` with blank cells up to `len`. No-op if
@@ -1792,28 +1869,49 @@ impl TerminalIngest {
     }
 
     fn primary_erase_line(&mut self, mode: usize) {
-        if self.primary_grid.is_empty() {
-            return;
-        }
         self.primary_wrap_pending = false;
         let cols = self.alternate.cols;
         let row = self.primary_cursor_row;
         let col = self.primary_cursor_col;
-        // Make sure the row is sized so the indices below land in
-        // existing storage (mode 0 erases past current end → just
-        // truncate at cursor, mode 1/2 need the row to exist at full
-        // width since they touch cells before/across the cursor).
         let blank = self.primary_blank_cell();
+        // BCE: with the default pen, erased cells can stay implicit
+        // (rows keep their sparse tails, exactly the old behavior). A
+        // pen with color/attrs must leave real styled blanks behind so
+        // the cleared span shows the active background — including
+        // cells past a row's stored end, which have to be materialized
+        // to carry a style at all.
+        let styled = self.current_style.bg != Color::Default;
+        if self.primary_grid.is_empty() && !styled {
+            return;
+        }
+        if styled {
+            while self.primary_grid.len() <= row {
+                self.primary_grid.push(Vec::new());
+            }
+        }
         match mode {
             // 0 (default): cursor → eol. Right of `line.len()` is
-            // implicitly blank (we never store trailing blanks), so
-            // we only need to overwrite the populated tail.
+            // implicitly blank with the default pen; a styled pen
+            // extends the row to full width first. The gap left of the
+            // cursor (never-written cells) pads with DEFAULT blanks —
+            // only the erased span picks up the pen.
             0 => {
-                if let Some(line) = self.primary_grid.get_mut(row)
-                    && line.len() > col
-                {
-                    for cell in &mut line[col..] {
-                        *cell = blank.clone();
+                if let Some(line) = self.primary_grid.get_mut(row) {
+                    // A cursor sitting on a continuation cell splits its
+                    // pair: the base to the left survives the erase.
+                    crate::style::sever_wide_pair(line, col);
+                    if styled {
+                        if line.len() < col {
+                            line.resize(col, Cell::BLANK);
+                        }
+                        if line.len() < cols {
+                            line.resize(cols, blank.clone());
+                        }
+                    }
+                    if line.len() > col {
+                        for cell in &mut line[col..] {
+                            *cell = blank.clone();
+                        }
                     }
                 }
             }
@@ -1822,6 +1920,9 @@ impl TerminalIngest {
                 self.primary_pad_row(row, (col + 1).min(cols));
                 if let Some(line) = self.primary_grid.get_mut(row) {
                     let end = (col + 1).min(line.len());
+                    // A cursor on the LEFT half erases the base but
+                    // leaves the continuation just past the span.
+                    crate::style::sever_wide_pair(line, end);
                     for cell in &mut line[..end] {
                         *cell = blank.clone();
                     }
@@ -1829,8 +1930,16 @@ impl TerminalIngest {
             }
             // 2: whole line
             2 => {
+                let full = if styled {
+                    Some(self.primary_blank_row())
+                } else {
+                    None
+                };
                 if let Some(line) = self.primary_grid.get_mut(row) {
-                    line.clear();
+                    match full {
+                        Some(painted) => *line = painted,
+                        None => line.clear(),
+                    }
                 }
             }
             _ => {}
@@ -1838,67 +1947,101 @@ impl TerminalIngest {
     }
 
     fn primary_erase_below(&mut self) {
-        // ED 0: cursor → eol on current row, then drop all rows below.
+        // ED 0: cursor → eol on current row, then the rows below. With
+        // the default pen dropping them is enough (they're implicitly
+        // blank); a styled pen paints every viewport row below the
+        // cursor with the active background (BCE), materializing rows
+        // that never existed.
         self.primary_erase_line(0);
         let row = self.primary_cursor_row;
-        if row + 1 < self.primary_grid.len() {
+        if self.current_style.bg != Color::Default {
+            let viewport = self.alternate.rows.max(1);
+            let painted = self.primary_blank_row();
+            while self.primary_grid.len() < viewport {
+                self.primary_grid.push(Vec::new());
+            }
+            for line in self.primary_grid.iter_mut().skip(row + 1) {
+                *line = painted.clone();
+            }
+        } else if row + 1 < self.primary_grid.len() {
             self.primary_grid.truncate(row + 1);
         }
     }
 
     fn primary_erase_above(&mut self) {
         // ED 1: blank rows above cursor + sol → cursor on current row.
+        // Styled pens replace each row with a full-width painted row
+        // (BCE); the default pen keeps the old fill-in-place behavior.
         let row = self.primary_cursor_row;
-        let blank = self.primary_blank_cell();
-        for line in self.primary_grid.iter_mut().take(row) {
-            line.fill(blank.clone());
+        if self.current_style.bg != Color::Default {
+            let painted = self.primary_blank_row();
+            for line in self.primary_grid.iter_mut().take(row) {
+                *line = painted.clone();
+            }
+        } else {
+            let blank = self.primary_blank_cell();
+            for line in self.primary_grid.iter_mut().take(row) {
+                line.fill(blank.clone());
+            }
         }
         self.primary_erase_line(1);
     }
 
     fn primary_insert_lines(&mut self, count: usize) {
-        // IL: only valid when cursor is within the grid. Insert blank
-        // rows at cursor_row; rows past the viewport bottom drop off
-        // (we don't push them to scrollback — IL is an in-area op).
-        if self.primary_grid.is_empty() {
-            return;
-        }
+        // IL: shift rows [cursor..=region bottom] down inside the
+        // DECSTBM region, blanks entering at the cursor and rows leaving
+        // past the region's bottom margin discarded. Rows BELOW the
+        // region must not move — a raw Vec::insert shifts the whole
+        // tail, which chews up composer/status rows apps park under a
+        // top-anchored region (codex's transcript layout). Outside the
+        // region IL is a no-op, per xterm.
         self.primary_wrap_pending = false;
+        let max_row = self.alternate.rows.saturating_sub(1);
+        let top = self.primary_scroll_top.min(max_row);
+        let bottom = self.primary_scroll_bottom.min(max_row);
         let row = self.primary_cursor_row;
-        // The grid grows lazily, so the cursor can sit beyond its
-        // current tail (CUP/CNL clamp against the viewport, not grid
-        // length). Rows past the tail are implicitly blank — inserting
-        // blanks among them shifts nothing, so IL is a no-op there
-        // (and Vec::insert past len would panic).
-        if row >= self.primary_grid.len() {
+        if row < top || row > bottom {
             return;
         }
-        let viewport = self.alternate.rows.max(1);
-        let count = count.min(viewport.saturating_sub(row));
-        for _ in 0..count {
-            self.primary_grid.insert(row, Vec::new());
+        // Materialize sparse rows so the rotate below has real storage,
+        // same as primary_scroll_up_within_region.
+        while self.primary_grid.len() <= bottom {
+            self.primary_grid.push(Vec::new());
         }
-        if self.primary_grid.len() > viewport {
-            self.primary_grid.truncate(viewport);
+        let count = count.min(bottom - row + 1);
+        let blank = self.primary_region_fill_row();
+        let region = &mut self.primary_grid[row..=bottom];
+        region.rotate_right(count);
+        for line in region.iter_mut().take(count) {
+            *line = blank.clone();
         }
         // Cursor stays put; col clamps to width.
     }
 
     fn primary_delete_lines(&mut self, count: usize) {
-        // DL: remove rows at cursor_row, append blanks at the bottom.
-        if self.primary_grid.is_empty() {
+        // DL: the mirror of IL — rows [cursor..=region bottom] shift up,
+        // blanks enter at the region's bottom margin, and rows below the
+        // region stay put instead of being dragged up through it.
+        // No-op outside the region, per xterm.
+        self.primary_wrap_pending = false;
+        let max_row = self.alternate.rows.saturating_sub(1);
+        let top = self.primary_scroll_top.min(max_row);
+        let bottom = self.primary_scroll_bottom.min(max_row);
+        let row = self.primary_cursor_row;
+        if row < top || row > bottom {
             return;
         }
-        self.primary_wrap_pending = false;
-        let row = self.primary_cursor_row;
-        let available = self.primary_grid.len().saturating_sub(row);
-        let count = count.min(available);
-        for _ in 0..count {
-            self.primary_grid.remove(row);
+        while self.primary_grid.len() <= bottom {
+            self.primary_grid.push(Vec::new());
         }
-        // Don't grow the grid past where it was — DL just shrinks
-        // visible content. The grid will re-grow naturally on the
-        // next print/newline.
+        let count = count.min(bottom - row + 1);
+        let blank = self.primary_region_fill_row();
+        let region = &mut self.primary_grid[row..=bottom];
+        region.rotate_left(count);
+        let len = region.len();
+        for line in region.iter_mut().skip(len - count) {
+            *line = blank.clone();
+        }
     }
 
     fn primary_delete_chars(&mut self, count: usize) {
@@ -1916,6 +2059,12 @@ impl TerminalIngest {
                 return; // nothing to delete
             }
             let end = (col + count).min(line.len());
+            // Both deletion boundaries can split a wide-char pair: the
+            // cursor can sit on a continuation cell, and the cell just
+            // past the deleted span can be a continuation whose base is
+            // being deleted (it shifts left as an orphan otherwise).
+            crate::style::sever_wide_pair(line, col);
+            crate::style::sever_wide_pair(line, end);
             line.drain(col..end);
             // We don't pad with trailing blanks — empty cells are
             // implicit. But if the row was full-width and we deleted
@@ -1944,6 +2093,12 @@ impl TerminalIngest {
         let blank = self.primary_blank_cell();
         if let Some(line) = self.primary_grid.get_mut(row_index) {
             let count = count.min(cols.saturating_sub(col));
+            // Inserting between the halves of a wide char splits the
+            // pair; blank both halves rather than strand them around
+            // the inserted blanks. (The truncation below can also strand
+            // a base at the last column — render-time clipping blanks
+            // that one, same as any other edge-clipped wide glyph.)
+            crate::style::sever_wide_pair(line, col);
             for _ in 0..count {
                 line.insert(col, blank.clone());
             }
@@ -1979,18 +2134,40 @@ impl TerminalIngest {
     }
 
     fn primary_erase_chars(&mut self, count: usize) {
-        // ECH: replace N cells at cursor with blanks; no shift.
-        if self.primary_grid.is_empty() {
-            return;
-        }
+        // ECH: replace N cells at cursor with blanks; no shift. Styled
+        // pens materialize the erased span past a row's stored end so
+        // the background paints (BCE), same as primary_erase_line.
         self.primary_wrap_pending = false;
         let col = self.primary_cursor_col;
+        let row = self.primary_cursor_row;
+        let cols = self.alternate.cols;
         let blank = self.primary_blank_cell();
-        if let Some(line) = self.primary_grid.get_mut(self.primary_cursor_row) {
+        let styled = self.current_style.bg != Color::Default;
+        if self.primary_grid.is_empty() && !styled {
+            return;
+        }
+        if styled {
+            while self.primary_grid.len() <= row {
+                self.primary_grid.push(Vec::new());
+            }
+        }
+        if let Some(line) = self.primary_grid.get_mut(row) {
+            let target_end = col.saturating_add(count).min(cols);
+            if styled {
+                if line.len() < col {
+                    line.resize(col, Cell::BLANK);
+                }
+                if line.len() < target_end {
+                    line.resize(target_end, blank.clone());
+                }
+            }
             if col >= line.len() {
                 return;
             }
-            let end = (col + count).min(line.len());
+            let end = target_end.min(line.len());
+            // Either edge of the erased span can split a wide pair.
+            crate::style::sever_wide_pair(line, col);
+            crate::style::sever_wide_pair(line, end);
             for cell in &mut line[col..end] {
                 *cell = blank.clone();
             }
@@ -2423,6 +2600,11 @@ impl TerminalIngest {
 
         let row = &mut self.primary_grid[self.primary_cursor_row];
         let col = self.primary_cursor_col;
+        // The write covers [col, col+width); if either boundary lands
+        // mid-wide-char, blank the half that survives outside the span
+        // (see style::sever_wide_pair for why orphans corrupt the row).
+        crate::style::sever_wide_pair(row, col);
+        crate::style::sever_wide_pair(row, col + width);
         if col < row.len() {
             row[col] = Cell::styled(ch, self.current_style.clone());
         } else {
@@ -2491,7 +2673,7 @@ impl TerminalIngest {
         } else {
             Vec::new()
         };
-        let blank = self.primary_blank_row();
+        let blank = self.primary_region_fill_row();
         let region = &mut self.primary_grid[top..=bottom];
         region.rotate_left(count);
         let len = region.len();
@@ -2528,7 +2710,7 @@ impl TerminalIngest {
         }
 
         let count = count.min(bottom.saturating_sub(top) + 1);
-        let blank = self.primary_blank_row();
+        let blank = self.primary_region_fill_row();
         let region = &mut self.primary_grid[top..=bottom];
         region.rotate_right(count);
         for row in region.iter_mut().take(count) {
@@ -2695,7 +2877,11 @@ impl AlternateScreen {
     }
 
     fn set_scroll_region(&mut self, top: usize, bottom: usize) {
-        if top >= self.rows || bottom >= self.rows || top >= bottom {
+        // Clamp-then-validate, same as the primary screen: xterm pulls
+        // an oversized bottom margin back to the last row instead of
+        // dropping the whole sequence.
+        let bottom = bottom.min(self.rows.saturating_sub(1));
+        if top >= bottom {
             return;
         }
 
@@ -2816,6 +3002,12 @@ impl AlternateScreen {
             }
         }
 
+        // Same boundary rule as the primary path: blank the halves of
+        // any wide-char pair this write splits instead of leaving
+        // orphaned cells behind.
+        let row = &mut self.cells[self.cursor_row];
+        crate::style::sever_wide_pair(row, self.cursor_col);
+        crate::style::sever_wide_pair(row, self.cursor_col + width);
         self.cells[self.cursor_row][self.cursor_col] = Cell::styled(ch, style.clone());
 
         if width == 2 && self.cursor_col + 1 < self.cols {
@@ -2887,6 +3079,11 @@ impl AlternateScreen {
 
         let count = count.min(self.cols.saturating_sub(self.cursor_col));
         let row = &mut self.cells[self.cursor_row];
+        // Splitting a wide pair at the insertion point strands both
+        // halves around the inserted blanks; blank them instead. A pair
+        // pushed off the right edge always lands its base on the last
+        // column, which render-time clipping already blanks.
+        crate::style::sever_wide_pair(row, self.cursor_col);
         row[self.cursor_col..].rotate_right(count);
         for cell in row.iter_mut().skip(self.cursor_col).take(count) {
             *cell = self.fill.clone();
@@ -2901,6 +3098,11 @@ impl AlternateScreen {
 
         let count = count.min(self.cols.saturating_sub(self.cursor_col));
         let row = &mut self.cells[self.cursor_row];
+        // Same boundary rule as primary DCH: the cursor can sit on a
+        // continuation cell, and the cell just past the deleted span can
+        // be a continuation whose base is deleted out from under it.
+        crate::style::sever_wide_pair(row, self.cursor_col);
+        crate::style::sever_wide_pair(row, self.cursor_col + count);
         row[self.cursor_col..].rotate_left(count);
         let len = row.len();
         for cell in row.iter_mut().skip(len.saturating_sub(count)) {
@@ -2921,9 +3123,9 @@ impl AlternateScreen {
                 for row in 0..self.cursor_row {
                     self.cells[row].fill(self.fill.clone());
                 }
-                for col in 0..=self.cursor_col.min(self.cols.saturating_sub(1)) {
-                    self.cells[self.cursor_row][col] = self.fill.clone();
-                }
+                // Same span as an EL 1 on the cursor row — reuse it so
+                // the wide-pair boundary handling stays in one place.
+                self.erase_line(1);
             }
             _ => self.clear_all(),
         }
@@ -2937,12 +3139,18 @@ impl AlternateScreen {
 
         match mode {
             1 => {
-                for col in 0..=self.cursor_col.min(self.cols.saturating_sub(1)) {
+                let end = self.cursor_col.min(self.cols.saturating_sub(1)) + 1;
+                // Erasing up to a wide base leaves its continuation just
+                // past the span — blank it rather than orphan it.
+                crate::style::sever_wide_pair(&mut self.cells[self.cursor_row], end);
+                for col in 0..end {
                     self.cells[self.cursor_row][col] = self.fill.clone();
                 }
             }
             2 => self.cells[self.cursor_row].fill(self.fill.clone()),
             _ => {
+                // A cursor on a continuation cell splits its pair.
+                crate::style::sever_wide_pair(&mut self.cells[self.cursor_row], self.cursor_col);
                 for col in self.cursor_col..self.cols {
                     self.cells[self.cursor_row][col] = self.fill.clone();
                 }
@@ -2957,6 +3165,9 @@ impl AlternateScreen {
         }
 
         let end = self.cursor_col.saturating_add(count).min(self.cols);
+        // Either edge of the erased span can split a wide pair.
+        crate::style::sever_wide_pair(&mut self.cells[self.cursor_row], self.cursor_col);
+        crate::style::sever_wide_pair(&mut self.cells[self.cursor_row], end);
         for col in self.cursor_col..end {
             self.cells[self.cursor_row][col] = self.fill.clone();
         }

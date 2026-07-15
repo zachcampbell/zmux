@@ -474,6 +474,34 @@ impl Cell {
     }
 }
 
+// A destructive edit (overwrite, insert, delete, erase) is about to
+// touch `col` without atomically covering its wide-char partner. If
+// `col` holds a continuation sentinel (`\0`), the pair is being split:
+// blank BOTH halves so neither survives as an orphan. An orphaned `\0`
+// makes `serialize_row` emit one column too few (everything right of it
+// shifts left, pane borders included); an orphaned base renders two
+// columns wide and shifts everything right. Blanks keep each cell's own
+// style so a background-painted region stays painted.
+//
+// Callers pass every boundary of the edited span: for a span [lo, hi)
+// that's `sever_wide_pair(row, lo)` and `sever_wide_pair(row, hi)` —
+// pairs entirely inside or outside the span are unaffected, and a pair
+// entirely covered by the span is overwritten as a unit.
+pub(crate) fn sever_wide_pair(row: &mut [Cell], col: usize) {
+    if row.get(col).is_none_or(|cell| cell.ch != '\0') {
+        return;
+    }
+    if col > 0
+        && let Some(base) = row.get_mut(col - 1)
+        && char_width(base.ch) == 2
+    {
+        *base = Cell::styled(' ', base.style.clone());
+    }
+    if let Some(continuation) = row.get_mut(col) {
+        *continuation = Cell::styled(' ', continuation.style.clone());
+    }
+}
+
 // Emits one row of cells as a string that contains the visible chars
 // separated by SGR transitions whenever the active style changes. A
 // trailing `\x1b[0m` resets after the row so subsequent writes (status

@@ -345,6 +345,15 @@ impl Session {
         self.pane.scrollback_viewport_top()
     }
 
+    // Combined-timeline index of the first row `render_cells` shows —
+    // what selection code must use to map screen rows to combined line
+    // indices. Differs from `scrollback_viewport_top` when follow mode
+    // renders a sparse grid top-aligned; see
+    // `TerminalIngest::rendered_viewport_origin`.
+    pub fn rendered_viewport_origin(&self) -> usize {
+        self.ingest.rendered_viewport_origin(&self.pane)
+    }
+
     pub fn scrollback_viewport_height(&self) -> usize {
         self.pane.scrollback_viewport_height()
     }
